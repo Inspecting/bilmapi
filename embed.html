@@ -1,7 +1,8 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Bilm Player</title>
   <style>
     body {
@@ -14,22 +15,45 @@
     }
     video {
       width: 100%;
-      max-width: 800px;
       height: auto;
+      max-height: 100%;
       background: black;
     }
   </style>
 </head>
 <body>
-  <video id="player" controls autoplay></video>
+  <video id="videoPlayer" controls autoplay></video>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
   <script>
-    const params = new URLSearchParams(window.location.search);
-    const imdb = params.get("imdb") || "tt2294629";
-    fetch("/api/embed/" + imdb)
-      .then(res => res.json())
-      .then(data => {
-        document.getElementById("player").src = data.embed;
-      });
+    async function loadVideo() {
+      const urlParams = new URLSearchParams(window.location.search);
+      const imdb = urlParams.get('imdb') || 'tt2294629';
+
+      const response = await fetch(`/api/embed/${imdb}`);
+      const data = await response.json();
+      const videoUrl = data.embed;
+
+      const video = document.getElementById('videoPlayer');
+
+      if (Hls.isSupported()) {
+        const hls = new Hls();
+        hls.loadSource(videoUrl);
+        hls.attachMedia(video);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          video.play();
+        });
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = videoUrl;
+        video.addEventListener('loadedmetadata', () => {
+          video.play();
+        });
+      } else {
+        console.error('This browser does not support HLS.');
+      }
+    }
+
+    loadVideo();
   </script>
 </body>
 </html>
