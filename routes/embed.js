@@ -1,15 +1,14 @@
 const express = require('express');
 const router = express.Router();
-const scrapeEmbed = require('../scrapers/vidSrcScraper');
+const path = require('path');
 
-router.get('/:imdb', async (req, res) => {
+// For now, return a test stream
+router.get('/:imdb', (req, res) => {
   const { imdb } = req.params;
-  try {
-    const embed = await scrapeEmbed(imdb);
-    res.json({ embed, imdb });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to get embed link.' });
-  }
+  res.json({
+    embed: 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8',
+    imdb
+  });
 });
 
 module.exports = router;

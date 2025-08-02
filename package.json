@@ -1,7 +1,6 @@
 {
   "name": "bilmapi",
   "version": "1.0.0",
-  "description": "Custom movie embed scraper API like VidSrc",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"

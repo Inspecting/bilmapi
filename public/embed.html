@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Bilm Player</title>
+  <style>
+    body {
+      margin: 0;
+      background-color: black;
+    }
+    video {
+      width: 100vw;
+      height: 100vh;
+      background: black;
+    }
+  </style>
+</head>
+<body>
+  <video id="player" controls autoplay></video>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <script>
+    const urlParams = new URLSearchParams(window.location.search);
+    const imdb = urlParams.get('imdb') || 'tt2294629';
+
+    fetch('/api/embed/' + imdb)
+      .then(res => res.json())
+      .then(data => {
+        const video = document.getElementById('player');
+        if (Hls.isSupported()) {
+          const hls = new Hls();
+          hls.loadSource(data.embed);
+          hls.attachMedia(video);
+        } else {
+          video.src = data.embed;
+        }
+      });
+  </script>
+</body>
+</html>
