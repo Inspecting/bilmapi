@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Bilm Embed</title>
+  <link rel="stylesheet" href="https://cdn.plyr.io/3.7.8/plyr.css"/>
+  <style>
+    html, body {
+      margin: 0;
+      background: #000;
+      height: 100%;
+      overflow: hidden;
+    }
+    #player {
+      height: 100vh;
+      width: 100vw;
+    }
+  </style>
+</head>
+<body>
+  <video id="player" playsinline controls></video>
+
+  <script src="https://cdn.plyr.io/3.7.8/plyr.js"></script>
+  <script>
+    const urlParams = new URLSearchParams(window.location.search);
+    const imdb = urlParams.get('id') || 'tt2294629'; // fallback default
+
+    fetch(`https://bilmapi.onrender.com/api/embed/${imdb}`)
+      .then(res => res.json())
+      .then(data => {
+        const source = data?.embed;
+        if (source) {
+          const video = document.getElementById('player');
+          video.src = source;
+          const player = new Plyr(video);
+        } else {
+          alert('Video not available');
+        }
+      });
+  </script>
+</body>
+</html>
