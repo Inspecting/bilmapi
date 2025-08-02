@@ -1,43 +1,53 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Bilm Embed</title>
-  <link rel="stylesheet" href="https://cdn.plyr.io/3.7.8/plyr.css"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bilm Player</title>
   <style>
-    html, body {
+    body {
       margin: 0;
-      background: #000;
-      height: 100%;
-      overflow: hidden;
-    }
-    #player {
+      background: black;
+      display: flex;
+      justify-content: center;
+      align-items: center;
       height: 100vh;
-      width: 100vw;
+    }
+    video {
+      width: 100%;
+      height: 100%;
+      background: black;
     }
   </style>
 </head>
 <body>
-  <video id="player" playsinline controls></video>
+  <video id="videoPlayer" controls autoplay></video>
 
-  <script src="https://cdn.plyr.io/3.7.8/plyr.js"></script>
   <script>
-    const urlParams = new URLSearchParams(window.location.search);
-    const imdb = urlParams.get('id') || 'tt2294629'; // fallback default
+    // Get IMDb ID from URL (?id=tt2294629)
+    const params = new URLSearchParams(window.location.search);
+    const imdb = params.get('id') || 'tt2294629';
 
     fetch(`https://bilmapi.onrender.com/api/embed/${imdb}`)
       .then(res => res.json())
       .then(data => {
-        const source = data?.embed;
-        if (source) {
-          const video = document.getElementById('player');
-          video.src = source;
-          const player = new Plyr(video);
+        const video = document.getElementById('videoPlayer');
+
+        if (video.canPlayType('application/vnd.apple.mpegurl')) {
+          // Native HLS support
+          video.src = data.embed;
         } else {
-          alert('Video not available');
+          // Use hls.js
+          const hls = new Hls();
+          hls.loadSource(data.embed);
+          hls.attachMedia(video);
         }
       });
+
+    // Load hls.js (client-side .m3u8 support)
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/npm/hls.js@latest';
+    document.head.appendChild(script);
   </script>
 </body>
 </html>
