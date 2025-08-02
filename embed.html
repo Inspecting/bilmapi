@@ -1,8 +1,7 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="UTF-8">
   <title>Bilm Player</title>
   <style>
     body {
@@ -15,39 +14,22 @@
     }
     video {
       width: 100%;
-      height: 100%;
+      max-width: 800px;
+      height: auto;
       background: black;
     }
   </style>
 </head>
 <body>
-  <video id="videoPlayer" controls autoplay></video>
-
+  <video id="player" controls autoplay></video>
   <script>
-    // Get IMDb ID from URL (?id=tt2294629)
     const params = new URLSearchParams(window.location.search);
-    const imdb = params.get('id') || 'tt2294629';
-
-    fetch(`https://bilmapi.onrender.com/api/embed/${imdb}`)
+    const imdb = params.get("imdb") || "tt2294629";
+    fetch("/api/embed/" + imdb)
       .then(res => res.json())
       .then(data => {
-        const video = document.getElementById('videoPlayer');
-
-        if (video.canPlayType('application/vnd.apple.mpegurl')) {
-          // Native HLS support
-          video.src = data.embed;
-        } else {
-          // Use hls.js
-          const hls = new Hls();
-          hls.loadSource(data.embed);
-          hls.attachMedia(video);
-        }
+        document.getElementById("player").src = data.embed;
       });
-
-    // Load hls.js (client-side .m3u8 support)
-    const script = document.createElement('script');
-    script.src = 'https://cdn.jsdelivr.net/npm/hls.js@latest';
-    document.head.appendChild(script);
   </script>
 </body>
 </html>
