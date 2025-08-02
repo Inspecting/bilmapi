@@ -9,9 +9,40 @@ app.get('/', (req, res) => {
   res.send('🎬 Bilm API is running!');
 });
 
+// Updated route to show video player directly
 app.get('/api/embed/:imdb', (req, res) => {
   const { imdb } = req.params;
-  res.json({ embed: `https://vidsrc.xyz/embed/movie/${imdb}` });
+
+  // Embed player from a free source
+  const embedUrl = `https://vidsrc.to/embed/movie/${imdb}`;
+
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <title>Bilm Player</title>
+      <style>
+        html, body {
+          margin: 0;
+          padding: 0;
+          height: 100%;
+          background: black;
+          overflow: hidden;
+        }
+        iframe {
+          width: 100%;
+          height: 100%;
+          border: none;
+        }
+      </style>
+    </head>
+    <body>
+      <iframe src="${embedUrl}" allowfullscreen allow="autoplay; fullscreen"></iframe>
+    </body>
+    </html>
+  `);
 });
 
 app.listen(PORT, () => {
