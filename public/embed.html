@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>VidShadowX Embed</title>
+  <style>
+    body { margin: 0; background: #000; color: #fff; font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; }
+    video { width: 100%; height: auto; max-height: 90vh; }
+    #controls { position: absolute; bottom: 10px; left: 10px; z-index: 10; }
+    button { background: #333; border: none; color: white; padding: 8px 12px; margin: 4px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <video id="videoPlayer" controls autoplay crossorigin="anonymous">
+    <source src="/sample-video.m3u8" type="application/x-mpegURL" />
+    <track label="English" kind="subtitles" srclang="en" src="/subs/sample.vtt" default>
+    Your browser does not support the video tag.
+  </video>
+</body>
+</html>
