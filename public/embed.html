@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Bilm Player</title>
+  <style>
+    html, body {
+      margin: 0;
+      background: black;
+      height: 100%;
+      overflow: hidden;
+    }
+    video {
+      width: 100%;
+      height: 100%;
+      background: black;
+    }
+  </style>
+</head>
+<body>
+  <video id="videoPlayer" controls autoplay></video>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const imdb = params.keys().next().value;
+    fetch('/api/embed/' + imdb)
+      .then(res => res.json())
+      .then(data => {
+        const video = document.getElementById('videoPlayer');
+        video.src = data.embed;
+      })
+      .catch(err => console.error(err));
+  </script>
+</body>
+</html>
