@@ -1,0 +1,18 @@
+
+body {
+  margin: 0;
+  background-color: #000;
+  color: white;
+  font-family: sans-serif;
+}
+.video-container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100vh;
+}
+video {
+  width: 100%;
+  max-width: 900px;
+  border: 2px solid #444;
+}

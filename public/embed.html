@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bilm Player</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="video-container">
+    <video id="videoPlayer" controls autoplay>
+      <source src="" type="video/mp4" />
+      Your browser does not support the video tag.
+    </video>
+    <div id="subtitles"></div>
+  </div>
+  <script>
+    const urlParams = new URLSearchParams(window.location.search);
+    const imdbId = urlParams.get("id");
+
+    fetch('/api/embed/' + imdbId)
+      .then(res => res.json())
+      .then(data => {
+        const player = document.getElementById('videoPlayer');
+        if (data && data.source) {
+          player.src = data.source;
+        }
+        if (data.subtitles) {
+          let track = document.createElement('track');
+          track.kind = "subtitles";
+          track.label = "English";
+          track.srclang = "en";
+          track.src = data.subtitles;
+          track.default = true;
+          player.appendChild(track);
+        }
+      });
+  </script>
+</body>
+</html>
