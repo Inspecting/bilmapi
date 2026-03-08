@@ -12,11 +12,21 @@
   "vars": {
     "FIREBASE_PROJECT_ID": "bilm-7bfe1"
   },
+  "routes": [
+    {
+      "pattern": "data-api.watchbilm.org/*",
+      "zone_name": "watchbilm.org"
+    },
+    {
+      "pattern": "data-api.watchbilm.org",
+      "zone_name": "watchbilm.org",
+      "custom_domain": true
+    }
+  ],
   "kv_namespaces": [
     {
       "binding": "BILM_DATA",
-      "id": "51288c08e9854811bd58d65cf64ca675",
-      "preview_id": "51288c08e9854811bd58d65cf64ca675"
+      "id": "51288c08e9854811bd58d65cf64ca675"
     }
   ]
 }
