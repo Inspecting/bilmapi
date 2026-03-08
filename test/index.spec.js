@@ -32,9 +32,75 @@ class MemoryKv {
   }
 }
 
-function createEnv(kv) {
+class MemoryD1Statement {
+  constructor(db, sql) {
+    this.db = db;
+    this.sql = String(sql || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    this.params = [];
+  }
+
+  bind(...params) {
+    this.params = params;
+    return this;
+  }
+
+  async run() {
+    if (!this.sql.startsWith('insert into user_snapshots')) {
+      throw new Error(`Unsupported D1 run SQL in test: ${this.sql}`);
+    }
+
+    const [userId, snapshotJson, updatedAtMs, deviceId, schema, savedAt] = this.params;
+    this.db.rows.set(String(userId), {
+      user_id: String(userId),
+      snapshot_json: String(snapshotJson),
+      updated_at_ms: Number(updatedAtMs || 0) || 0,
+      device_id: deviceId || null,
+      schema: schema || null,
+      saved_at: String(savedAt || '')
+    });
+    return { success: true };
+  }
+
+  async first() {
+    const userId = String(this.params[0] || '');
+    const row = this.db.rows.get(userId);
+    if (!row) return null;
+
+    if (this.sql.includes('select snapshot_json')) {
+      return {
+        snapshot_json: row.snapshot_json,
+        updated_at_ms: row.updated_at_ms,
+        device_id: row.device_id,
+        schema: row.schema
+      };
+    }
+
+    if (this.sql.includes('select updated_at_ms')) {
+      return {
+        updated_at_ms: row.updated_at_ms,
+        device_id: row.device_id,
+        schema: row.schema
+      };
+    }
+
+    throw new Error(`Unsupported D1 first SQL in test: ${this.sql}`);
+  }
+}
+
+class MemoryD1 {
+  constructor() {
+    this.rows = new Map();
+  }
+
+  prepare(sql) {
+    return new MemoryD1Statement(this, sql);
+  }
+}
+
+function createEnv({ kv = new MemoryKv(), d1 = new MemoryD1() } = {}) {
   return {
     BILM_DATA: kv,
+    BILM_DB: d1,
     FIREBASE_PROJECT_ID: 'bilm-7bfe1',
     BILM_ADMIN_TOKEN: 'top-secret-token'
   };
@@ -50,12 +116,14 @@ function createVerifier() {
 
 describe('bilm backend api', () => {
   let kv;
+  let d1;
   let env;
   let worker;
 
   beforeEach(() => {
     kv = new MemoryKv();
-    env = createEnv(kv);
+    d1 = new MemoryD1();
+    env = createEnv({ kv, d1 });
     worker = createWorker({ verifyIdToken: createVerifier() });
   });
 
@@ -71,7 +139,7 @@ describe('bilm backend api', () => {
       }
     };
 
-    const saveResponse = await worker.fetch(new Request('https://data-api.watchbilm.org/?userId=' + USER_ID, {
+    const saveResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/?userId=${USER_ID}`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -83,8 +151,9 @@ describe('bilm backend api', () => {
 
     expect(saveResponse.status).toBe(200);
     expect(saveResponse.headers.get('access-control-allow-origin')).toBe(ALLOWED_ORIGIN);
+    expect(d1.rows.has(USER_ID)).toBe(true);
 
-    const loadResponse = await worker.fetch(new Request('https://data-api.watchbilm.org/?userId=' + USER_ID, {
+    const loadResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/?userId=${USER_ID}`, {
       method: 'GET',
       headers: {
         authorization: 'Bearer valid-token',
@@ -98,13 +167,14 @@ describe('bilm backend api', () => {
     expect(loaded.meta.deviceId).toBe('device-a');
   });
 
-  it('returns snapshot metadata from meta route', async () => {
-    await kv.put(`user-${USER_ID}`, JSON.stringify({ schema: 'bilm-backup-v1' }), {
-      metadata: {
-        updatedAtMs: 1711234567890,
-        deviceId: 'meta-device',
-        schema: 'bilm-backup-v1'
-      }
+  it('returns snapshot metadata from meta route (D1)', async () => {
+    d1.rows.set(USER_ID, {
+      user_id: USER_ID,
+      snapshot_json: JSON.stringify({ schema: 'bilm-backup-v1' }),
+      updated_at_ms: 1711234567890,
+      device_id: 'meta-device',
+      schema: 'bilm-backup-v1',
+      saved_at: new Date().toISOString()
     });
 
     const response = await worker.fetch(new Request(`https://data-api.watchbilm.org/?userId=${USER_ID}&meta=true`, {
@@ -116,6 +186,24 @@ describe('bilm backend api', () => {
     expect(body.exists).toBe(true);
     expect(body.updatedAtMs).toBe(1711234567890);
     expect(body.deviceId).toBe('meta-device');
+  });
+
+  it('falls back to kv when D1 has no row', async () => {
+    const fallbackPayload = {
+      schema: 'bilm-backup-v1',
+      meta: { updatedAtMs: 1713333333333, deviceId: 'kv-device' }
+    };
+    await kv.put(`user-${USER_ID}`, JSON.stringify(fallbackPayload), {
+      metadata: fallbackPayload.meta
+    });
+
+    const response = await worker.fetch(new Request(`https://data-api.watchbilm.org/?userId=${USER_ID}`, {
+      headers: { authorization: 'Bearer valid-token' }
+    }), env);
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.meta.deviceId).toBe('kv-device');
   });
 
   it('returns 401 for missing or invalid token', async () => {
@@ -144,14 +232,14 @@ describe('bilm backend api', () => {
   });
 
   it('applies cors only for allowed origins and handles preflight', async () => {
-    const allowedPreflight = await worker.fetch(new Request('https://data-api.watchbilm.org/?userId=' + USER_ID, {
+    const allowedPreflight = await worker.fetch(new Request(`https://data-api.watchbilm.org/?userId=${USER_ID}`, {
       method: 'OPTIONS',
       headers: { origin: ALLOWED_ORIGIN }
     }), env);
     expect(allowedPreflight.status).toBe(204);
     expect(allowedPreflight.headers.get('access-control-allow-origin')).toBe(ALLOWED_ORIGIN);
 
-    const blockedPreflight = await worker.fetch(new Request('https://data-api.watchbilm.org/?userId=' + USER_ID, {
+    const blockedPreflight = await worker.fetch(new Request(`https://data-api.watchbilm.org/?userId=${USER_ID}`, {
       method: 'OPTIONS',
       headers: { origin: DISALLOWED_ORIGIN }
     }), env);
@@ -165,6 +253,43 @@ describe('bilm backend api', () => {
       }
     }), env);
     expect(response.headers.get('access-control-allow-origin')).toBeNull();
+  });
+
+  it('rejects payloads that contain credential-like fields', async () => {
+    const response = await worker.fetch(new Request(`https://data-api.watchbilm.org/?userId=${USER_ID}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        data: {
+          schema: 'bilm-backup-v1',
+          auth_token: 'do-not-store'
+        }
+      })
+    }), env);
+
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toBe('credential_storage_forbidden');
+  });
+
+  it('imports snapshots into D1 when admin token is valid', async () => {
+    const response = await worker.fetch(new Request('https://data-api.watchbilm.org/?bulk=true', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-admin-token': 'top-secret-token'
+      },
+      body: JSON.stringify({
+        [USER_ID]: { schema: 'bilm-backup-v1', meta: { updatedAtMs: 1720000000000 } }
+      })
+    }), env);
+
+    expect(response.status).toBe(200);
+    expect(d1.rows.has(USER_ID)).toBe(true);
   });
 
   it('rejects import and bulk routes without valid admin token', async () => {

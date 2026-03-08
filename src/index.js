@@ -3,6 +3,49 @@ import { createRemoteJWKSet, jwtVerify } from 'jose';
 const DEFAULT_PROJECT_ID = 'bilm-7bfe1';
 const FIREBASE_ISSUER_BASE = 'https://securetoken.google.com';
 const FIREBASE_JWKS_URL = 'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com';
+const UPSERT_SNAPSHOT_SQL = `
+  INSERT INTO user_snapshots (user_id, snapshot_json, updated_at_ms, device_id, schema, saved_at)
+  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+  ON CONFLICT(user_id) DO UPDATE SET
+    snapshot_json = excluded.snapshot_json,
+    updated_at_ms = excluded.updated_at_ms,
+    device_id = excluded.device_id,
+    schema = excluded.schema,
+    saved_at = excluded.saved_at
+`;
+const SELECT_SNAPSHOT_SQL = `
+  SELECT snapshot_json, updated_at_ms, device_id, schema
+  FROM user_snapshots
+  WHERE user_id = ?1
+  LIMIT 1
+`;
+const SELECT_SNAPSHOT_META_SQL = `
+  SELECT updated_at_ms, device_id, schema
+  FROM user_snapshots
+  WHERE user_id = ?1
+  LIMIT 1
+`;
+const DISALLOWED_CREDENTIAL_KEYS = new Set([
+  'password',
+  'passwordhash',
+  'password_hash',
+  'passworddigest',
+  'password_digest',
+  'passwd',
+  'passphrase',
+  'salt',
+  'access_token',
+  'accesstoken',
+  'refresh_token',
+  'refreshtoken',
+  'id_token',
+  'idtoken',
+  'session_token',
+  'sessiontoken',
+  'auth_token',
+  'authtoken',
+  'jwt'
+]);
 const DEFAULT_ALLOWED_ORIGINS = new Set([
   'https://watchbilm.org',
   'https://bilm.fly.dev',
@@ -15,6 +58,16 @@ const firebaseJwks = createRemoteJWKSet(new URL(FIREBASE_JWKS_URL));
 
 function getProjectId(env) {
   return String(env?.FIREBASE_PROJECT_ID || DEFAULT_PROJECT_ID).trim() || DEFAULT_PROJECT_ID;
+}
+
+function getD1Database(env) {
+  const db = env?.BILM_DB;
+  return db && typeof db.prepare === 'function' ? db : null;
+}
+
+function getKvNamespace(env) {
+  const kv = env?.BILM_DATA;
+  return kv && typeof kv.get === 'function' ? kv : null;
 }
 
 function normalizeUserId(value) {
@@ -106,6 +159,39 @@ function getSnapshotMetadata(snapshot) {
   };
 }
 
+function normalizeCredentialKey(key) {
+  return String(key || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
+}
+
+function assertNoCredentialStorage(payload, corsOrigin) {
+  if (!payload || typeof payload !== 'object') return;
+
+  const stack = [payload];
+  let inspected = 0;
+  while (stack.length) {
+    const current = stack.pop();
+    if (!current || typeof current !== 'object') continue;
+    inspected += 1;
+    if (inspected > 5000) break;
+
+    for (const [rawKey, rawValue] of Object.entries(current)) {
+      const key = normalizeCredentialKey(rawKey);
+      if (
+        DISALLOWED_CREDENTIAL_KEYS.has(key) &&
+        rawValue !== null &&
+        typeof rawValue !== 'undefined' &&
+        String(rawValue).trim() !== ''
+      ) {
+        throw jsonResponse(400, {
+          error: 'credential_storage_forbidden',
+          message: 'Credential-like fields are not allowed in snapshot storage.'
+        }, corsOrigin);
+      }
+      if (rawValue && typeof rawValue === 'object') stack.push(rawValue);
+    }
+  }
+}
+
 async function requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId }) {
   const token = getBearerToken(request);
   if (!token) {
@@ -144,7 +230,114 @@ function requireAdminToken({ request, corsOrigin, env }) {
   }
 }
 
+function assertStorageConfigured(env, corsOrigin) {
+  if (!getD1Database(env) && !getKvNamespace(env)) {
+    throw jsonResponse(503, {
+      error: 'storage_not_configured',
+      message: 'No storage backend is configured. Bind BILM_DB (D1) and/or BILM_DATA (KV).'
+    }, corsOrigin);
+  }
+}
+
+async function writeSnapshotToD1({ env, userId, snapshotJson, metadata }) {
+  const db = getD1Database(env);
+  if (!db) return false;
+  await db
+    .prepare(UPSERT_SNAPSHOT_SQL)
+    .bind(
+      userId,
+      snapshotJson,
+      metadata.updatedAtMs,
+      metadata.deviceId,
+      metadata.schema,
+      metadata.savedAt
+    )
+    .run();
+  return true;
+}
+
+async function writeSnapshotToKv({ env, userId, snapshotJson, metadata }) {
+  const kv = getKvNamespace(env);
+  if (!kv) return false;
+  await kv.put(`user-${userId}`, snapshotJson, { metadata });
+  return true;
+}
+
+async function persistSnapshot({ env, userId, snapshot, corsOrigin }) {
+  assertNoCredentialStorage(snapshot, corsOrigin);
+
+  const metadata = getSnapshotMetadata(snapshot);
+  const snapshotJson = JSON.stringify(snapshot || {});
+  let stored = false;
+
+  if (await writeSnapshotToD1({ env, userId, snapshotJson, metadata })) {
+    stored = true;
+  }
+
+  if (await writeSnapshotToKv({ env, userId, snapshotJson, metadata })) {
+    stored = true;
+  }
+
+  if (!stored) {
+    throw jsonResponse(503, {
+      error: 'storage_not_configured',
+      message: 'No storage backend is configured. Bind BILM_DB (D1) and/or BILM_DATA (KV).'
+    }, corsOrigin);
+  }
+}
+
+async function readSnapshotValue({ env, userId }) {
+  const db = getD1Database(env);
+  if (db) {
+    const row = await db.prepare(SELECT_SNAPSHOT_SQL).bind(userId).first();
+    if (row && typeof row.snapshot_json === 'string') {
+      return row.snapshot_json;
+    }
+  }
+
+  const kv = getKvNamespace(env);
+  if (kv) {
+    return await kv.get(`user-${userId}`);
+  }
+
+  return null;
+}
+
+async function readSnapshotMeta({ env, userId }) {
+  const db = getD1Database(env);
+  if (db) {
+    const row = await db.prepare(SELECT_SNAPSHOT_META_SQL).bind(userId).first();
+    if (row) {
+      return {
+        exists: true,
+        updatedAtMs: Number(row.updated_at_ms || 0) || null,
+        deviceId: String(row.device_id || '').trim() || null,
+        schema: String(row.schema || '').trim() || null
+      };
+    }
+  }
+
+  const kv = getKvNamespace(env);
+  if (kv) {
+    const { value, metadata } = await kv.getWithMetadata(`user-${userId}`, 'text');
+    return {
+      exists: value !== null,
+      updatedAtMs: Number(metadata?.updatedAtMs || 0) || null,
+      deviceId: String(metadata?.deviceId || '').trim() || null,
+      schema: String(metadata?.schema || '').trim() || null
+    };
+  }
+
+  return {
+    exists: false,
+    updatedAtMs: null,
+    deviceId: null,
+    schema: null
+  };
+}
+
 async function handleImportRequest({ request, env, corsOrigin }) {
+  assertStorageConfigured(env, corsOrigin);
   requireAdminToken({ request, corsOrigin, env });
   const data = await parseJsonBody(request, corsOrigin);
   const writes = [];
@@ -157,10 +350,7 @@ async function handleImportRequest({ request, env, corsOrigin }) {
       if (!isValidUserId(userId)) {
         throw jsonResponse(400, { error: 'invalid_user_id', message: `Invalid userId: ${docId}` }, corsOrigin);
       }
-      const kvKey = `user-${userId}`;
-      writes.push(env.BILM_DATA.put(kvKey, JSON.stringify(docData || {}), {
-        metadata: getSnapshotMetadata(docData)
-      }));
+      writes.push(persistSnapshot({ env, userId, snapshot: docData || {}, corsOrigin }));
       count += 1;
       if (writes.length >= 25) {
         await Promise.all(writes);
@@ -174,6 +364,7 @@ async function handleImportRequest({ request, env, corsOrigin }) {
 }
 
 async function handleBulkImportRequest({ request, env, corsOrigin }) {
+  assertStorageConfigured(env, corsOrigin);
   requireAdminToken({ request, corsOrigin, env });
   const data = await parseJsonBody(request, corsOrigin);
   const writes = [];
@@ -182,10 +373,7 @@ async function handleBulkImportRequest({ request, env, corsOrigin }) {
   for (const [docId, docData] of Object.entries(data || {})) {
     const userId = normalizeUserId(docId);
     if (!isValidUserId(userId)) continue;
-    const kvKey = `user-${userId}`;
-    writes.push(env.BILM_DATA.put(kvKey, JSON.stringify(docData || {}), {
-      metadata: getSnapshotMetadata(docData)
-    }));
+    writes.push(persistSnapshot({ env, userId, snapshot: docData || {}, corsOrigin }));
     count += 1;
     if (writes.length >= 25) {
       await Promise.all(writes);
@@ -198,6 +386,7 @@ async function handleBulkImportRequest({ request, env, corsOrigin }) {
 }
 
 async function handleGetSnapshot({ request, env, corsOrigin, verifyIdToken }) {
+  assertStorageConfigured(env, corsOrigin);
   const url = new URL(request.url);
   const userId = normalizeUserId(url.searchParams.get('userId'));
   if (!isValidUserId(userId)) {
@@ -206,21 +395,13 @@ async function handleGetSnapshot({ request, env, corsOrigin, verifyIdToken }) {
 
   await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId });
 
-  const kvKey = `user-${userId}`;
   const wantsMeta = url.searchParams.get('meta') === 'true';
 
   if (wantsMeta) {
-    const { value, metadata } = await env.BILM_DATA.getWithMetadata(kvKey, 'text');
-    const updatedAtMs = Number(metadata?.updatedAtMs || 0) || null;
-    return jsonResponse(200, {
-      exists: value !== null,
-      updatedAtMs,
-      deviceId: String(metadata?.deviceId || '').trim() || null,
-      schema: String(metadata?.schema || '').trim() || null
-    }, corsOrigin);
+    return jsonResponse(200, await readSnapshotMeta({ env, userId }), corsOrigin);
   }
 
-  const value = await env.BILM_DATA.get(kvKey);
+  const value = await readSnapshotValue({ env, userId });
   if (value === null) {
     return jsonResponse(404, { error: 'not_found', message: 'No snapshot found for this user.' }, corsOrigin);
   }
@@ -229,6 +410,7 @@ async function handleGetSnapshot({ request, env, corsOrigin, verifyIdToken }) {
 }
 
 async function handleSaveSnapshot({ request, env, corsOrigin, verifyIdToken }) {
+  assertStorageConfigured(env, corsOrigin);
   const body = await parseJsonBody(request, corsOrigin);
   const userId = normalizeUserId(body?.userId);
   if (!isValidUserId(userId)) {
@@ -241,11 +423,8 @@ async function handleSaveSnapshot({ request, env, corsOrigin, verifyIdToken }) {
     return jsonResponse(400, { error: 'missing_data', message: 'Snapshot data is required.' }, corsOrigin);
   }
 
-  const kvKey = `user-${userId}`;
   const payload = body.data;
-  await env.BILM_DATA.put(kvKey, JSON.stringify(payload), {
-    metadata: getSnapshotMetadata(payload)
-  });
+  await persistSnapshot({ env, userId, snapshot: payload, corsOrigin });
 
   return jsonResponse(200, { ok: true, saved: true }, corsOrigin);
 }

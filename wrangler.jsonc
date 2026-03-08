@@ -30,5 +30,13 @@
 			"binding": "BILM_DATA",
 			"id": "51288c08e9854811bd58d65cf64ca675"
 		}
+	],
+	"d1_databases": [
+		{
+			"binding": "BILM_DB",
+			"database_name": "bilm-data",
+			"database_id": "ad5148bf-a47b-4a2f-a200-92f83336d0fb",
+			"migrations_dir": "migrations"
+		}
 	]
 }
