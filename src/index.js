@@ -25,6 +25,44 @@ const SELECT_SNAPSHOT_META_SQL = `
   WHERE user_id = ?1
   LIMIT 1
 `;
+const UPSERT_LIST_SYNC_ITEM_SQL = `
+  INSERT INTO list_sync_items (
+    user_id,
+    list_key,
+    item_key,
+    item_json,
+    updated_at_ms,
+    deleted_at_ms,
+    device_id,
+    saved_at
+  )
+  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+  ON CONFLICT(user_id, list_key, item_key) DO UPDATE SET
+    item_json = excluded.item_json,
+    updated_at_ms = excluded.updated_at_ms,
+    deleted_at_ms = excluded.deleted_at_ms,
+    device_id = excluded.device_id,
+    saved_at = excluded.saved_at
+  WHERE excluded.updated_at_ms >= list_sync_items.updated_at_ms
+`;
+const SELECT_LIST_SYNC_CHANGES_SQL = `
+  SELECT list_key, item_key, item_json, updated_at_ms, deleted_at_ms
+  FROM list_sync_items
+  WHERE user_id = ?1
+    AND updated_at_ms > ?2
+  ORDER BY updated_at_ms ASC
+  LIMIT ?3
+`;
+const LIST_SYNC_KEYS = new Set([
+  'bilm-favorites',
+  'bilm-watch-later',
+  'bilm-continue-watching',
+  'bilm-watch-history',
+  'bilm-search-history',
+  'bilm-shared-chat',
+  'bilm-history-movies',
+  'bilm-history-tv'
+]);
 const DISALLOWED_CREDENTIAL_KEYS = new Set([
   'password',
   'passwordhash',
@@ -77,6 +115,19 @@ function normalizeUserId(value) {
 function isValidUserId(userId) {
   const normalized = normalizeUserId(userId);
   return normalized.length >= 25 && normalized.length <= 30;
+}
+
+function normalizeListKey(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function isValidListKey(value) {
+  const key = normalizeListKey(value);
+  return LIST_SYNC_KEYS.has(key);
+}
+
+function normalizeItemKey(value) {
+  return String(value || '').trim();
 }
 
 function createCorsHeaders(corsOrigin = '') {
@@ -239,6 +290,15 @@ function assertStorageConfigured(env, corsOrigin) {
   }
 }
 
+function assertD1Configured(env, corsOrigin) {
+  if (!getD1Database(env)) {
+    throw jsonResponse(503, {
+      error: 'd1_not_configured',
+      message: 'BILM_DB (D1) is required for list sync endpoints.'
+    }, corsOrigin);
+  }
+}
+
 async function writeSnapshotToD1({ env, userId, snapshotJson, metadata }) {
   const db = getD1Database(env);
   if (!db) return false;
@@ -334,6 +394,180 @@ async function readSnapshotMeta({ env, userId }) {
     deviceId: null,
     schema: null
   };
+}
+
+function normalizeUpdatedAtMs(value) {
+  const parsed = Number(value || 0);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return Date.now();
+  }
+  return Math.floor(parsed);
+}
+
+function normalizeListSyncOperation(rawOperation, corsOrigin, index = 0) {
+  const listKey = normalizeListKey(rawOperation?.listKey);
+  if (!isValidListKey(listKey)) {
+    throw jsonResponse(400, {
+      error: 'invalid_list_key',
+      message: `Invalid listKey at operations[${index}].`
+    }, corsOrigin);
+  }
+
+  const itemKey = normalizeItemKey(rawOperation?.itemKey);
+  if (!itemKey || itemKey.length > 255) {
+    throw jsonResponse(400, {
+      error: 'invalid_item_key',
+      message: `Invalid itemKey at operations[${index}].`
+    }, corsOrigin);
+  }
+
+  const deleted = rawOperation?.deleted === true;
+  const updatedAtMs = normalizeUpdatedAtMs(rawOperation?.updatedAtMs);
+  const payloadCandidate = rawOperation?.payload ?? rawOperation?.item ?? rawOperation?.value ?? null;
+
+  if (!deleted) {
+    if (!payloadCandidate || typeof payloadCandidate !== 'object' || Array.isArray(payloadCandidate)) {
+      throw jsonResponse(400, {
+        error: 'invalid_payload',
+        message: `Non-deleted operation requires object payload at operations[${index}].`
+      }, corsOrigin);
+    }
+    assertNoCredentialStorage(payloadCandidate, corsOrigin);
+  }
+
+  return {
+    listKey,
+    itemKey,
+    deleted,
+    updatedAtMs,
+    payload: deleted ? null : payloadCandidate
+  };
+}
+
+function parseSinceMs(rawValue) {
+  const value = Number(rawValue || 0);
+  if (!Number.isFinite(value) || value < 0) return 0;
+  return Math.floor(value);
+}
+
+function parsePullLimit(rawValue) {
+  const value = Number(rawValue || 250);
+  if (!Number.isFinite(value)) return 250;
+  return Math.max(1, Math.min(500, Math.floor(value)));
+}
+
+async function handleListSyncPush({ request, env, corsOrigin, verifyIdToken }) {
+  assertD1Configured(env, corsOrigin);
+  const body = await parseJsonBody(request, corsOrigin);
+  const userId = normalizeUserId(body?.userId);
+  if (!isValidUserId(userId)) {
+    return jsonResponse(400, { error: 'invalid_user_id', message: 'Invalid or missing userId.' }, corsOrigin);
+  }
+
+  await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId });
+
+  const operations = Array.isArray(body?.operations) ? body.operations : [];
+  if (!operations.length) {
+    return jsonResponse(200, { ok: true, processed: 0, cursorMs: parseSinceMs(body?.cursorMs) }, corsOrigin);
+  }
+  if (operations.length > 1000) {
+    return jsonResponse(400, { error: 'too_many_operations', message: 'Maximum 1000 operations per request.' }, corsOrigin);
+  }
+
+  const db = getD1Database(env);
+  const deviceId = String(body?.deviceId || '').trim() || null;
+  const nowIso = new Date().toISOString();
+  let cursorMs = parseSinceMs(body?.cursorMs);
+  let processed = 0;
+
+  for (let index = 0; index < operations.length; index += 1) {
+    const operation = normalizeListSyncOperation(operations[index], corsOrigin, index);
+    const itemJson = operation.deleted ? null : JSON.stringify(operation.payload);
+    const deletedAtMs = operation.deleted ? operation.updatedAtMs : null;
+    await db
+      .prepare(UPSERT_LIST_SYNC_ITEM_SQL)
+      .bind(
+        userId,
+        operation.listKey,
+        operation.itemKey,
+        itemJson,
+        operation.updatedAtMs,
+        deletedAtMs,
+        deviceId,
+        nowIso
+      )
+      .run();
+    processed += 1;
+    if (operation.updatedAtMs > cursorMs) {
+      cursorMs = operation.updatedAtMs;
+    }
+  }
+
+  return jsonResponse(200, { ok: true, processed, cursorMs }, corsOrigin);
+}
+
+async function handleListSyncPull({ request, env, corsOrigin, verifyIdToken }) {
+  assertD1Configured(env, corsOrigin);
+  const url = new URL(request.url);
+  const userId = normalizeUserId(url.searchParams.get('userId'));
+  if (!isValidUserId(userId)) {
+    return jsonResponse(400, { error: 'invalid_user_id', message: 'Invalid or missing userId.' }, corsOrigin);
+  }
+
+  await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId });
+
+  const sinceMs = parseSinceMs(url.searchParams.get('since'));
+  const limit = parsePullLimit(url.searchParams.get('limit'));
+  const db = getD1Database(env);
+  const query = await db.prepare(SELECT_LIST_SYNC_CHANGES_SQL).bind(userId, sinceMs, limit).all();
+  const rows = Array.isArray(query?.results) ? query.results : [];
+
+  let cursorMs = sinceMs;
+  const operations = [];
+
+  rows.forEach((row) => {
+    const updatedAtMs = parseSinceMs(row?.updated_at_ms);
+    if (updatedAtMs > cursorMs) {
+      cursorMs = updatedAtMs;
+    }
+    const listKey = normalizeListKey(row?.list_key);
+    const itemKey = normalizeItemKey(row?.item_key);
+    if (!isValidListKey(listKey) || !itemKey) return;
+
+    const deleted = Number(row?.deleted_at_ms || 0) > 0;
+    if (deleted) {
+      operations.push({
+        listKey,
+        itemKey,
+        deleted: true,
+        updatedAtMs
+      });
+      return;
+    }
+
+    let payload = null;
+    try {
+      payload = JSON.parse(String(row?.item_json || 'null'));
+    } catch {
+      payload = null;
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return;
+
+    operations.push({
+      listKey,
+      itemKey,
+      deleted: false,
+      updatedAtMs,
+      payload
+    });
+  });
+
+  return jsonResponse(200, {
+    ok: true,
+    sinceMs,
+    cursorMs,
+    operations
+  }, corsOrigin);
 }
 
 async function handleImportRequest({ request, env, corsOrigin }) {
@@ -447,6 +681,14 @@ export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOri
       }
 
       try {
+        if (request.method === 'POST' && url.pathname === '/sync/lists/push') {
+          return await handleListSyncPush({ request, env, corsOrigin, verifyIdToken });
+        }
+
+        if (request.method === 'GET' && url.pathname === '/sync/lists/pull') {
+          return await handleListSyncPull({ request, env, corsOrigin, verifyIdToken });
+        }
+
         if (request.method === 'POST' && url.searchParams.get('import') === 'true') {
           return await handleImportRequest({ request, env, corsOrigin });
         }

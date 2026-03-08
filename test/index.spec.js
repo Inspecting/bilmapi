@@ -45,20 +45,46 @@ class MemoryD1Statement {
   }
 
   async run() {
-    if (!this.sql.startsWith('insert into user_snapshots')) {
-      throw new Error(`Unsupported D1 run SQL in test: ${this.sql}`);
+    if (this.sql.startsWith('insert into user_snapshots')) {
+      const [userId, snapshotJson, updatedAtMs, deviceId, schema, savedAt] = this.params;
+      this.db.rows.set(String(userId), {
+        user_id: String(userId),
+        snapshot_json: String(snapshotJson),
+        updated_at_ms: Number(updatedAtMs || 0) || 0,
+        device_id: deviceId || null,
+        schema: schema || null,
+        saved_at: String(savedAt || '')
+      });
+      return { success: true };
     }
 
-    const [userId, snapshotJson, updatedAtMs, deviceId, schema, savedAt] = this.params;
-    this.db.rows.set(String(userId), {
-      user_id: String(userId),
-      snapshot_json: String(snapshotJson),
-      updated_at_ms: Number(updatedAtMs || 0) || 0,
-      device_id: deviceId || null,
-      schema: schema || null,
-      saved_at: String(savedAt || '')
-    });
-    return { success: true };
+    if (this.sql.startsWith('insert into list_sync_items')) {
+      const [userId, listKey, itemKey, itemJson, updatedAtMs, deletedAtMs, deviceId, savedAt] = this.params;
+      const normalizedUserId = String(userId || '');
+      const normalizedListKey = String(listKey || '');
+      const normalizedItemKey = String(itemKey || '');
+      const compositeKey = `${normalizedUserId}|${normalizedListKey}|${normalizedItemKey}`;
+      const incomingUpdatedAt = Number(updatedAtMs || 0) || 0;
+      const current = this.db.listRows.get(compositeKey);
+      if (current && Number(current.updated_at_ms || 0) > incomingUpdatedAt) {
+        return { success: true };
+      }
+      this.db.listRows.set(compositeKey, {
+        user_id: normalizedUserId,
+        list_key: normalizedListKey,
+        item_key: normalizedItemKey,
+        item_json: itemJson === null || typeof itemJson === 'undefined' ? null : String(itemJson),
+        updated_at_ms: incomingUpdatedAt,
+        deleted_at_ms: deletedAtMs === null || typeof deletedAtMs === 'undefined'
+          ? null
+          : (Number(deletedAtMs || 0) || 0),
+        device_id: deviceId || null,
+        saved_at: String(savedAt || '')
+      });
+      return { success: true };
+    }
+
+    throw new Error(`Unsupported D1 run SQL in test: ${this.sql}`);
   }
 
   async first() {
@@ -85,11 +111,35 @@ class MemoryD1Statement {
 
     throw new Error(`Unsupported D1 first SQL in test: ${this.sql}`);
   }
+
+  async all() {
+    if (this.sql.includes('from list_sync_items')) {
+      const [userId, sinceMs, limit] = this.params;
+      const normalizedUserId = String(userId || '');
+      const since = Number(sinceMs || 0) || 0;
+      const max = Number(limit || 250) || 250;
+      const results = [...this.db.listRows.values()]
+        .filter((row) => row.user_id === normalizedUserId && Number(row.updated_at_ms || 0) > since)
+        .sort((a, b) => Number(a.updated_at_ms || 0) - Number(b.updated_at_ms || 0))
+        .slice(0, Math.max(1, max))
+        .map((row) => ({
+          list_key: row.list_key,
+          item_key: row.item_key,
+          item_json: row.item_json,
+          updated_at_ms: row.updated_at_ms,
+          deleted_at_ms: row.deleted_at_ms
+        }));
+      return { results };
+    }
+
+    throw new Error(`Unsupported D1 all SQL in test: ${this.sql}`);
+  }
 }
 
 class MemoryD1 {
   constructor() {
     this.rows = new Map();
+    this.listRows = new Map();
   }
 
   prepare(sql) {
@@ -274,6 +324,123 @@ describe('bilm backend api', () => {
     expect(response.status).toBe(400);
     const body = await response.json();
     expect(body.error).toBe('credential_storage_forbidden');
+  });
+
+  it('pushes and pulls incremental list sync operations', async () => {
+    const pushResponse = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/lists/push', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        operations: [
+          {
+            listKey: 'bilm-watch-history',
+            itemKey: 'movie:10',
+            updatedAtMs: 1721000000000,
+            deleted: false,
+            payload: { key: 'movie-10', type: 'movie', id: 10, updatedAt: 1721000000000 }
+          },
+          {
+            listKey: 'bilm-watch-history',
+            itemKey: 'movie:9',
+            updatedAtMs: 1721000000100,
+            deleted: true
+          }
+        ]
+      })
+    }), env);
+
+    expect(pushResponse.status).toBe(200);
+    const pushBody = await pushResponse.json();
+    expect(pushBody.ok).toBe(true);
+    expect(pushBody.processed).toBe(2);
+    expect(pushBody.cursorMs).toBe(1721000000100);
+
+    const pullResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/sync/lists/pull?userId=${USER_ID}&since=0`, {
+      method: 'GET',
+      headers: { authorization: 'Bearer valid-token' }
+    }), env);
+
+    expect(pullResponse.status).toBe(200);
+    const pullBody = await pullResponse.json();
+    expect(pullBody.ok).toBe(true);
+    expect(Array.isArray(pullBody.operations)).toBe(true);
+    expect(pullBody.operations.length).toBe(2);
+    expect(pullBody.operations[0].listKey).toBe('bilm-watch-history');
+    expect(pullBody.operations[0].deleted).toBe(false);
+    expect(pullBody.operations[1].deleted).toBe(true);
+  });
+
+  it('does not let stale upserts resurrect newer tombstones', async () => {
+    const deleteNewer = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/lists/push', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        operations: [
+          {
+            listKey: 'bilm-continue-watching',
+            itemKey: 'tv:22',
+            updatedAtMs: 1722000000200,
+            deleted: true
+          }
+        ]
+      })
+    }), env);
+    expect(deleteNewer.status).toBe(200);
+
+    const staleUpsert = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/lists/push', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        operations: [
+          {
+            listKey: 'bilm-continue-watching',
+            itemKey: 'tv:22',
+            updatedAtMs: 1722000000100,
+            deleted: false,
+            payload: { key: 'tv-22', type: 'tv', id: 22, updatedAt: 1722000000100 }
+          }
+        ]
+      })
+    }), env);
+    expect(staleUpsert.status).toBe(200);
+
+    const pull = await worker.fetch(new Request(`https://data-api.watchbilm.org/sync/lists/pull?userId=${USER_ID}&since=0`, {
+      method: 'GET',
+      headers: { authorization: 'Bearer valid-token' }
+    }), env);
+
+    expect(pull.status).toBe(200);
+    const body = await pull.json();
+    expect(body.operations.length).toBe(1);
+    expect(body.operations[0].deleted).toBe(true);
+    expect(body.operations[0].updatedAtMs).toBe(1722000000200);
+  });
+
+  it('requires auth on list sync routes', async () => {
+    const push = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/lists/push', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        userId: USER_ID,
+        operations: []
+      })
+    }), env);
+    expect(push.status).toBe(401);
+
+    const pull = await worker.fetch(new Request(`https://data-api.watchbilm.org/sync/lists/pull?userId=${USER_ID}&since=0`), env);
+    expect(pull.status).toBe(401);
   });
 
   it('imports snapshots into D1 when admin token is valid', async () => {
