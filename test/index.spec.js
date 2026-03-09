@@ -84,11 +84,95 @@ class MemoryD1Statement {
       return { success: true };
     }
 
+    if (this.sql.startsWith('insert into sync_items')) {
+      const [userId, sectorKey, itemKey, itemJson, updatedAtMs, deletedAtMs, deviceId, opId, savedAt] = this.params;
+      const normalizedUserId = String(userId || '');
+      const normalizedSectorKey = String(sectorKey || '');
+      const normalizedItemKey = String(itemKey || '');
+      const compositeKey = `${normalizedUserId}|${normalizedSectorKey}|${normalizedItemKey}`;
+      const incomingUpdatedAt = Number(updatedAtMs || 0) || 0;
+      const incomingOpId = String(opId || '');
+      const current = this.db.syncRows.get(compositeKey);
+      if (current) {
+        const currentUpdatedAt = Number(current.updated_at_ms || 0) || 0;
+        const currentOpId = String(current.op_id || '');
+        const staleByTime = incomingUpdatedAt < currentUpdatedAt;
+        const staleByOpId = incomingUpdatedAt === currentUpdatedAt && incomingOpId < currentOpId;
+        if (staleByTime || staleByOpId) {
+          return { success: true, meta: { changes: 0 } };
+        }
+      }
+      this.db.syncRows.set(compositeKey, {
+        user_id: normalizedUserId,
+        sector_key: normalizedSectorKey,
+        item_key: normalizedItemKey,
+        item_json: itemJson === null || typeof itemJson === 'undefined' ? null : String(itemJson),
+        updated_at_ms: incomingUpdatedAt,
+        deleted_at_ms: deletedAtMs === null || typeof deletedAtMs === 'undefined'
+          ? null
+          : (Number(deletedAtMs || 0) || 0),
+        device_id: deviceId || null,
+        op_id: incomingOpId || null,
+        saved_at: String(savedAt || '')
+      });
+      return { success: true, meta: { changes: 1 } };
+    }
+
+    if (this.sql.startsWith('insert into user_sync_state')) {
+      const [userId, migratedAtMs, migrationSource, updatedAtMs, savedAt] = this.params;
+      const normalizedUserId = String(userId || '');
+      const current = this.db.syncStateRows.get(normalizedUserId);
+      this.db.syncStateRows.set(normalizedUserId, {
+        user_id: normalizedUserId,
+        migrated_at_ms: current?.migrated_at_ms || (Number(migratedAtMs || 0) || null),
+        migration_source: current?.migration_source || (String(migrationSource || '').trim() || null),
+        updated_at_ms: Number(updatedAtMs || 0) || 0,
+        saved_at: String(savedAt || '')
+      });
+      return { success: true, meta: { changes: 1 } };
+    }
+
+    if (this.sql.startsWith('delete from sync_items')) {
+      const cutoffMs = Number(this.params[0] || 0) || 0;
+      let deleted = 0;
+      for (const [key, row] of this.db.syncRows.entries()) {
+        const deletedAtMs = Number(row.deleted_at_ms || 0) || 0;
+        if (deletedAtMs > 0 && deletedAtMs < cutoffMs) {
+          this.db.syncRows.delete(key);
+          deleted += 1;
+        }
+      }
+      return { success: true, meta: { changes: deleted } };
+    }
+
+    if (this.sql.startsWith('delete from list_sync_items')) {
+      const cutoffMs = Number(this.params[0] || 0) || 0;
+      let deleted = 0;
+      for (const [key, row] of this.db.listRows.entries()) {
+        const deletedAtMs = Number(row.deleted_at_ms || 0) || 0;
+        if (deletedAtMs > 0 && deletedAtMs < cutoffMs) {
+          this.db.listRows.delete(key);
+          deleted += 1;
+        }
+      }
+      return { success: true, meta: { changes: deleted } };
+    }
+
     throw new Error(`Unsupported D1 run SQL in test: ${this.sql}`);
   }
 
   async first() {
     const userId = String(this.params[0] || '');
+    if (this.sql.includes('select migrated_at_ms')) {
+      const syncState = this.db.syncStateRows.get(userId);
+      if (!syncState) return null;
+      return {
+        migrated_at_ms: syncState.migrated_at_ms,
+        migration_source: syncState.migration_source,
+        updated_at_ms: syncState.updated_at_ms
+      };
+    }
+
     const row = this.db.rows.get(userId);
     if (!row) return null;
 
@@ -132,6 +216,31 @@ class MemoryD1Statement {
       return { results };
     }
 
+    if (this.sql.includes('from sync_items')) {
+      const [userId, sinceMs] = this.params;
+      const max = Number(this.params[this.params.length - 1] || 250) || 250;
+      const normalizedUserId = String(userId || '');
+      const since = Number(sinceMs || 0) || 0;
+      const sectorFilters = this.params
+        .slice(2, this.params.length - 1)
+        .map((entry) => String(entry || ''))
+        .filter(Boolean);
+      const results = [...this.db.syncRows.values()]
+        .filter((row) => row.user_id === normalizedUserId && Number(row.updated_at_ms || 0) > since)
+        .filter((row) => !sectorFilters.length || sectorFilters.includes(String(row.sector_key || '')))
+        .sort((a, b) => Number(a.updated_at_ms || 0) - Number(b.updated_at_ms || 0))
+        .slice(0, Math.max(1, max))
+        .map((row) => ({
+          sector_key: row.sector_key,
+          item_key: row.item_key,
+          item_json: row.item_json,
+          updated_at_ms: row.updated_at_ms,
+          deleted_at_ms: row.deleted_at_ms,
+          op_id: row.op_id
+        }));
+      return { results };
+    }
+
     throw new Error(`Unsupported D1 all SQL in test: ${this.sql}`);
   }
 }
@@ -140,6 +249,8 @@ class MemoryD1 {
   constructor() {
     this.rows = new Map();
     this.listRows = new Map();
+    this.syncRows = new Map();
+    this.syncStateRows = new Map();
   }
 
   prepare(sql) {
@@ -441,6 +552,168 @@ describe('bilm backend api', () => {
 
     const pull = await worker.fetch(new Request(`https://data-api.watchbilm.org/sync/lists/pull?userId=${USER_ID}&since=0`), env);
     expect(pull.status).toBe(401);
+  });
+
+  it('pushes and pulls sector sync operations with state metadata', async () => {
+    const push = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        deviceId: 'device-alpha',
+        operations: [
+          {
+            sectorKey: 'watch_history',
+            itemKey: 'movie:44',
+            updatedAtMs: 1723000000000,
+            opId: 'op-1',
+            deleted: false,
+            payload: { key: 'movie-44', type: 'movie', id: 44, updatedAt: 1723000000000 }
+          },
+          {
+            sectorKey: 'chat_messages',
+            itemKey: 'chat:abc',
+            updatedAtMs: 1723000000100,
+            opId: 'op-2',
+            deleted: false,
+            payload: { id: 'abc', text: 'hi', author: 'test', createdAtMs: 1723000000100 }
+          }
+        ]
+      })
+    }), env);
+
+    expect(push.status).toBe(200);
+    const pushBody = await push.json();
+    expect(pushBody.ok).toBe(true);
+    expect(pushBody.processed).toBe(2);
+    expect(pushBody.cursorMs).toBe(1723000000100);
+    expect(push.headers.get('x-request-id')).toBeTruthy();
+
+    const pull = await worker.fetch(new Request(`https://data-api.watchbilm.org/sync/sectors/pull?userId=${USER_ID}&since=0&sectors=chat_messages,watch_history`, {
+      method: 'GET',
+      headers: { authorization: 'Bearer valid-token' }
+    }), env);
+
+    expect(pull.status).toBe(200);
+    const pullBody = await pull.json();
+    expect(pullBody.ok).toBe(true);
+    expect(pullBody.operations.length).toBe(2);
+    expect(pullBody.operations[0].sectorKey).toBe('watch_history');
+    expect(pullBody.operations[1].sectorKey).toBe('chat_messages');
+    expect(pullBody.state.migratedAtMs).toBeNull();
+  });
+
+  it('bootstraps sectors once and skips on subsequent attempts', async () => {
+    const first = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/bootstrap', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        migrationSource: 'firebase_snapshot',
+        operations: [
+          {
+            sectorKey: 'favorites',
+            itemKey: 'movie:90',
+            updatedAtMs: 1724000000000,
+            deleted: false,
+            payload: { key: 'movie-90', type: 'movie', id: 90, updatedAt: 1724000000000 }
+          }
+        ]
+      })
+    }), env);
+
+    expect(first.status).toBe(200);
+    const firstBody = await first.json();
+    expect(firstBody.ok).toBe(true);
+    expect(firstBody.skipped).toBe(false);
+    expect(firstBody.state.migratedAtMs).toBeTruthy();
+    expect(firstBody.state.migrationSource).toBe('firebase_snapshot');
+
+    const second = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/bootstrap', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        migrationSource: 'local_fallback',
+        operations: []
+      })
+    }), env);
+
+    expect(second.status).toBe(200);
+    const secondBody = await second.json();
+    expect(secondBody.ok).toBe(true);
+    expect(secondBody.skipped).toBe(true);
+    expect(secondBody.state.migrationSource).toBe('firebase_snapshot');
+  });
+
+  it('returns chat-specific validation errors with retry metadata', async () => {
+    const payload = 'x'.repeat(2105);
+    const response = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        operations: [
+          {
+            sectorKey: 'chat_messages',
+            itemKey: 'chat:too-long',
+            updatedAtMs: 1725000000000,
+            deleted: false,
+            payload: { id: 'too-long', text: payload, createdAtMs: 1725000000000 }
+          }
+        ]
+      })
+    }), env);
+
+    expect(response.status).toBe(413);
+    const body = await response.json();
+    expect(body.error).toBe('payload_too_large');
+    expect(body.code).toBe('chat_message_too_large');
+    expect(body.retryable).toBe(false);
+    expect(body.requestId).toBeTruthy();
+  });
+
+  it('purges expired tombstones on scheduled run', async () => {
+    d1.syncRows.set(`${USER_ID}|watch_history|movie:1`, {
+      user_id: USER_ID,
+      sector_key: 'watch_history',
+      item_key: 'movie:1',
+      item_json: null,
+      updated_at_ms: 1700000000000,
+      deleted_at_ms: 1700000000000,
+      device_id: 'device-a',
+      op_id: 'op-a',
+      saved_at: new Date().toISOString()
+    });
+    d1.listRows.set(`${USER_ID}|bilm-watch-history|movie:2`, {
+      user_id: USER_ID,
+      list_key: 'bilm-watch-history',
+      item_key: 'movie:2',
+      item_json: null,
+      updated_at_ms: 1700000000000,
+      deleted_at_ms: 1700000000000,
+      device_id: 'device-a',
+      saved_at: new Date().toISOString()
+    });
+    expect(d1.syncRows.size).toBe(1);
+    expect(d1.listRows.size).toBe(1);
+
+    await worker.scheduled({}, env, {});
+
+    expect(d1.syncRows.size).toBe(0);
+    expect(d1.listRows.size).toBe(0);
   });
 
   it('imports snapshots into D1 when admin token is valid', async () => {
