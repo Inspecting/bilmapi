@@ -258,12 +258,13 @@ class MemoryD1 {
   }
 }
 
-function createEnv({ kv = new MemoryKv(), d1 = new MemoryD1() } = {}) {
+function createEnv({ kv = new MemoryKv(), d1 = new MemoryD1(), disableAuth = false } = {}) {
   return {
     BILM_DATA: kv,
     BILM_DB: d1,
     FIREBASE_PROJECT_ID: 'bilm-7bfe1',
-    BILM_ADMIN_TOKEN: 'top-secret-token'
+    BILM_ADMIN_TOKEN: 'top-secret-token',
+    BILM_DISABLE_AUTH: disableAuth ? 'true' : 'false'
   };
 }
 
@@ -552,6 +553,31 @@ describe('bilm backend api', () => {
 
     const pull = await worker.fetch(new Request(`https://data-api.watchbilm.org/sync/lists/pull?userId=${USER_ID}&since=0`), env);
     expect(pull.status).toBe(401);
+  });
+
+  it('allows temporary auth bypass when enabled in env', async () => {
+    const bypassEnv = createEnv({ kv, d1, disableAuth: true });
+    const response = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        userId: USER_ID,
+        operations: [
+          {
+            sectorKey: 'watch_history',
+            itemKey: 'movie:501',
+            updatedAtMs: 1729000000000,
+            deleted: false,
+            payload: { key: 'movie-501', type: 'movie', id: 501, updatedAt: 1729000000000 }
+          }
+        ]
+      })
+    }), bypassEnv);
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.ok).toBe(true);
+    expect(body.processed).toBe(1);
   });
 
   it('pushes and pulls sector sync operations with state metadata', async () => {

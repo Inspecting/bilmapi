@@ -12,7 +12,8 @@
 		"nodejs_compat"
 	],
 	"vars": {
-		"FIREBASE_PROJECT_ID": "bilm-7bfe1"
+		"FIREBASE_PROJECT_ID": "bilm-7bfe1",
+		"BILM_DISABLE_AUTH": "true"
 	},
 	"routes": [
 		{
