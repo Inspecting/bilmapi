@@ -13,7 +13,7 @@
 	],
 	"vars": {
 		"FIREBASE_PROJECT_ID": "bilm-7bfe1",
-		"BILM_DISABLE_AUTH": "true"
+		"BILM_DISABLE_AUTH": "false"
 	},
 	"routes": [
 		{

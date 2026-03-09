@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createWorker } from '../src/index.js';
 
 const USER_ID = '12345678901234567890123456';
@@ -29,6 +29,36 @@ class MemoryKv {
       value: item ? item.value : null,
       metadata: item?.metadata || null
     };
+  }
+}
+
+class MemoryR2Object {
+  constructor(value) {
+    this.value = String(value || '');
+  }
+
+  async text() {
+    return this.value;
+  }
+
+  async arrayBuffer() {
+    return new TextEncoder().encode(this.value).buffer;
+  }
+}
+
+class MemoryR2 {
+  constructor() {
+    this.map = new Map();
+  }
+
+  async put(key, value) {
+    this.map.set(String(key), String(value || ''));
+  }
+
+  async get(key) {
+    const value = this.map.get(String(key));
+    if (typeof value === 'undefined') return null;
+    return new MemoryR2Object(value);
   }
 }
 
@@ -132,6 +162,88 @@ class MemoryD1Statement {
       return { success: true, meta: { changes: 1 } };
     }
 
+    if (this.sql.startsWith('insert into media_cache_entries')) {
+      const [
+        cacheKey,
+        provider,
+        resourceType,
+        queryText,
+        statusCode,
+        contentType,
+        payloadInlineJson,
+        payloadR2Key,
+        fetchedAtMs,
+        expiresAtMs,
+        staleUntilMs,
+        hitCount,
+        lastHitAtMs
+      ] = this.params;
+      const normalizedCacheKey = String(cacheKey || '');
+      this.db.mediaRows.set(normalizedCacheKey, {
+        cache_key: normalizedCacheKey,
+        provider: String(provider || ''),
+        resource_type: String(resourceType || ''),
+        query_text: queryText === null || typeof queryText === 'undefined' ? null : String(queryText),
+        status_code: Number(statusCode || 0) || 200,
+        content_type: String(contentType || ''),
+        payload_inline_json: payloadInlineJson === null || typeof payloadInlineJson === 'undefined'
+          ? null
+          : String(payloadInlineJson),
+        payload_r2_key: payloadR2Key === null || typeof payloadR2Key === 'undefined'
+          ? null
+          : String(payloadR2Key),
+        fetched_at_ms: Number(fetchedAtMs || 0) || 0,
+        expires_at_ms: Number(expiresAtMs || 0) || 0,
+        stale_until_ms: Number(staleUntilMs || 0) || 0,
+        hit_count: Number(hitCount || 0) || 0,
+        last_hit_at_ms: Number(lastHitAtMs || 0) || 0
+      });
+      return { success: true, meta: { changes: 1 } };
+    }
+
+    if (this.sql.startsWith('update media_cache_entries')) {
+      const [cacheKey, lastHitAtMs] = this.params;
+      const key = String(cacheKey || '');
+      const current = this.db.mediaRows.get(key);
+      if (!current) return { success: true, meta: { changes: 0 } };
+      current.hit_count = (Number(current.hit_count || 0) || 0) + 1;
+      current.last_hit_at_ms = Number(lastHitAtMs || 0) || 0;
+      this.db.mediaRows.set(key, current);
+      return { success: true, meta: { changes: 1 } };
+    }
+
+    if (this.sql.startsWith('insert into media_query_metrics')) {
+      const [provider, resourceType, queryText, lastSeenAtMs] = this.params;
+      const key = `${String(provider || '')}|${String(resourceType || '')}|${String(queryText || '')}`;
+      const current = this.db.mediaQueryRows.get(key);
+      this.db.mediaQueryRows.set(key, {
+        provider: String(provider || ''),
+        resource_type: String(resourceType || ''),
+        query_text: String(queryText || ''),
+        hit_count: (Number(current?.hit_count || 0) || 0) + 1,
+        last_seen_at_ms: Number(lastSeenAtMs || 0) || 0
+      });
+      return { success: true, meta: { changes: 1 } };
+    }
+
+    if (this.sql.startsWith('insert into media_refresh_locks')) {
+      const [cacheKey, ownerId, lockUntilMs, updatedAtMs, lockCutoffMs] = this.params;
+      const normalizedCacheKey = String(cacheKey || '');
+      const current = this.db.mediaLocks.get(normalizedCacheKey);
+      const currentUntil = Number(current?.lock_until_ms || 0) || 0;
+      const cutoff = Number(lockCutoffMs || 0) || 0;
+      if (current && currentUntil >= cutoff) {
+        return { success: true, meta: { changes: 0 } };
+      }
+      this.db.mediaLocks.set(normalizedCacheKey, {
+        cache_key: normalizedCacheKey,
+        owner_id: String(ownerId || ''),
+        lock_until_ms: Number(lockUntilMs || 0) || 0,
+        updated_at_ms: Number(updatedAtMs || 0) || 0
+      });
+      return { success: true, meta: { changes: 1 } };
+    }
+
     if (this.sql.startsWith('delete from sync_items')) {
       const cutoffMs = Number(this.params[0] || 0) || 0;
       let deleted = 0;
@@ -139,6 +251,44 @@ class MemoryD1Statement {
         const deletedAtMs = Number(row.deleted_at_ms || 0) || 0;
         if (deletedAtMs > 0 && deletedAtMs < cutoffMs) {
           this.db.syncRows.delete(key);
+          deleted += 1;
+        }
+      }
+      return { success: true, meta: { changes: deleted } };
+    }
+
+    if (this.sql.startsWith('delete from media_refresh_locks where cache_key')) {
+      const [cacheKey, ownerId] = this.params;
+      const normalizedCacheKey = String(cacheKey || '');
+      const lock = this.db.mediaLocks.get(normalizedCacheKey);
+      if (!lock) return { success: true, meta: { changes: 0 } };
+      if (String(lock.owner_id || '') !== String(ownerId || '')) {
+        return { success: true, meta: { changes: 0 } };
+      }
+      this.db.mediaLocks.delete(normalizedCacheKey);
+      return { success: true, meta: { changes: 1 } };
+    }
+
+    if (this.sql.startsWith('delete from media_cache_entries')) {
+      const cutoffMs = Number(this.params[0] || 0) || 0;
+      let deleted = 0;
+      for (const [key, row] of this.db.mediaRows.entries()) {
+        const staleUntilMs = Number(row.stale_until_ms || 0) || 0;
+        if (staleUntilMs > 0 && staleUntilMs < cutoffMs) {
+          this.db.mediaRows.delete(key);
+          deleted += 1;
+        }
+      }
+      return { success: true, meta: { changes: deleted } };
+    }
+
+    if (this.sql.startsWith('delete from media_refresh_locks where lock_until_ms')) {
+      const cutoffMs = Number(this.params[0] || 0) || 0;
+      let deleted = 0;
+      for (const [key, row] of this.db.mediaLocks.entries()) {
+        const lockUntilMs = Number(row.lock_until_ms || 0) || 0;
+        if (lockUntilMs > 0 && lockUntilMs < cutoffMs) {
+          this.db.mediaLocks.delete(key);
           deleted += 1;
         }
       }
@@ -162,9 +312,9 @@ class MemoryD1Statement {
   }
 
   async first() {
-    const userId = String(this.params[0] || '');
+    const key = String(this.params[0] || '');
     if (this.sql.includes('select migrated_at_ms')) {
-      const syncState = this.db.syncStateRows.get(userId);
+      const syncState = this.db.syncStateRows.get(key);
       if (!syncState) return null;
       return {
         migrated_at_ms: syncState.migrated_at_ms,
@@ -173,7 +323,26 @@ class MemoryD1Statement {
       };
     }
 
-    const row = this.db.rows.get(userId);
+    if (this.sql.includes('from media_cache_entries')) {
+      const mediaRow = this.db.mediaRows.get(key);
+      if (!mediaRow) return null;
+      return {
+        cache_key: mediaRow.cache_key,
+        provider: mediaRow.provider,
+        resource_type: mediaRow.resource_type,
+        status_code: mediaRow.status_code,
+        content_type: mediaRow.content_type,
+        payload_inline_json: mediaRow.payload_inline_json,
+        payload_r2_key: mediaRow.payload_r2_key,
+        fetched_at_ms: mediaRow.fetched_at_ms,
+        expires_at_ms: mediaRow.expires_at_ms,
+        stale_until_ms: mediaRow.stale_until_ms,
+        hit_count: mediaRow.hit_count,
+        last_hit_at_ms: mediaRow.last_hit_at_ms
+      };
+    }
+
+    const row = this.db.rows.get(key);
     if (!row) return null;
 
     if (this.sql.includes('select snapshot_json')) {
@@ -251,6 +420,9 @@ class MemoryD1 {
     this.listRows = new Map();
     this.syncRows = new Map();
     this.syncStateRows = new Map();
+    this.mediaRows = new Map();
+    this.mediaQueryRows = new Map();
+    this.mediaLocks = new Map();
   }
 
   prepare(sql) {
@@ -258,13 +430,22 @@ class MemoryD1 {
   }
 }
 
-function createEnv({ kv = new MemoryKv(), d1 = new MemoryD1(), disableAuth = false } = {}) {
+function createEnv({
+  kv = new MemoryKv(),
+  d1 = new MemoryD1(),
+  r2 = new MemoryR2(),
+  disableAuth = false
+} = {}) {
   return {
     BILM_DATA: kv,
     BILM_DB: d1,
+    BILM_R2: r2,
     FIREBASE_PROJECT_ID: 'bilm-7bfe1',
     BILM_ADMIN_TOKEN: 'top-secret-token',
-    BILM_DISABLE_AUTH: disableAuth ? 'true' : 'false'
+    BILM_DISABLE_AUTH: disableAuth ? 'true' : 'false',
+    TMDB_API_KEY: 'tmdb-test-key',
+    TMDB_READ_ACCESS_TOKEN: '',
+    OMDB_API_KEY: 'omdb-test-key'
   };
 }
 
@@ -279,14 +460,20 @@ function createVerifier() {
 describe('bilm backend api', () => {
   let kv;
   let d1;
+  let r2;
   let env;
   let worker;
 
   beforeEach(() => {
     kv = new MemoryKv();
     d1 = new MemoryD1();
-    env = createEnv({ kv, d1 });
+    r2 = new MemoryR2();
+    env = createEnv({ kv, d1, r2 });
     worker = createWorker({ verifyIdToken: createVerifier() });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it('saves and retrieves snapshot with valid auth', async () => {
@@ -415,6 +602,15 @@ describe('bilm backend api', () => {
       }
     }), env);
     expect(response.headers.get('access-control-allow-origin')).toBeNull();
+  });
+
+  it('does not expose media routes on data-api', async () => {
+    const response = await worker.fetch(new Request('https://data-api.watchbilm.org/media/tmdb/movie/603', {
+      method: 'GET'
+    }), env);
+    expect(response.status).toBe(404);
+    const body = await response.json();
+    expect(body.code).toBe('route_not_found');
   });
 
   it('rejects payloads that contain credential-like fields', async () => {
