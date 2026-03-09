@@ -134,9 +134,17 @@ const SECTOR_SYNC_KEYS = new Set([
   'continue_watching',
   'watch_history',
   'search_history',
-  'chat_messages'
+  'chat_messages',
+  'settings_profile',
+  'playback_notes',
+  'tv_progress',
+  'ui_prefs'
 ]);
 const CHAT_SECTOR_KEY = 'chat_messages';
+const SETTINGS_PROFILE_SECTOR_KEY = 'settings_profile';
+const PLAYBACK_NOTES_SECTOR_KEY = 'playback_notes';
+const TV_PROGRESS_SECTOR_KEY = 'tv_progress';
+const UI_PREFS_SECTOR_KEY = 'ui_prefs';
 const TOMBSTONE_RETENTION_DAYS = 30;
 const DISALLOWED_CREDENTIAL_KEYS = new Set([
   'password',
@@ -632,6 +640,30 @@ function validateChatPayload(payload, { corsOrigin, index = 0, requestId = null 
   }
 }
 
+function validateGenericSectorPayload(payload, {
+  corsOrigin,
+  index = 0,
+  requestId = null,
+  sectorKey = ''
+}) {
+  const serialized = JSON.stringify(payload || {});
+  const length = serialized.length;
+  let maxLength = 12000;
+  if (sectorKey === SETTINGS_PROFILE_SECTOR_KEY) maxLength = 16000;
+  if (sectorKey === PLAYBACK_NOTES_SECTOR_KEY) maxLength = 24000;
+  if (sectorKey === TV_PROGRESS_SECTOR_KEY) maxLength = 8000;
+  if (sectorKey === UI_PREFS_SECTOR_KEY) maxLength = 6000;
+  if (length > maxLength) {
+    throw errorResponse(413, {
+      error: 'payload_too_large',
+      message: `Payload exceeds sector size limit at operations[${index}].`,
+      retryable: false,
+      code: 'sector_payload_too_large',
+      requestId
+    }, corsOrigin);
+  }
+}
+
 function normalizeSectorSyncOperation(rawOperation, corsOrigin, index = 0, requestId = null) {
   const sectorKey = normalizeSectorKey(rawOperation?.sectorKey ?? rawOperation?.listKey);
   if (!isValidSectorKey(sectorKey)) {
@@ -672,6 +704,8 @@ function normalizeSectorSyncOperation(rawOperation, corsOrigin, index = 0, reque
     }
     if (sectorKey === CHAT_SECTOR_KEY) {
       validateChatPayload(payloadCandidate, { corsOrigin, index, requestId });
+    } else {
+      validateGenericSectorPayload(payloadCandidate, { corsOrigin, index, requestId, sectorKey });
     }
     assertNoCredentialStorage(payloadCandidate, corsOrigin);
   }

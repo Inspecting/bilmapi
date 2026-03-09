@@ -711,6 +711,77 @@ describe('bilm backend api', () => {
     expect(body.requestId).toBeTruthy();
   });
 
+  it('accepts settings/profile and progress sector operations', async () => {
+    const response = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        operations: [
+          {
+            sectorKey: 'settings_profile',
+            itemKey: 'theme_settings',
+            updatedAtMs: 1725100000000,
+            deleted: false,
+            payload: {
+              storageKey: 'bilm-theme-settings',
+              value: '{"defaultServer":"embedmaster"}'
+            }
+          },
+          {
+            sectorKey: 'playback_notes',
+            itemKey: 'playback_note',
+            updatedAtMs: 1725100000100,
+            deleted: false,
+            payload: {
+              storageKey: 'bilm-playback-note',
+              value: '{"movie:42":"01:20"}'
+            }
+          }
+        ]
+      })
+    }), env);
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.ok).toBe(true);
+    expect(body.processed).toBe(2);
+  });
+
+  it('enforces generic sector payload size limits', async () => {
+    const hugeValue = 'x'.repeat(20050);
+    const response = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        operations: [
+          {
+            sectorKey: 'settings_profile',
+            itemKey: 'theme_settings',
+            updatedAtMs: 1725200000000,
+            deleted: false,
+            payload: {
+              storageKey: 'bilm-theme-settings',
+              value: hugeValue
+            }
+          }
+        ]
+      })
+    }), env);
+
+    expect(response.status).toBe(413);
+    const body = await response.json();
+    expect(body.code).toBe('sector_payload_too_large');
+    expect(body.requestId).toBeTruthy();
+  });
+
   it('purges expired tombstones on scheduled run', async () => {
     d1.syncRows.set(`${USER_ID}|watch_history|movie:1`, {
       user_id: USER_ID,
