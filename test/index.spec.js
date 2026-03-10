@@ -4,6 +4,7 @@ import { createWorker } from '../src/index.js';
 const USER_ID = '12345678901234567890123456';
 const OTHER_USER_ID = 'abcdefghijklmnopqrstuvwxyz12';
 const ALLOWED_ORIGIN = 'https://watchbilm.org';
+const ALLOWED_FLY_ORIGIN = 'https://bilm.fly.dev';
 const DISALLOWED_ORIGIN = 'https://evil.example';
 
 class MemoryKv {
@@ -95,9 +96,21 @@ class MemoryD1Statement {
       const normalizedItemKey = String(itemKey || '');
       const compositeKey = `${normalizedUserId}|${normalizedListKey}|${normalizedItemKey}`;
       const incomingUpdatedAt = Number(updatedAtMs || 0) || 0;
+      const incomingDeletedAtMs = deletedAtMs === null || typeof deletedAtMs === 'undefined'
+        ? 0
+        : (Number(deletedAtMs || 0) || 0);
       const current = this.db.listRows.get(compositeKey);
-      if (current && Number(current.updated_at_ms || 0) > incomingUpdatedAt) {
-        return { success: true };
+      if (current) {
+        const currentUpdatedAt = Number(current.updated_at_ms || 0) || 0;
+        const currentDeletedAtMs = current.deleted_at_ms === null || typeof current.deleted_at_ms === 'undefined'
+          ? 0
+          : (Number(current.deleted_at_ms || 0) || 0);
+        const staleByTime = incomingUpdatedAt < currentUpdatedAt;
+        const staleByDeletePriority = incomingUpdatedAt === currentUpdatedAt
+          && incomingDeletedAtMs < currentDeletedAtMs;
+        if (staleByTime || staleByDeletePriority) {
+          return { success: true, meta: { changes: 0 } };
+        }
       }
       this.db.listRows.set(compositeKey, {
         user_id: normalizedUserId,
@@ -122,13 +135,26 @@ class MemoryD1Statement {
       const compositeKey = `${normalizedUserId}|${normalizedSectorKey}|${normalizedItemKey}`;
       const incomingUpdatedAt = Number(updatedAtMs || 0) || 0;
       const incomingOpId = String(opId || '');
+      const incomingDeletedAtMs = deletedAtMs === null || typeof deletedAtMs === 'undefined'
+        ? 0
+        : (Number(deletedAtMs || 0) || 0);
       const current = this.db.syncRows.get(compositeKey);
       if (current) {
         const currentUpdatedAt = Number(current.updated_at_ms || 0) || 0;
         const currentOpId = String(current.op_id || '');
+        const currentDeletedAtMs = current.deleted_at_ms === null || typeof current.deleted_at_ms === 'undefined'
+          ? 0
+          : (Number(current.deleted_at_ms || 0) || 0);
         const staleByTime = incomingUpdatedAt < currentUpdatedAt;
-        const staleByOpId = incomingUpdatedAt === currentUpdatedAt && incomingOpId < currentOpId;
+        const staleByDeletePriority = incomingUpdatedAt === currentUpdatedAt
+          && incomingDeletedAtMs < currentDeletedAtMs;
+        const staleByOpId = incomingUpdatedAt === currentUpdatedAt
+          && incomingDeletedAtMs === currentDeletedAtMs
+          && incomingOpId < currentOpId;
         if (staleByTime || staleByOpId) {
+          return { success: true, meta: { changes: 0 } };
+        }
+        if (staleByDeletePriority) {
           return { success: true, meta: { changes: 0 } };
         }
       }
@@ -457,7 +483,7 @@ function createVerifier() {
   };
 }
 
-describe('bilm backend api', () => {
+describe('data api', () => {
   let kv;
   let d1;
   let r2;
@@ -587,6 +613,13 @@ describe('bilm backend api', () => {
     }), env);
     expect(allowedPreflight.status).toBe(204);
     expect(allowedPreflight.headers.get('access-control-allow-origin')).toBe(ALLOWED_ORIGIN);
+
+    const flyAllowedPreflight = await worker.fetch(new Request(`https://data-api.watchbilm.org/?userId=${USER_ID}`, {
+      method: 'OPTIONS',
+      headers: { origin: ALLOWED_FLY_ORIGIN }
+    }), env);
+    expect(flyAllowedPreflight.status).toBe(204);
+    expect(flyAllowedPreflight.headers.get('access-control-allow-origin')).toBe(ALLOWED_FLY_ORIGIN);
 
     const blockedPreflight = await worker.fetch(new Request(`https://data-api.watchbilm.org/?userId=${USER_ID}`, {
       method: 'OPTIONS',
@@ -736,6 +769,59 @@ describe('bilm backend api', () => {
     expect(body.operations[0].updatedAtMs).toBe(1722000000200);
   });
 
+  it('keeps list tombstones when delete and upsert share the same timestamp', async () => {
+    const deleteTie = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/lists/push', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        operations: [
+          {
+            listKey: 'bilm-favorites',
+            itemKey: 'movie:77',
+            updatedAtMs: 1722500000000,
+            deleted: true
+          }
+        ]
+      })
+    }), env);
+    expect(deleteTie.status).toBe(200);
+
+    const staleUpsertSameTs = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/lists/push', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        operations: [
+          {
+            listKey: 'bilm-favorites',
+            itemKey: 'movie:77',
+            updatedAtMs: 1722500000000,
+            deleted: false,
+            payload: { key: 'movie-77', type: 'movie', id: 77, updatedAt: 1722500000000 }
+          }
+        ]
+      })
+    }), env);
+    expect(staleUpsertSameTs.status).toBe(200);
+
+    const pull = await worker.fetch(new Request(`https://data-api.watchbilm.org/sync/lists/pull?userId=${USER_ID}&since=0`, {
+      method: 'GET',
+      headers: { authorization: 'Bearer valid-token' }
+    }), env);
+    expect(pull.status).toBe(200);
+    const body = await pull.json();
+    const tiedOperation = body.operations.find((operation) => operation.itemKey === 'movie:77');
+    expect(tiedOperation).toBeTruthy();
+    expect(tiedOperation.deleted).toBe(true);
+  });
+
   it('requires auth on list sync routes', async () => {
     const push = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/lists/push', {
       method: 'POST',
@@ -826,6 +912,61 @@ describe('bilm backend api', () => {
     expect(pullBody.operations[0].sectorKey).toBe('watch_history');
     expect(pullBody.operations[1].sectorKey).toBe('chat_messages');
     expect(pullBody.state.migratedAtMs).toBeNull();
+  });
+
+  it('keeps sector tombstones when delete and upsert share the same timestamp', async () => {
+    const deleteTie = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        operations: [
+          {
+            sectorKey: 'chat_messages',
+            itemKey: 'chat:tie-case',
+            updatedAtMs: 1723500000000,
+            opId: 'op-delete',
+            deleted: true
+          }
+        ]
+      })
+    }), env);
+    expect(deleteTie.status).toBe(200);
+
+    const staleUpsertSameTs = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        operations: [
+          {
+            sectorKey: 'chat_messages',
+            itemKey: 'chat:tie-case',
+            updatedAtMs: 1723500000000,
+            opId: 'op-upsert-z',
+            deleted: false,
+            payload: { id: 'tie-case', text: 'stale upsert', author: 'test', createdAtMs: 1723500000000 }
+          }
+        ]
+      })
+    }), env);
+    expect(staleUpsertSameTs.status).toBe(200);
+
+    const pull = await worker.fetch(new Request(`https://data-api.watchbilm.org/sync/sectors/pull?userId=${USER_ID}&since=0&sectors=chat_messages`, {
+      method: 'GET',
+      headers: { authorization: 'Bearer valid-token' }
+    }), env);
+    expect(pull.status).toBe(200);
+    const body = await pull.json();
+    const tiedOperation = body.operations.find((operation) => operation.itemKey === 'chat:tie-case');
+    expect(tiedOperation).toBeTruthy();
+    expect(tiedOperation.deleted).toBe(true);
   });
 
   it('bootstraps sectors once and skips on subsequent attempts', async () => {

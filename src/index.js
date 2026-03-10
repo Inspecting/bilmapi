@@ -43,7 +43,11 @@ const UPSERT_LIST_SYNC_ITEM_SQL = `
     deleted_at_ms = excluded.deleted_at_ms,
     device_id = excluded.device_id,
     saved_at = excluded.saved_at
-  WHERE excluded.updated_at_ms >= list_sync_items.updated_at_ms
+  WHERE excluded.updated_at_ms > list_sync_items.updated_at_ms
+    OR (
+      excluded.updated_at_ms = list_sync_items.updated_at_ms
+      AND COALESCE(excluded.deleted_at_ms, 0) >= COALESCE(list_sync_items.deleted_at_ms, 0)
+    )
 `;
 const UPSERT_SECTOR_SYNC_ITEM_SQL = `
   INSERT INTO sync_items (
@@ -68,7 +72,13 @@ const UPSERT_SECTOR_SYNC_ITEM_SQL = `
   WHERE excluded.updated_at_ms > sync_items.updated_at_ms
     OR (
       excluded.updated_at_ms = sync_items.updated_at_ms
-      AND COALESCE(excluded.op_id, '') >= COALESCE(sync_items.op_id, '')
+      AND (
+        COALESCE(excluded.deleted_at_ms, 0) > COALESCE(sync_items.deleted_at_ms, 0)
+        OR (
+          COALESCE(excluded.deleted_at_ms, 0) = COALESCE(sync_items.deleted_at_ms, 0)
+          AND COALESCE(excluded.op_id, '') >= COALESCE(sync_items.op_id, '')
+        )
+      )
     )
 `;
 const SELECT_SECTOR_SYNC_CHANGES_BASE_SQL = `
@@ -278,6 +288,7 @@ const DEFAULT_ALLOWED_ORIGINS = new Set([
   'https://bilm.fly.dev',
   'https://inspecting.github.io',
   'https://data-api.watchbilm.org',
+  'https://data-api.reidmhit.workers.dev',
   'https://bilm-backend.reidmhit.workers.dev'
 ]);
 

@@ -1,6 +1,6 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-  "name": "bilm-backend",
+  "name": "data-api",
   "main": "src/index.js",
   "workers_dev": false,
   "preview_urls": false,
