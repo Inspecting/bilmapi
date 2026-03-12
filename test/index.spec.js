@@ -542,6 +542,64 @@ describe('data api', () => {
     expect(loaded.meta.deviceId).toBe('device-a');
   });
 
+  it('accepts legacy value payloads for snapshot save', async () => {
+    const payload = {
+      schema: 'bilm-backup-v1',
+      meta: {
+        updatedAtMs: 1711111111111,
+        deviceId: 'device-legacy'
+      },
+      localStorage: {
+        'bilm-watch-history': '[]'
+      },
+      sessionStorage: {}
+    };
+
+    const saveResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/?userId=${USER_ID}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token',
+        origin: ALLOWED_ORIGIN
+      },
+      body: JSON.stringify({ userId: USER_ID, value: JSON.stringify(payload) })
+    }), env);
+
+    expect(saveResponse.status).toBe(200);
+    const saveBody = await saveResponse.json();
+    expect(saveBody.ok).toBe(true);
+    expect(Number(saveBody.bytes || 0)).toBeGreaterThan(0);
+
+    const loadResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/?userId=${USER_ID}`, {
+      method: 'GET',
+      headers: {
+        authorization: 'Bearer valid-token',
+        origin: ALLOWED_ORIGIN
+      }
+    }), env);
+
+    expect(loadResponse.status).toBe(200);
+    const loaded = await loadResponse.json();
+    expect(loaded.schema).toBe('bilm-backup-v1');
+    expect(loaded.meta.deviceId).toBe('device-legacy');
+  });
+
+  it('returns service health metadata', async () => {
+    const response = await worker.fetch(new Request('https://data-api.watchbilm.org/health', {
+      method: 'GET',
+      headers: { origin: ALLOWED_ORIGIN }
+    }), env);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('access-control-allow-origin')).toBe(ALLOWED_ORIGIN);
+    const body = await response.json();
+    expect(body.ok).toBe(true);
+    expect(body.service).toBe('data-api');
+    expect(body.storage?.snapshotStorageReady).toBe(true);
+    expect(Array.isArray(body.endpoints)).toBe(true);
+    expect(body.endpoints.some((entry) => entry.id === 'cloud_export_save')).toBe(true);
+  });
+
   it('returns snapshot metadata from meta route (D1)', async () => {
     d1.rows.set(USER_ID, {
       user_id: USER_ID,

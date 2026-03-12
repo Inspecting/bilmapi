@@ -292,6 +292,7 @@ const DEFAULT_ALLOWED_ORIGINS = new Set([
   'https://data-api.reidmhit.workers.dev',
   'https://bilm-backend.reidmhit.workers.dev'
 ]);
+const MAX_SNAPSHOT_BYTES = 1500000;
 
 const firebaseJwks = createRemoteJWKSet(new URL(FIREBASE_JWKS_URL));
 
@@ -483,6 +484,63 @@ function getSnapshotMetadata(snapshot) {
     schema,
     savedAt: new Date().toISOString()
   };
+}
+
+function tryParseJson(value) {
+  if (typeof value !== 'string') return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function isSnapshotLikePayload(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (String(value?.schema || '').trim() === 'bilm-backup-v1') return true;
+  const hasStorageState = (
+    (value.localStorage && typeof value.localStorage === 'object' && !Array.isArray(value.localStorage))
+    || (value.sessionStorage && typeof value.sessionStorage === 'object' && !Array.isArray(value.sessionStorage))
+  );
+  const hasMeta = value.meta && typeof value.meta === 'object' && !Array.isArray(value.meta);
+  return hasStorageState || hasMeta;
+}
+
+function extractSnapshotFromSaveBody(body = {}) {
+  const queue = [body?.data, body?.snapshot, body?.export, body?.backup, body?.value];
+  const seen = new Set();
+  let inspected = 0;
+
+  while (queue.length && inspected < 24) {
+    inspected += 1;
+    const candidate = queue.shift();
+    if (!candidate) continue;
+
+    if (typeof candidate === 'string') {
+      const parsed = tryParseJson(candidate);
+      if (parsed) queue.push(parsed);
+      continue;
+    }
+
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue;
+
+    if (isSnapshotLikePayload(candidate)) {
+      return String(candidate?.schema || '').trim()
+        ? candidate
+        : { ...candidate, schema: 'bilm-backup-v1' };
+    }
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+
+    queue.push(candidate.data, candidate.snapshot, candidate.export, candidate.backup, candidate.value);
+  }
+
+  return null;
+}
+
+function calculateJsonBytes(input) {
+  const text = typeof input === 'string' ? input : JSON.stringify(input ?? null);
+  return new TextEncoder().encode(String(text || '')).byteLength;
 }
 
 function normalizeCredentialKey(key) {
@@ -1484,6 +1542,15 @@ async function persistSnapshot({ env, userId, snapshot, corsOrigin }) {
 
   const metadata = getSnapshotMetadata(snapshot);
   const snapshotJson = JSON.stringify(snapshot || {});
+  const snapshotBytes = calculateJsonBytes(snapshotJson);
+  if (snapshotBytes > MAX_SNAPSHOT_BYTES) {
+    throw jsonResponse(413, {
+      error: 'snapshot_too_large',
+      message: `Snapshot exceeds maximum size of ${MAX_SNAPSHOT_BYTES.toLocaleString()} bytes.`,
+      maxBytes: MAX_SNAPSHOT_BYTES,
+      bytes: snapshotBytes
+    }, corsOrigin);
+  }
   let stored = false;
 
   if (await writeSnapshotToD1({ env, userId, snapshotJson, metadata })) {
@@ -1500,6 +1567,10 @@ async function persistSnapshot({ env, userId, snapshot, corsOrigin }) {
       message: 'No storage backend is configured. Bind BILM_DB (D1) and/or BILM_DATA (KV).'
     }, corsOrigin);
   }
+  return {
+    bytes: snapshotBytes,
+    metadata
+  };
 }
 
 async function readSnapshotValue({ env, userId }) {
@@ -2281,14 +2352,54 @@ async function handleSaveSnapshot({ request, env, corsOrigin, verifyIdToken }) {
 
   await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId });
 
-  if (typeof body?.data === 'undefined') {
-    return jsonResponse(400, { error: 'missing_data', message: 'Snapshot data is required.' }, corsOrigin);
+  const payload = extractSnapshotFromSaveBody(body);
+  if (!payload) {
+    return jsonResponse(400, {
+      error: 'missing_data',
+      message: 'Snapshot data is required. Provide a bilm-backup snapshot in data/snapshot/value.'
+    }, corsOrigin);
   }
 
-  const payload = body.data;
-  await persistSnapshot({ env, userId, snapshot: payload, corsOrigin });
+  const result = await persistSnapshot({ env, userId, snapshot: payload, corsOrigin });
 
-  return jsonResponse(200, { ok: true, saved: true }, corsOrigin);
+  return jsonResponse(200, {
+    ok: true,
+    saved: true,
+    bytes: result?.bytes || 0
+  }, corsOrigin);
+}
+
+function buildHealthPayload(env) {
+  const hasD1 = Boolean(getD1Database(env));
+  const hasKv = Boolean(getKvNamespace(env));
+  const hasR2 = Boolean(getR2Bucket(env));
+  return {
+    ok: true,
+    service: 'data-api',
+    checkedAtMs: Date.now(),
+    auth: {
+      bypassEnabled: isAuthTemporarilyDisabled(env)
+    },
+    storage: {
+      d1: hasD1,
+      kv: hasKv,
+      r2: hasR2,
+      snapshotStorageReady: hasD1 || hasKv,
+      syncStorageReady: hasD1
+    },
+    endpoints: [
+      { id: 'login_gate', method: 'GET', path: '/?userId=<uid>', expectedStatuses: [200, 401, 404] },
+      { id: 'cloud_export_save', method: 'POST', path: '/', expectedStatuses: [200, 401] },
+      { id: 'cloud_import_read', method: 'GET', path: '/?userId=<uid>', expectedStatuses: [200, 401, 404] },
+      { id: 'sync_pull', method: 'GET', path: '/sync/sectors/pull?userId=<uid>&since=0', expectedStatuses: [200, 401] },
+      { id: 'sync_push', method: 'POST', path: '/sync/sectors/push', expectedStatuses: [200, 401] },
+      { id: 'import_admin_guard', method: 'POST', path: '/?import=true', expectedStatuses: [200, 401, 403] }
+    ]
+  };
+}
+
+async function handleHealthCheck({ env, corsOrigin }) {
+  return jsonResponse(200, buildHealthPayload(env), corsOrigin);
 }
 
 export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOrigins = DEFAULT_ALLOWED_ORIGINS } = {}) {
@@ -2311,6 +2422,10 @@ export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOri
       }
 
       try {
+        if (request.method === 'GET' && (url.pathname === '/health' || url.pathname === '/healthz')) {
+          return await handleHealthCheck({ env, corsOrigin });
+        }
+
         if (url.pathname.startsWith('/media/')) {
           return errorResponse(404, {
             error: 'route_not_found',
