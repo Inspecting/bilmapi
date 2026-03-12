@@ -285,6 +285,7 @@ const DISALLOWED_CREDENTIAL_KEYS = new Set([
 ]);
 const DEFAULT_ALLOWED_ORIGINS = new Set([
   'https://watchbilm.org',
+  'https://www.watchbilm.org',
   'https://bilm.fly.dev',
   'https://inspecting.github.io',
   'https://data-api.watchbilm.org',
