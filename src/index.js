@@ -252,6 +252,7 @@ const SETTINGS_PROFILE_SECTOR_KEY = 'settings_profile';
 const PLAYBACK_NOTES_SECTOR_KEY = 'playback_notes';
 const TV_PROGRESS_SECTOR_KEY = 'tv_progress';
 const UI_PREFS_SECTOR_KEY = 'ui_prefs';
+const SYNC_FUTURE_TIME_WINDOW_MS = 10 * 60 * 1000;
 const TOMBSTONE_RETENTION_DAYS = 30;
 const MEDIA_CACHE_R2_INLINE_THRESHOLD_BYTES = 96 * 1024;
 const MEDIA_REFRESH_LOCK_MS = 30 * 1000;
@@ -1624,11 +1625,20 @@ async function readSnapshotMeta({ env, userId }) {
 }
 
 function normalizeUpdatedAtMs(value) {
+  return clampTimestampMs(value, Date.now());
+}
+
+function clampTimestampMs(value, fallback = 0) {
   const parsed = Number(value || 0);
   if (!Number.isFinite(parsed) || parsed <= 0) {
-    return Date.now();
+    return Number(fallback || 0) || 0;
   }
-  return Math.floor(parsed);
+  const normalized = Math.floor(parsed);
+  const maxFutureMs = Date.now() + SYNC_FUTURE_TIME_WINDOW_MS;
+  if (normalized > maxFutureMs) {
+    return maxFutureMs;
+  }
+  return normalized;
 }
 
 function normalizeListSyncOperation(rawOperation, corsOrigin, index = 0) {
@@ -1837,16 +1847,14 @@ async function persistUserSyncState({
       userId,
       Number(migratedAtMs || 0) || null,
       String(migrationSource || '').trim() || null,
-      Number(updatedAtMs || 0) || Date.now(),
+      normalizeUpdatedAtMs(updatedAtMs),
       savedAt
     )
     .run();
 }
 
 function parseSinceMs(rawValue) {
-  const value = Number(rawValue || 0);
-  if (!Number.isFinite(value) || value < 0) return 0;
-  return Math.floor(value);
+  return clampTimestampMs(rawValue, 0);
 }
 
 function parsePullLimit(rawValue) {

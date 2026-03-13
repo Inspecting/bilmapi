@@ -6,6 +6,7 @@ const OTHER_USER_ID = 'abcdefghijklmnopqrstuvwxyz12';
 const ALLOWED_ORIGIN = 'https://watchbilm.org';
 const ALLOWED_FLY_ORIGIN = 'https://bilm.fly.dev';
 const DISALLOWED_ORIGIN = 'https://evil.example';
+const SYNC_FUTURE_TIME_WINDOW_MS = 10 * 60 * 1000;
 
 class MemoryKv {
   constructor() {
@@ -771,6 +772,211 @@ describe('data api', () => {
     expect(pullBody.operations[0].listKey).toBe('bilm-watch-history');
     expect(pullBody.operations[0].deleted).toBe(false);
     expect(pullBody.operations[1].deleted).toBe(true);
+  });
+
+  it('allows valid retries after a non-retryable operation failure', async () => {
+    const tooLongChat = 'x'.repeat(2105);
+    const failedBatch = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        operations: [
+          {
+            sectorKey: 'chat_messages',
+            itemKey: 'chat:oversize',
+            updatedAtMs: 1721800000000,
+            deleted: false,
+            payload: { id: 'chat-oversize', text: tooLongChat, createdAtMs: 1721800000000 }
+          },
+          {
+            sectorKey: 'watch_history',
+            itemKey: 'movie:181',
+            updatedAtMs: 1721800000100,
+            deleted: false,
+            payload: { key: 'movie-181', type: 'movie', id: 181, updatedAt: 1721800000100 }
+          }
+        ]
+      })
+    }), env);
+    expect(failedBatch.status).toBe(413);
+
+    const retryValidOnly = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        operations: [
+          {
+            sectorKey: 'watch_history',
+            itemKey: 'movie:181',
+            updatedAtMs: 1721800000100,
+            deleted: false,
+            payload: { key: 'movie-181', type: 'movie', id: 181, updatedAt: 1721800000100 }
+          }
+        ]
+      })
+    }), env);
+    expect(retryValidOnly.status).toBe(200);
+
+    const pull = await worker.fetch(new Request(`https://data-api.watchbilm.org/sync/sectors/pull?userId=${USER_ID}&since=0&sectors=watch_history`, {
+      method: 'GET',
+      headers: { authorization: 'Bearer valid-token' }
+    }), env);
+    expect(pull.status).toBe(200);
+    const body = await pull.json();
+    expect(body.operations.length).toBe(1);
+    expect(body.operations[0].itemKey).toBe('movie:181');
+  });
+
+  it('clamps future updatedAtMs and still accepts newer normal-time updates', async () => {
+    const baseNowMs = 1726000000000;
+    vi.useFakeTimers();
+    vi.setSystemTime(baseNowMs);
+    try {
+      const futurePush = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: 'Bearer valid-token'
+        },
+        body: JSON.stringify({
+          userId: USER_ID,
+          operations: [
+            {
+              sectorKey: 'watch_history',
+              itemKey: 'movie:future',
+              updatedAtMs: baseNowMs + (24 * 60 * 60 * 1000),
+              deleted: false,
+              payload: { key: 'movie-future', type: 'movie', id: 991, updatedAt: baseNowMs + (24 * 60 * 60 * 1000) }
+            }
+          ]
+        })
+      }), env);
+      expect(futurePush.status).toBe(200);
+      const futurePushBody = await futurePush.json();
+      expect(futurePushBody.cursorMs).toBe(baseNowMs + SYNC_FUTURE_TIME_WINDOW_MS);
+
+      vi.setSystemTime(baseNowMs + SYNC_FUTURE_TIME_WINDOW_MS + 60000);
+      const normalPush = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: 'Bearer valid-token'
+        },
+        body: JSON.stringify({
+          userId: USER_ID,
+          operations: [
+            {
+              sectorKey: 'watch_history',
+              itemKey: 'movie:future',
+              updatedAtMs: Date.now(),
+              deleted: false,
+              payload: { key: 'movie-future', type: 'movie', id: 992, updatedAt: Date.now() }
+            }
+          ]
+        })
+      }), env);
+      expect(normalPush.status).toBe(200);
+
+      const pull = await worker.fetch(new Request(`https://data-api.watchbilm.org/sync/sectors/pull?userId=${USER_ID}&since=0&sectors=watch_history`, {
+        method: 'GET',
+        headers: { authorization: 'Bearer valid-token' }
+      }), env);
+      expect(pull.status).toBe(200);
+      const pullBody = await pull.json();
+      const updated = pullBody.operations.find((operation) => operation.itemKey === 'movie:future');
+      expect(updated).toBeTruthy();
+      expect(updated.updatedAtMs).toBe(Date.now());
+      expect(updated.payload.id).toBe(992);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clamps future since cursors and preserves pull progression', async () => {
+    const baseNowMs = 1726100000000;
+    vi.useFakeTimers();
+    vi.setSystemTime(baseNowMs);
+    try {
+      const firstPush = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: 'Bearer valid-token'
+        },
+        body: JSON.stringify({
+          userId: USER_ID,
+          operations: [
+            {
+              sectorKey: 'favorites',
+              itemKey: 'movie:201',
+              updatedAtMs: baseNowMs + 1000,
+              deleted: false,
+              payload: { key: 'movie-201', type: 'movie', id: 201, updatedAt: baseNowMs + 1000 }
+            }
+          ]
+        })
+      }), env);
+      expect(firstPush.status).toBe(200);
+
+      const futureSinceMs = baseNowMs + (12 * 60 * 60 * 1000);
+      const clampedPull = await worker.fetch(new Request(
+        `https://data-api.watchbilm.org/sync/sectors/pull?userId=${USER_ID}&since=${futureSinceMs}&sectors=favorites`,
+        {
+          method: 'GET',
+          headers: { authorization: 'Bearer valid-token' }
+        }
+      ), env);
+      expect(clampedPull.status).toBe(200);
+      const clampedBody = await clampedPull.json();
+      expect(clampedBody.operations.length).toBe(0);
+      expect(clampedBody.cursorMs).toBe(baseNowMs + SYNC_FUTURE_TIME_WINDOW_MS);
+
+      vi.setSystemTime(baseNowMs + SYNC_FUTURE_TIME_WINDOW_MS + 120000);
+      const secondUpdatedAtMs = Date.now();
+      const secondPush = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: 'Bearer valid-token'
+        },
+        body: JSON.stringify({
+          userId: USER_ID,
+          operations: [
+            {
+              sectorKey: 'favorites',
+              itemKey: 'movie:202',
+              updatedAtMs: secondUpdatedAtMs,
+              deleted: false,
+              payload: { key: 'movie-202', type: 'movie', id: 202, updatedAt: secondUpdatedAtMs }
+            }
+          ]
+        })
+      }), env);
+      expect(secondPush.status).toBe(200);
+
+      const progressionPull = await worker.fetch(new Request(
+        `https://data-api.watchbilm.org/sync/sectors/pull?userId=${USER_ID}&since=${clampedBody.cursorMs}&sectors=favorites`,
+        {
+          method: 'GET',
+          headers: { authorization: 'Bearer valid-token' }
+        }
+      ), env);
+      expect(progressionPull.status).toBe(200);
+      const progressionBody = await progressionPull.json();
+      expect(progressionBody.operations.length).toBe(1);
+      expect(progressionBody.operations[0].itemKey).toBe('movie:202');
+      expect(progressionBody.operations[0].updatedAtMs).toBe(secondUpdatedAtMs);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('does not let stale upserts resurrect newer tombstones', async () => {
