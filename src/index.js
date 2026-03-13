@@ -321,9 +321,11 @@ function getR2Bucket(env) {
 function isAuthTemporarilyDisabled(env, request = null) {
   const envFlag = String(env?.BILM_DISABLE_AUTH || '').trim().toLowerCase();
   const envEnabled = envFlag === '1' || envFlag === 'true' || envFlag === 'yes' || envFlag === 'on';
-  if (envEnabled) return true;
+  if (!envEnabled) return false;
+  if (!request) return true;
   const headerValue = String(request?.headers?.get?.('x-bilm-auth-bypass') || '').trim().toLowerCase();
-  return headerValue === '1' || headerValue === 'true' || headerValue === 'yes';
+  if (!headerValue) return true;
+  return headerValue === '1' || headerValue === 'true' || headerValue === 'yes' || headerValue === 'on';
 }
 
 function normalizeUserId(value) {
