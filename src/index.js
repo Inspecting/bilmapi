@@ -225,6 +225,162 @@ const PURGE_OLD_MEDIA_LOCKS_SQL = `
   WHERE lock_until_ms > 0
     AND lock_until_ms < ?1
 `;
+const UPSERT_ACCOUNT_USER_CAPABILITY_SQL = `
+  INSERT INTO account_user_capabilities (
+    user_id,
+    email,
+    chat_ready,
+    last_chat_seen_at_ms,
+    updated_at_ms
+  )
+  VALUES (?1, ?2, ?3, ?4, ?5)
+  ON CONFLICT(user_id) DO UPDATE SET
+    email = excluded.email,
+    chat_ready = CASE
+      WHEN excluded.chat_ready > account_user_capabilities.chat_ready THEN excluded.chat_ready
+      ELSE account_user_capabilities.chat_ready
+    END,
+    last_chat_seen_at_ms = CASE
+      WHEN excluded.last_chat_seen_at_ms IS NULL THEN account_user_capabilities.last_chat_seen_at_ms
+      WHEN account_user_capabilities.last_chat_seen_at_ms IS NULL THEN excluded.last_chat_seen_at_ms
+      WHEN excluded.last_chat_seen_at_ms > account_user_capabilities.last_chat_seen_at_ms THEN excluded.last_chat_seen_at_ms
+      ELSE account_user_capabilities.last_chat_seen_at_ms
+    END,
+    updated_at_ms = excluded.updated_at_ms
+`;
+const SELECT_ACCOUNT_USER_CAPABILITY_BY_EMAIL_SQL = `
+  SELECT user_id, email, chat_ready, last_chat_seen_at_ms, updated_at_ms
+  FROM account_user_capabilities
+  WHERE email = ?1
+  ORDER BY updated_at_ms DESC
+  LIMIT 1
+`;
+const INSERT_ACCOUNT_LINK_SQL = `
+  INSERT INTO account_links (
+    id,
+    status,
+    requester_user_id,
+    requester_email,
+    target_user_id,
+    target_email,
+    requester_share_scopes_json,
+    target_share_scopes_json,
+    requester_approved_at_ms,
+    target_approved_at_ms,
+    created_at_ms,
+    updated_at_ms,
+    activated_at_ms,
+    declined_at_ms,
+    unlinked_at_ms
+  )
+  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+`;
+const UPSERT_ACCOUNT_LINK_SQL = `
+  INSERT INTO account_links (
+    id,
+    status,
+    requester_user_id,
+    requester_email,
+    target_user_id,
+    target_email,
+    requester_share_scopes_json,
+    target_share_scopes_json,
+    requester_approved_at_ms,
+    target_approved_at_ms,
+    created_at_ms,
+    updated_at_ms,
+    activated_at_ms,
+    declined_at_ms,
+    unlinked_at_ms
+  )
+  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+  ON CONFLICT(id) DO UPDATE SET
+    status = excluded.status,
+    requester_user_id = excluded.requester_user_id,
+    requester_email = excluded.requester_email,
+    target_user_id = excluded.target_user_id,
+    target_email = excluded.target_email,
+    requester_share_scopes_json = excluded.requester_share_scopes_json,
+    target_share_scopes_json = excluded.target_share_scopes_json,
+    requester_approved_at_ms = excluded.requester_approved_at_ms,
+    target_approved_at_ms = excluded.target_approved_at_ms,
+    created_at_ms = excluded.created_at_ms,
+    updated_at_ms = excluded.updated_at_ms,
+    activated_at_ms = excluded.activated_at_ms,
+    declined_at_ms = excluded.declined_at_ms,
+    unlinked_at_ms = excluded.unlinked_at_ms
+`;
+const SELECT_ACCOUNT_LINK_BY_ID_SQL = `
+  SELECT
+    id,
+    status,
+    requester_user_id,
+    requester_email,
+    target_user_id,
+    target_email,
+    requester_share_scopes_json,
+    target_share_scopes_json,
+    requester_approved_at_ms,
+    target_approved_at_ms,
+    created_at_ms,
+    updated_at_ms,
+    activated_at_ms,
+    declined_at_ms,
+    unlinked_at_ms
+  FROM account_links
+  WHERE id = ?1
+  LIMIT 1
+`;
+const LIST_ACCOUNT_LINKS_FOR_USER_SQL = `
+  SELECT
+    id,
+    status,
+    requester_user_id,
+    requester_email,
+    target_user_id,
+    target_email,
+    requester_share_scopes_json,
+    target_share_scopes_json,
+    requester_approved_at_ms,
+    target_approved_at_ms,
+    created_at_ms,
+    updated_at_ms,
+    activated_at_ms,
+    declined_at_ms,
+    unlinked_at_ms
+  FROM account_links
+  WHERE requester_user_id = ?1
+    OR target_user_id = ?1
+    OR requester_email = ?2
+    OR target_email = ?2
+  ORDER BY updated_at_ms DESC
+  LIMIT 50
+`;
+const SELECT_BLOCKING_ACCOUNT_LINK_SQL = `
+  SELECT id, status
+  FROM account_links
+  WHERE status IN ('pending', 'active')
+    AND id != ?3
+    AND (
+      requester_user_id = ?1
+      OR target_user_id = ?1
+      OR requester_email = ?2
+      OR target_email = ?2
+    )
+  LIMIT 1
+`;
+const SELECT_SHARED_SYNC_ITEMS_BASE_SQL = `
+  SELECT
+    sector_key,
+    item_key,
+    item_json,
+    updated_at_ms,
+    deleted_at_ms,
+    op_id
+  FROM sync_items
+  WHERE user_id = ?1
+    AND updated_at_ms > ?2
+`;
 const LIST_SYNC_KEYS = new Set([
   'bilm-favorites',
   'bilm-watch-later',
@@ -294,6 +450,31 @@ const DEFAULT_ALLOWED_ORIGINS = new Set([
   'https://bilm-backend.reidmhit.workers.dev'
 ]);
 const MAX_SNAPSHOT_BYTES = 1500000;
+const ACCOUNT_LINK_STATUS_PENDING = 'pending';
+const ACCOUNT_LINK_STATUS_ACTIVE = 'active';
+const ACCOUNT_LINK_STATUS_DECLINED = 'declined';
+const ACCOUNT_LINK_STATUS_UNLINKED = 'unlinked';
+const ACCOUNT_LINK_SCOPE_KEYS = Object.freeze([
+  'continueWatching',
+  'favorites',
+  'watchHistory',
+  'searchHistory',
+  'secretChat'
+]);
+const ACCOUNT_LINK_SCOPE_TO_SECTORS = Object.freeze({
+  continueWatching: ['continue_watching'],
+  favorites: ['favorites'],
+  watchHistory: ['watch_history'],
+  searchHistory: ['search_history'],
+  secretChat: ['chat_messages']
+});
+const DEFAULT_ACCOUNT_LINK_SCOPES = Object.freeze({
+  continueWatching: false,
+  favorites: false,
+  watchHistory: false,
+  searchHistory: false,
+  secretChat: false
+});
 
 const firebaseJwks = createRemoteJWKSet(new URL(FIREBASE_JWKS_URL));
 
@@ -337,6 +518,75 @@ function isValidUserId(userId) {
   return normalized.length >= 25 && normalized.length <= 30;
 }
 
+function normalizeEmail(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function isValidEmail(value) {
+  const normalized = normalizeEmail(value);
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized);
+}
+
+function normalizeAccountLinkScopes(rawScopes = {}) {
+  const source = rawScopes && typeof rawScopes === 'object' && !Array.isArray(rawScopes)
+    ? rawScopes
+    : {};
+  const normalized = { ...DEFAULT_ACCOUNT_LINK_SCOPES };
+  ACCOUNT_LINK_SCOPE_KEYS.forEach((scopeKey) => {
+    const snakeKey = scopeKey.replace(/[A-Z]/g, (character) => `_${character.toLowerCase()}`);
+    normalized[scopeKey] = source[scopeKey] === true || source[snakeKey] === true;
+  });
+  return normalized;
+}
+
+function parseAccountLinkScopesJson(rawValue) {
+  if (!rawValue) return { ...DEFAULT_ACCOUNT_LINK_SCOPES };
+  try {
+    const parsed = JSON.parse(String(rawValue));
+    return normalizeAccountLinkScopes(parsed);
+  } catch {
+    return { ...DEFAULT_ACCOUNT_LINK_SCOPES };
+  }
+}
+
+function hasAnyEnabledAccountLinkScope(scopes = {}) {
+  return ACCOUNT_LINK_SCOPE_KEYS.some((scopeKey) => scopes?.[scopeKey] === true);
+}
+
+function createAccountLinkId() {
+  return `link-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+function getAccountLinkRole(row, actorUserId = '', actorEmail = '') {
+  const requesterUserId = normalizeUserId(row?.requester_user_id);
+  const targetUserId = normalizeUserId(row?.target_user_id);
+  const requesterEmail = normalizeEmail(row?.requester_email);
+  const targetEmail = normalizeEmail(row?.target_email);
+  if ((actorUserId && requesterUserId === actorUserId) || (actorEmail && requesterEmail === actorEmail)) return 'requester';
+  if ((actorUserId && targetUserId === actorUserId) || (actorEmail && targetEmail === actorEmail)) return 'target';
+  return '';
+}
+
+function isAccountLinkParticipant(row, actorUserId = '', actorEmail = '') {
+  return Boolean(getAccountLinkRole(row, actorUserId, actorEmail));
+}
+
+function getEnabledSharedSectorsFromScopes(scopes = {}) {
+  const sectors = new Set();
+  ACCOUNT_LINK_SCOPE_KEYS.forEach((scopeKey) => {
+    if (scopes?.[scopeKey] !== true) return;
+    const mappedSectors = ACCOUNT_LINK_SCOPE_TO_SECTORS[scopeKey] || [];
+    mappedSectors.forEach((sectorKey) => sectors.add(String(sectorKey || '').trim().toLowerCase()));
+  });
+  return [...sectors].filter((sectorKey) => isValidSectorKey(sectorKey));
+}
+
+function toOptionalTimestamp(value) {
+  const parsed = Number(value || 0);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.floor(parsed);
+}
+
 function normalizeListKey(value) {
   return String(value || '').trim().toLowerCase();
 }
@@ -364,7 +614,7 @@ function createCorsHeaders(corsOrigin = '') {
   return {
     'Access-Control-Allow-Origin': corsOrigin,
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-admin-token',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-admin-token, x-bilm-auth-bypass',
     'Access-Control-Max-Age': '86400',
     'Vary': 'Origin'
   };
@@ -620,6 +870,50 @@ async function requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, us
   return payload;
 }
 
+async function requireAccountLinkAuthContext({
+  request,
+  env,
+  corsOrigin,
+  verifyIdToken,
+  userId,
+  requestId = null
+}) {
+  const normalizedUserId = normalizeUserId(userId);
+  if (!isValidUserId(normalizedUserId)) {
+    throw errorResponse(400, {
+      error: 'invalid_user_id',
+      message: 'Invalid or missing userId.',
+      retryable: false,
+      code: 'invalid_user_id',
+      requestId
+    }, corsOrigin);
+  }
+
+  const payload = await requireSnapshotAuth({
+    request,
+    corsOrigin,
+    env,
+    verifyIdToken,
+    userId: normalizedUserId,
+    requestId
+  });
+  const email = normalizeEmail(payload?.email || request?.headers?.get?.('x-bilm-auth-email'));
+  if (!isValidEmail(email)) {
+    throw errorResponse(403, {
+      error: 'email_required',
+      message: 'Token does not include a valid email address.',
+      retryable: false,
+      code: 'email_required',
+      requestId
+    }, corsOrigin);
+  }
+  return {
+    userId: normalizedUserId,
+    email,
+    payload
+  };
+}
+
 function requireAdminToken({ request, corsOrigin, env }) {
   const configuredToken = String(env?.BILM_ADMIN_TOKEN || '').trim();
   if (!configuredToken) {
@@ -651,6 +945,169 @@ function assertD1Configured(env, corsOrigin) {
       message: 'BILM_DB (D1) is required for sync endpoints.'
     }, corsOrigin);
   }
+}
+
+async function upsertAccountUserCapability({
+  db,
+  userId,
+  email,
+  chatReady = false,
+  lastChatSeenAtMs = null
+}) {
+  const normalizedUserId = normalizeUserId(userId);
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedUserId || !isValidEmail(normalizedEmail)) return;
+  const nowMs = Date.now();
+  await db.prepare(UPSERT_ACCOUNT_USER_CAPABILITY_SQL).bind(
+    normalizedUserId,
+    normalizedEmail,
+    chatReady ? 1 : 0,
+    toOptionalTimestamp(lastChatSeenAtMs),
+    nowMs
+  ).run();
+}
+
+async function readAccountUserCapabilityByEmail({ db, email }) {
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedEmail || !isValidEmail(normalizedEmail)) return null;
+  const row = await db.prepare(SELECT_ACCOUNT_USER_CAPABILITY_BY_EMAIL_SQL).bind(normalizedEmail).first();
+  if (!row) return null;
+  return {
+    userId: normalizeUserId(row?.user_id),
+    email: normalizeEmail(row?.email),
+    chatReady: Number(row?.chat_ready || 0) > 0,
+    lastChatSeenAtMs: toOptionalTimestamp(row?.last_chat_seen_at_ms),
+    updatedAtMs: toOptionalTimestamp(row?.updated_at_ms) || Date.now()
+  };
+}
+
+function normalizeAccountLinkRow(row = {}) {
+  return {
+    id: String(row?.id || '').trim(),
+    status: String(row?.status || '').trim().toLowerCase(),
+    requesterUserId: normalizeUserId(row?.requester_user_id),
+    requesterEmail: normalizeEmail(row?.requester_email),
+    targetUserId: normalizeUserId(row?.target_user_id),
+    targetEmail: normalizeEmail(row?.target_email),
+    requesterShareScopes: parseAccountLinkScopesJson(row?.requester_share_scopes_json),
+    targetShareScopes: parseAccountLinkScopesJson(row?.target_share_scopes_json),
+    requesterApprovedAtMs: toOptionalTimestamp(row?.requester_approved_at_ms),
+    targetApprovedAtMs: toOptionalTimestamp(row?.target_approved_at_ms),
+    createdAtMs: toOptionalTimestamp(row?.created_at_ms) || Date.now(),
+    updatedAtMs: toOptionalTimestamp(row?.updated_at_ms) || Date.now(),
+    activatedAtMs: toOptionalTimestamp(row?.activated_at_ms),
+    declinedAtMs: toOptionalTimestamp(row?.declined_at_ms),
+    unlinkedAtMs: toOptionalTimestamp(row?.unlinked_at_ms)
+  };
+}
+
+function formatAccountLinkForActor(linkRow, actorUserId = '', actorEmail = '') {
+  const normalized = normalizeAccountLinkRow(linkRow);
+  const role = (
+    (actorUserId && normalized.requesterUserId === actorUserId)
+      || (actorEmail && normalized.requesterEmail === actorEmail)
+  )
+    ? 'requester'
+    : (
+      ((actorUserId && normalized.targetUserId === actorUserId)
+        || (actorEmail && normalized.targetEmail === actorEmail))
+        ? 'target'
+        : ''
+    );
+
+  const requesterPayload = {
+    userId: normalized.requesterUserId || null,
+    email: normalized.requesterEmail || null,
+    shareScopes: normalizeAccountLinkScopes(normalized.requesterShareScopes),
+    approvedAtMs: normalized.requesterApprovedAtMs
+  };
+  const targetPayload = {
+    userId: normalized.targetUserId || null,
+    email: normalized.targetEmail || null,
+    shareScopes: normalizeAccountLinkScopes(normalized.targetShareScopes),
+    approvedAtMs: normalized.targetApprovedAtMs
+  };
+  const me = role === 'requester' ? requesterPayload : (role === 'target' ? targetPayload : null);
+  const partner = role === 'requester' ? targetPayload : (role === 'target' ? requesterPayload : null);
+
+  return {
+    id: normalized.id,
+    status: normalized.status,
+    createdAtMs: normalized.createdAtMs,
+    updatedAtMs: normalized.updatedAtMs,
+    activatedAtMs: normalized.activatedAtMs,
+    declinedAtMs: normalized.declinedAtMs,
+    unlinkedAtMs: normalized.unlinkedAtMs,
+    requester: requesterPayload,
+    target: targetPayload,
+    myRole: role || null,
+    me,
+    partner,
+    canApprove: normalized.status === ACCOUNT_LINK_STATUS_PENDING
+      && role === 'target'
+      && !normalized.targetApprovedAtMs,
+    canUpdateScopes: normalized.status === ACCOUNT_LINK_STATUS_ACTIVE && Boolean(role),
+    canUnlink: (
+      normalized.status === ACCOUNT_LINK_STATUS_ACTIVE
+      || normalized.status === ACCOUNT_LINK_STATUS_PENDING
+    ) && Boolean(role)
+  };
+}
+
+async function readAccountLinkById({ db, linkId }) {
+  const normalizedLinkId = String(linkId || '').trim();
+  if (!normalizedLinkId) return null;
+  const row = await db.prepare(SELECT_ACCOUNT_LINK_BY_ID_SQL).bind(normalizedLinkId).first();
+  return row ? normalizeAccountLinkRow(row) : null;
+}
+
+async function listAccountLinksForActor({ db, userId, email }) {
+  const normalizedUserId = normalizeUserId(userId);
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedUserId && !normalizedEmail) return [];
+  const query = await db.prepare(LIST_ACCOUNT_LINKS_FOR_USER_SQL).bind(
+    normalizedUserId || '',
+    normalizedEmail || ''
+  ).all();
+  const rows = Array.isArray(query?.results) ? query.results : [];
+  return rows.map((row) => normalizeAccountLinkRow(row));
+}
+
+async function findBlockingAccountLink({ db, userId, email, excludeLinkId = '' }) {
+  const normalizedUserId = normalizeUserId(userId);
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedUserId && !normalizedEmail) return null;
+  const row = await db.prepare(SELECT_BLOCKING_ACCOUNT_LINK_SQL).bind(
+    normalizedUserId || '',
+    normalizedEmail || '',
+    String(excludeLinkId || '').trim()
+  ).first();
+  if (!row?.id) return null;
+  return {
+    id: String(row.id || '').trim(),
+    status: String(row.status || '').trim().toLowerCase()
+  };
+}
+
+async function saveAccountLinkRow({ db, link }) {
+  const normalized = normalizeAccountLinkRow(link);
+  await db.prepare(UPSERT_ACCOUNT_LINK_SQL).bind(
+    normalized.id,
+    normalized.status,
+    normalized.requesterUserId || null,
+    normalized.requesterEmail || null,
+    normalized.targetUserId || null,
+    normalized.targetEmail || null,
+    JSON.stringify(normalizeAccountLinkScopes(normalized.requesterShareScopes)),
+    JSON.stringify(normalizeAccountLinkScopes(normalized.targetShareScopes)),
+    normalized.requesterApprovedAtMs,
+    normalized.targetApprovedAtMs,
+    normalized.createdAtMs,
+    normalized.updatedAtMs,
+    normalized.activatedAtMs,
+    normalized.declinedAtMs,
+    normalized.unlinkedAtMs
+  ).run();
 }
 
 function assertMediaCacheConfigured(env, corsOrigin) {
@@ -1865,6 +2322,718 @@ function parsePullLimit(rawValue) {
   return Math.max(1, Math.min(500, Math.floor(value)));
 }
 
+function buildSharedSyncItemsStatement({ db, userId, sinceMs, sectors, limit }) {
+  const validSectors = Array.isArray(sectors)
+    ? [...new Set(sectors.map((sector) => normalizeSectorKey(sector)).filter((sector) => isValidSectorKey(sector)))]
+    : [];
+  if (!validSectors.length) return null;
+  const bindings = [userId, sinceMs];
+  const placeholders = validSectors.map((_, index) => `?${index + 3}`).join(', ');
+  let sql = `${SELECT_SHARED_SYNC_ITEMS_BASE_SQL}`;
+  sql += ` AND sector_key IN (${placeholders})`;
+  sql += ` ORDER BY updated_at_ms ASC LIMIT ?${bindings.length + validSectors.length + 1}`;
+  bindings.push(...validSectors, limit);
+  return db.prepare(sql).bind(...bindings);
+}
+
+async function handleListAccountLinks({ request, env, corsOrigin, verifyIdToken, requestId }) {
+  assertD1Configured(env, corsOrigin);
+  const url = new URL(request.url);
+  const userId = normalizeUserId(url.searchParams.get('userId'));
+  const authContext = await requireAccountLinkAuthContext({
+    request,
+    env,
+    corsOrigin,
+    verifyIdToken,
+    userId,
+    requestId
+  });
+  const db = getD1Database(env);
+  await upsertAccountUserCapability({
+    db,
+    userId: authContext.userId,
+    email: authContext.email
+  });
+
+  const links = await listAccountLinksForActor({
+    db,
+    userId: authContext.userId,
+    email: authContext.email
+  });
+  const formatted = links.map((row) => formatAccountLinkForActor(row, authContext.userId, authContext.email));
+  const activeLink = formatted.find((link) => link?.status === ACCOUNT_LINK_STATUS_ACTIVE) || null;
+  const incomingRequests = formatted.filter((link) => link?.status === ACCOUNT_LINK_STATUS_PENDING && link.canApprove);
+  const pendingRequests = formatted.filter((link) => link?.status === ACCOUNT_LINK_STATUS_PENDING);
+
+  const selfCapability = await readAccountUserCapabilityByEmail({
+    db,
+    email: authContext.email
+  });
+
+  return jsonResponse(200, {
+    ok: true,
+    chatReady: selfCapability?.chatReady === true,
+    links: formatted,
+    activeLink,
+    incomingRequests,
+    pendingRequests
+  }, corsOrigin, { 'x-request-id': requestId });
+}
+
+async function handleGetAccountLinkTargetCapabilities({ request, env, corsOrigin, verifyIdToken, requestId }) {
+  assertD1Configured(env, corsOrigin);
+  const url = new URL(request.url);
+  const userId = normalizeUserId(url.searchParams.get('userId'));
+  const authContext = await requireAccountLinkAuthContext({
+    request,
+    env,
+    corsOrigin,
+    verifyIdToken,
+    userId,
+    requestId
+  });
+  const db = getD1Database(env);
+  await upsertAccountUserCapability({
+    db,
+    userId: authContext.userId,
+    email: authContext.email
+  });
+
+  const targetEmail = normalizeEmail(url.searchParams.get('email'));
+  if (!isValidEmail(targetEmail)) {
+    return errorResponse(400, {
+      error: 'invalid_target_email',
+      message: 'A valid target email is required.',
+      retryable: false,
+      code: 'invalid_target_email',
+      requestId
+    }, corsOrigin);
+  }
+  if (targetEmail === authContext.email) {
+    return errorResponse(400, {
+      error: 'self_link_forbidden',
+      message: 'You cannot link your account to itself.',
+      retryable: false,
+      code: 'self_link_forbidden',
+      requestId
+    }, corsOrigin);
+  }
+
+  const targetCapability = await readAccountUserCapabilityByEmail({
+    db,
+    email: targetEmail
+  });
+  const targetBlocking = await findBlockingAccountLink({
+    db,
+    userId: targetCapability?.userId || '',
+    email: targetEmail
+  });
+  const requesterBlocking = await findBlockingAccountLink({
+    db,
+    userId: authContext.userId,
+    email: authContext.email
+  });
+
+  return jsonResponse(200, {
+    ok: true,
+    targetEmail,
+    accountFound: Boolean(targetCapability?.userId),
+    chatEligible: targetCapability?.chatReady === true,
+    requesterBlocked: Boolean(requesterBlocking),
+    targetBlocked: Boolean(targetBlocking)
+  }, corsOrigin, { 'x-request-id': requestId });
+}
+
+async function handleCreateAccountLinkRequest({ request, env, corsOrigin, verifyIdToken, requestId }) {
+  assertD1Configured(env, corsOrigin);
+  const body = await parseJsonBody(request, corsOrigin, requestId);
+  const userId = normalizeUserId(body?.userId);
+  const authContext = await requireAccountLinkAuthContext({
+    request,
+    env,
+    corsOrigin,
+    verifyIdToken,
+    userId,
+    requestId
+  });
+  const targetEmail = normalizeEmail(body?.targetEmail);
+  if (!isValidEmail(targetEmail)) {
+    return errorResponse(400, {
+      error: 'invalid_target_email',
+      message: 'A valid target email is required.',
+      retryable: false,
+      code: 'invalid_target_email',
+      requestId
+    }, corsOrigin);
+  }
+  if (targetEmail === authContext.email) {
+    return errorResponse(400, {
+      error: 'self_link_forbidden',
+      message: 'You cannot link your account to itself.',
+      retryable: false,
+      code: 'self_link_forbidden',
+      requestId
+    }, corsOrigin);
+  }
+
+  const requesterShareScopes = normalizeAccountLinkScopes(body?.shareScopes);
+  if (!hasAnyEnabledAccountLinkScope(requesterShareScopes)) {
+    return errorResponse(400, {
+      error: 'invalid_share_scopes',
+      message: 'Choose at least one category to share.',
+      retryable: false,
+      code: 'invalid_share_scopes',
+      requestId
+    }, corsOrigin);
+  }
+
+  const db = getD1Database(env);
+  await upsertAccountUserCapability({
+    db,
+    userId: authContext.userId,
+    email: authContext.email
+  });
+
+  const requesterBlocking = await findBlockingAccountLink({
+    db,
+    userId: authContext.userId,
+    email: authContext.email
+  });
+  if (requesterBlocking) {
+    return errorResponse(409, {
+      error: 'link_conflict',
+      message: 'You already have a pending or active account link. Unlink it first.',
+      retryable: false,
+      code: 'requester_link_conflict',
+      requestId
+    }, corsOrigin);
+  }
+
+  const targetCapability = await readAccountUserCapabilityByEmail({
+    db,
+    email: targetEmail
+  });
+  const targetBlocking = await findBlockingAccountLink({
+    db,
+    userId: targetCapability?.userId || '',
+    email: targetEmail
+  });
+  if (targetBlocking) {
+    return errorResponse(409, {
+      error: 'target_link_conflict',
+      message: 'That account already has a pending or active account link.',
+      retryable: false,
+      code: 'target_link_conflict',
+      requestId
+    }, corsOrigin);
+  }
+
+  if (requesterShareScopes.secretChat === true && targetCapability?.chatReady !== true) {
+    return errorResponse(400, {
+      error: 'secret_chat_unavailable',
+      message: 'Secret Chat can only be shared when the target account has chat history.',
+      retryable: false,
+      code: 'secret_chat_unavailable',
+      requestId
+    }, corsOrigin);
+  }
+
+  const nowMs = Date.now();
+  const link = {
+    id: createAccountLinkId(),
+    status: ACCOUNT_LINK_STATUS_PENDING,
+    requesterUserId: authContext.userId,
+    requesterEmail: authContext.email,
+    targetUserId: targetCapability?.userId || null,
+    targetEmail,
+    requesterShareScopes,
+    targetShareScopes: { ...DEFAULT_ACCOUNT_LINK_SCOPES },
+    requesterApprovedAtMs: nowMs,
+    targetApprovedAtMs: null,
+    createdAtMs: nowMs,
+    updatedAtMs: nowMs,
+    activatedAtMs: null,
+    declinedAtMs: null,
+    unlinkedAtMs: null
+  };
+  await db.prepare(INSERT_ACCOUNT_LINK_SQL).bind(
+    link.id,
+    link.status,
+    link.requesterUserId,
+    link.requesterEmail,
+    link.targetUserId,
+    link.targetEmail,
+    JSON.stringify(link.requesterShareScopes),
+    JSON.stringify(link.targetShareScopes),
+    link.requesterApprovedAtMs,
+    link.targetApprovedAtMs,
+    link.createdAtMs,
+    link.updatedAtMs,
+    link.activatedAtMs,
+    link.declinedAtMs,
+    link.unlinkedAtMs
+  ).run();
+
+  const saved = await readAccountLinkById({ db, linkId: link.id });
+  return jsonResponse(200, {
+    ok: true,
+    link: formatAccountLinkForActor(saved || link, authContext.userId, authContext.email)
+  }, corsOrigin, { 'x-request-id': requestId });
+}
+
+async function handleRespondToAccountLinkRequest({ request, env, corsOrigin, verifyIdToken, requestId }) {
+  assertD1Configured(env, corsOrigin);
+  const body = await parseJsonBody(request, corsOrigin, requestId);
+  const userId = normalizeUserId(body?.userId);
+  const authContext = await requireAccountLinkAuthContext({
+    request,
+    env,
+    corsOrigin,
+    verifyIdToken,
+    userId,
+    requestId
+  });
+  const linkId = String(body?.linkId || '').trim();
+  const action = String(body?.action || '').trim().toLowerCase();
+  if (!linkId) {
+    return errorResponse(400, {
+      error: 'invalid_link_id',
+      message: 'linkId is required.',
+      retryable: false,
+      code: 'invalid_link_id',
+      requestId
+    }, corsOrigin);
+  }
+  if (action !== 'approve' && action !== 'decline') {
+    return errorResponse(400, {
+      error: 'invalid_action',
+      message: 'action must be "approve" or "decline".',
+      retryable: false,
+      code: 'invalid_action',
+      requestId
+    }, corsOrigin);
+  }
+
+  const db = getD1Database(env);
+  await upsertAccountUserCapability({
+    db,
+    userId: authContext.userId,
+    email: authContext.email
+  });
+
+  const existing = await readAccountLinkById({ db, linkId });
+  if (!existing) {
+    return errorResponse(404, {
+      error: 'link_not_found',
+      message: 'Account link request not found.',
+      retryable: false,
+      code: 'link_not_found',
+      requestId
+    }, corsOrigin);
+  }
+  const role = getAccountLinkRole({
+    requester_user_id: existing.requesterUserId,
+    requester_email: existing.requesterEmail,
+    target_user_id: existing.targetUserId,
+    target_email: existing.targetEmail
+  }, authContext.userId, authContext.email);
+  if (role !== 'target') {
+    return errorResponse(403, {
+      error: 'forbidden',
+      message: 'Only the invited account can approve or decline this request.',
+      retryable: false,
+      code: 'forbidden',
+      requestId
+    }, corsOrigin);
+  }
+  if (existing.status !== ACCOUNT_LINK_STATUS_PENDING) {
+    return errorResponse(409, {
+      error: 'link_not_pending',
+      message: 'This account link request is no longer pending.',
+      retryable: false,
+      code: 'link_not_pending',
+      requestId
+    }, corsOrigin);
+  }
+
+  const nowMs = Date.now();
+  const next = {
+    ...existing,
+    targetUserId: authContext.userId,
+    targetEmail: authContext.email,
+    updatedAtMs: nowMs
+  };
+
+  if (action === 'decline') {
+    next.status = ACCOUNT_LINK_STATUS_DECLINED;
+    next.targetApprovedAtMs = null;
+    next.declinedAtMs = nowMs;
+  } else {
+    const shareScopes = normalizeAccountLinkScopes(body?.shareScopes);
+    next.targetShareScopes = shareScopes;
+    next.targetApprovedAtMs = nowMs;
+    next.declinedAtMs = null;
+    next.status = ACCOUNT_LINK_STATUS_ACTIVE;
+    next.activatedAtMs = nowMs;
+
+    const requesterBlocking = await findBlockingAccountLink({
+      db,
+      userId: next.requesterUserId,
+      email: next.requesterEmail,
+      excludeLinkId: next.id
+    });
+    if (requesterBlocking) {
+      return errorResponse(409, {
+        error: 'requester_link_conflict',
+        message: 'The requester account already has another pending or active link.',
+        retryable: false,
+        code: 'requester_link_conflict',
+        requestId
+      }, corsOrigin);
+    }
+    const targetBlocking = await findBlockingAccountLink({
+      db,
+      userId: next.targetUserId,
+      email: next.targetEmail,
+      excludeLinkId: next.id
+    });
+    if (targetBlocking) {
+      return errorResponse(409, {
+        error: 'target_link_conflict',
+        message: 'Your account already has another pending or active link.',
+        retryable: false,
+        code: 'target_link_conflict',
+        requestId
+      }, corsOrigin);
+    }
+    const requesterCapability = await readAccountUserCapabilityByEmail({
+      db,
+      email: next.requesterEmail
+    });
+    if (next.targetShareScopes.secretChat === true && requesterCapability?.chatReady !== true) {
+      return errorResponse(400, {
+        error: 'secret_chat_unavailable',
+        message: 'Secret Chat can only be shared when the partner account has chat history.',
+        retryable: false,
+        code: 'secret_chat_unavailable',
+        requestId
+      }, corsOrigin);
+    }
+  }
+
+  await saveAccountLinkRow({ db, link: next });
+  const saved = await readAccountLinkById({ db, linkId: next.id });
+  return jsonResponse(200, {
+    ok: true,
+    link: formatAccountLinkForActor(saved || next, authContext.userId, authContext.email)
+  }, corsOrigin, { 'x-request-id': requestId });
+}
+
+async function handleUpdateAccountLinkScopes({ request, env, corsOrigin, verifyIdToken, requestId }) {
+  assertD1Configured(env, corsOrigin);
+  const body = await parseJsonBody(request, corsOrigin, requestId);
+  const userId = normalizeUserId(body?.userId);
+  const authContext = await requireAccountLinkAuthContext({
+    request,
+    env,
+    corsOrigin,
+    verifyIdToken,
+    userId,
+    requestId
+  });
+  const linkId = String(body?.linkId || '').trim();
+  if (!linkId) {
+    return errorResponse(400, {
+      error: 'invalid_link_id',
+      message: 'linkId is required.',
+      retryable: false,
+      code: 'invalid_link_id',
+      requestId
+    }, corsOrigin);
+  }
+
+  const db = getD1Database(env);
+  const existing = await readAccountLinkById({ db, linkId });
+  if (!existing) {
+    return errorResponse(404, {
+      error: 'link_not_found',
+      message: 'Account link not found.',
+      retryable: false,
+      code: 'link_not_found',
+      requestId
+    }, corsOrigin);
+  }
+  const role = getAccountLinkRole({
+    requester_user_id: existing.requesterUserId,
+    requester_email: existing.requesterEmail,
+    target_user_id: existing.targetUserId,
+    target_email: existing.targetEmail
+  }, authContext.userId, authContext.email);
+  if (!role) {
+    return errorResponse(403, {
+      error: 'forbidden',
+      message: 'You are not part of this account link.',
+      retryable: false,
+      code: 'forbidden',
+      requestId
+    }, corsOrigin);
+  }
+  if (existing.status !== ACCOUNT_LINK_STATUS_ACTIVE) {
+    return errorResponse(409, {
+      error: 'link_not_active',
+      message: 'Sharing settings can only be updated on an active link.',
+      retryable: false,
+      code: 'link_not_active',
+      requestId
+    }, corsOrigin);
+  }
+
+  const next = {
+    ...existing,
+    updatedAtMs: Date.now()
+  };
+  const normalizedScopes = normalizeAccountLinkScopes(body?.shareScopes);
+  if (role === 'requester') {
+    if (normalizedScopes.secretChat === true) {
+      const targetCapability = await readAccountUserCapabilityByEmail({ db, email: next.targetEmail });
+      if (targetCapability?.chatReady !== true) {
+        return errorResponse(400, {
+          error: 'secret_chat_unavailable',
+          message: 'Secret Chat can only be shared when the partner account has chat history.',
+          retryable: false,
+          code: 'secret_chat_unavailable',
+          requestId
+        }, corsOrigin);
+      }
+    }
+    next.requesterShareScopes = normalizedScopes;
+  } else {
+    if (normalizedScopes.secretChat === true) {
+      const requesterCapability = await readAccountUserCapabilityByEmail({ db, email: next.requesterEmail });
+      if (requesterCapability?.chatReady !== true) {
+        return errorResponse(400, {
+          error: 'secret_chat_unavailable',
+          message: 'Secret Chat can only be shared when the partner account has chat history.',
+          retryable: false,
+          code: 'secret_chat_unavailable',
+          requestId
+        }, corsOrigin);
+      }
+    }
+    next.targetShareScopes = normalizedScopes;
+  }
+
+  await saveAccountLinkRow({ db, link: next });
+  const saved = await readAccountLinkById({ db, linkId: next.id });
+  return jsonResponse(200, {
+    ok: true,
+    link: formatAccountLinkForActor(saved || next, authContext.userId, authContext.email)
+  }, corsOrigin, { 'x-request-id': requestId });
+}
+
+async function handleUnlinkAccountLink({ request, env, corsOrigin, verifyIdToken, requestId }) {
+  assertD1Configured(env, corsOrigin);
+  const body = await parseJsonBody(request, corsOrigin, requestId);
+  const userId = normalizeUserId(body?.userId);
+  const authContext = await requireAccountLinkAuthContext({
+    request,
+    env,
+    corsOrigin,
+    verifyIdToken,
+    userId,
+    requestId
+  });
+  const linkId = String(body?.linkId || '').trim();
+  if (!linkId) {
+    return errorResponse(400, {
+      error: 'invalid_link_id',
+      message: 'linkId is required.',
+      retryable: false,
+      code: 'invalid_link_id',
+      requestId
+    }, corsOrigin);
+  }
+
+  const db = getD1Database(env);
+  const existing = await readAccountLinkById({ db, linkId });
+  if (!existing) {
+    return errorResponse(404, {
+      error: 'link_not_found',
+      message: 'Account link not found.',
+      retryable: false,
+      code: 'link_not_found',
+      requestId
+    }, corsOrigin);
+  }
+  if (!isAccountLinkParticipant({
+    requester_user_id: existing.requesterUserId,
+    requester_email: existing.requesterEmail,
+    target_user_id: existing.targetUserId,
+    target_email: existing.targetEmail
+  }, authContext.userId, authContext.email)) {
+    return errorResponse(403, {
+      error: 'forbidden',
+      message: 'You are not part of this account link.',
+      retryable: false,
+      code: 'forbidden',
+      requestId
+    }, corsOrigin);
+  }
+
+  const next = {
+    ...existing,
+    status: ACCOUNT_LINK_STATUS_UNLINKED,
+    updatedAtMs: Date.now(),
+    unlinkedAtMs: Date.now()
+  };
+  await saveAccountLinkRow({ db, link: next });
+  return jsonResponse(200, {
+    ok: true,
+    link: formatAccountLinkForActor(next, authContext.userId, authContext.email)
+  }, corsOrigin, { 'x-request-id': requestId });
+}
+
+async function handleMarkAccountChatReady({ request, env, corsOrigin, verifyIdToken, requestId }) {
+  assertD1Configured(env, corsOrigin);
+  const body = await parseJsonBody(request, corsOrigin, requestId);
+  const userId = normalizeUserId(body?.userId);
+  const authContext = await requireAccountLinkAuthContext({
+    request,
+    env,
+    corsOrigin,
+    verifyIdToken,
+    userId,
+    requestId
+  });
+  const db = getD1Database(env);
+  const nowMs = Date.now();
+  await upsertAccountUserCapability({
+    db,
+    userId: authContext.userId,
+    email: authContext.email,
+    chatReady: true,
+    lastChatSeenAtMs: nowMs
+  });
+  return jsonResponse(200, {
+    ok: true,
+    userId: authContext.userId,
+    chatReady: true,
+    lastChatSeenAtMs: nowMs
+  }, corsOrigin, { 'x-request-id': requestId });
+}
+
+async function handlePullLinkedSharedFeed({ request, env, corsOrigin, verifyIdToken, requestId }) {
+  assertD1Configured(env, corsOrigin);
+  const url = new URL(request.url);
+  const userId = normalizeUserId(url.searchParams.get('userId'));
+  const authContext = await requireAccountLinkAuthContext({
+    request,
+    env,
+    corsOrigin,
+    verifyIdToken,
+    userId,
+    requestId
+  });
+  const sinceMs = parseSinceMs(url.searchParams.get('since'));
+  const limit = parsePullLimit(url.searchParams.get('limit'));
+  const db = getD1Database(env);
+
+  await upsertAccountUserCapability({
+    db,
+    userId: authContext.userId,
+    email: authContext.email
+  });
+  const links = await listAccountLinksForActor({
+    db,
+    userId: authContext.userId,
+    email: authContext.email
+  });
+  const activeLinks = links.filter((link) => link.status === ACCOUNT_LINK_STATUS_ACTIVE);
+  const activeLinkIds = activeLinks
+    .map((link) => String(link?.id || '').trim())
+    .filter(Boolean)
+    .sort();
+
+  const operations = [];
+
+  for (const link of activeLinks) {
+    const role = getAccountLinkRole({
+      requester_user_id: link.requesterUserId,
+      requester_email: link.requesterEmail,
+      target_user_id: link.targetUserId,
+      target_email: link.targetEmail
+    }, authContext.userId, authContext.email);
+    if (!role) continue;
+    const sourceUserId = role === 'requester' ? link.targetUserId : link.requesterUserId;
+    const sourceEmail = role === 'requester' ? link.targetEmail : link.requesterEmail;
+    const sourceScopes = role === 'requester' ? link.targetShareScopes : link.requesterShareScopes;
+    const sectors = getEnabledSharedSectorsFromScopes(sourceScopes);
+    if (!sourceUserId || !sectors.length) continue;
+
+    const statement = buildSharedSyncItemsStatement({
+      db,
+      userId: sourceUserId,
+      sinceMs,
+      sectors,
+      limit
+    });
+    if (!statement) continue;
+    const query = await statement.all();
+    const rows = Array.isArray(query?.results) ? query.results : [];
+    rows.forEach((row) => {
+      const updatedAtMs = parseSinceMs(row?.updated_at_ms);
+      const sectorKey = normalizeSectorKey(row?.sector_key);
+      const itemKey = normalizeItemKey(row?.item_key);
+      if (!isValidSectorKey(sectorKey) || !itemKey) return;
+      const deleted = Number(row?.deleted_at_ms || 0) > 0;
+      let payload = null;
+      if (!deleted) {
+        try {
+          payload = JSON.parse(String(row?.item_json || 'null'));
+        } catch {
+          payload = null;
+        }
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return;
+      }
+      operations.push({
+        linkId: link.id,
+        sourceUserId,
+        sourceEmail: sourceEmail || null,
+        sectorKey,
+        itemKey,
+        deleted,
+        updatedAtMs,
+        opId: String(row?.op_id || '').trim() || null,
+        payload
+      });
+    });
+  }
+
+  operations.sort((left, right) => {
+    const leftTime = Number(left?.updatedAtMs || 0);
+    const rightTime = Number(right?.updatedAtMs || 0);
+    if (leftTime !== rightTime) return leftTime - rightTime;
+    const leftKey = `${left?.linkId || ''}:${left?.sectorKey || ''}:${left?.itemKey || ''}`;
+    const rightKey = `${right?.linkId || ''}:${right?.sectorKey || ''}:${right?.itemKey || ''}`;
+    return leftKey.localeCompare(rightKey);
+  });
+  const limited = operations.slice(0, limit);
+  const limitedCursorMs = limited.reduce(
+    (max, operation) => Math.max(max, parseSinceMs(operation?.updatedAtMs)),
+    sinceMs
+  );
+  const hasMore = operations.length > limited.length;
+
+  return jsonResponse(200, {
+    ok: true,
+    sinceMs,
+    cursorMs: limitedCursorMs,
+    hasMore,
+    activeLinkIds,
+    operations: limited
+  }, corsOrigin, { 'x-request-id': requestId });
+}
+
 async function handleListSyncPush({ request, env, corsOrigin, verifyIdToken }) {
   assertD1Configured(env, corsOrigin);
   const body = await parseJsonBody(request, corsOrigin);
@@ -2403,6 +3572,9 @@ function buildHealthPayload(env) {
       { id: 'cloud_import_read', method: 'GET', path: '/?userId=<uid>', expectedStatuses: [200, 401, 404] },
       { id: 'sync_pull', method: 'GET', path: '/sync/sectors/pull?userId=<uid>&since=0', expectedStatuses: [200, 401] },
       { id: 'sync_push', method: 'POST', path: '/sync/sectors/push', expectedStatuses: [200, 401] },
+      { id: 'account_links_list', method: 'GET', path: '/links?userId=<uid>', expectedStatuses: [200, 401] },
+      { id: 'account_links_request', method: 'POST', path: '/links/request', expectedStatuses: [200, 400, 401, 409] },
+      { id: 'account_links_shared_feed', method: 'GET', path: '/links/shared-feed?userId=<uid>&since=0', expectedStatuses: [200, 401] },
       { id: 'import_admin_guard', method: 'POST', path: '/?import=true', expectedStatuses: [200, 401, 403] }
     ]
   };
@@ -2444,6 +3616,38 @@ export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOri
             code: 'route_not_found',
             requestId
           }, corsOrigin);
+        }
+
+        if (request.method === 'GET' && url.pathname === '/links') {
+          return await handleListAccountLinks({ request, env, corsOrigin, verifyIdToken, requestId });
+        }
+
+        if (request.method === 'GET' && url.pathname === '/links/target-capabilities') {
+          return await handleGetAccountLinkTargetCapabilities({ request, env, corsOrigin, verifyIdToken, requestId });
+        }
+
+        if (request.method === 'GET' && url.pathname === '/links/shared-feed') {
+          return await handlePullLinkedSharedFeed({ request, env, corsOrigin, verifyIdToken, requestId });
+        }
+
+        if (request.method === 'POST' && url.pathname === '/links/request') {
+          return await handleCreateAccountLinkRequest({ request, env, corsOrigin, verifyIdToken, requestId });
+        }
+
+        if (request.method === 'POST' && url.pathname === '/links/respond') {
+          return await handleRespondToAccountLinkRequest({ request, env, corsOrigin, verifyIdToken, requestId });
+        }
+
+        if (request.method === 'POST' && url.pathname === '/links/scopes') {
+          return await handleUpdateAccountLinkScopes({ request, env, corsOrigin, verifyIdToken, requestId });
+        }
+
+        if (request.method === 'POST' && url.pathname === '/links/unlink') {
+          return await handleUnlinkAccountLink({ request, env, corsOrigin, verifyIdToken, requestId });
+        }
+
+        if (request.method === 'POST' && url.pathname === '/links/chat-ready') {
+          return await handleMarkAccountChatReady({ request, env, corsOrigin, verifyIdToken, requestId });
         }
 
         if (request.method === 'POST' && url.pathname === '/sync/sectors/push') {
