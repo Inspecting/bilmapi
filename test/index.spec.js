@@ -3,6 +3,7 @@ import { createWorker } from '../src/index.js';
 
 const USER_ID = '12345678901234567890123456';
 const OTHER_USER_ID = 'abcdefghijklmnopqrstuvwxyz12';
+const THIRD_USER_ID = '33333333333333333333333333';
 const ALLOWED_ORIGIN = 'https://watchbilm.org';
 const ALLOWED_FLY_ORIGIN = 'https://bilm.fly.dev';
 const DISALLOWED_ORIGIN = 'https://evil.example';
@@ -189,6 +190,71 @@ class MemoryD1Statement {
       return { success: true, meta: { changes: 1 } };
     }
 
+    if (this.sql.startsWith('insert into account_user_capabilities')) {
+      const [userId, email, chatReady, lastChatSeenAtMs, updatedAtMs] = this.params;
+      const normalizedUserId = String(userId || '');
+      const current = this.db.accountCapabilityRows.get(normalizedUserId);
+      this.db.accountCapabilityRows.set(normalizedUserId, {
+        user_id: normalizedUserId,
+        email: String(email || '').toLowerCase(),
+        chat_ready: Math.max(Number(current?.chat_ready || 0) || 0, Number(chatReady || 0) || 0),
+        last_chat_seen_at_ms: lastChatSeenAtMs === null || typeof lastChatSeenAtMs === 'undefined'
+          ? current?.last_chat_seen_at_ms || null
+          : Number(lastChatSeenAtMs || 0) || null,
+        updated_at_ms: Number(updatedAtMs || 0) || 0
+      });
+      return { success: true, meta: { changes: 1 } };
+    }
+
+    if (this.sql.startsWith('insert into account_links')) {
+      const [
+        id,
+        status,
+        requesterUserId,
+        requesterEmail,
+        targetUserId,
+        targetEmail,
+        requesterShareScopesJson,
+        targetShareScopesJson,
+        requesterApprovedAtMs,
+        targetApprovedAtMs,
+        createdAtMs,
+        updatedAtMs,
+        activatedAtMs,
+        declinedAtMs,
+        unlinkedAtMs
+      ] = this.params;
+      const row = {
+        id: String(id || ''),
+        status: String(status || '').toLowerCase(),
+        requester_user_id: String(requesterUserId || ''),
+        requester_email: String(requesterEmail || '').toLowerCase(),
+        target_user_id: targetUserId === null || typeof targetUserId === 'undefined' ? null : String(targetUserId || ''),
+        target_email: String(targetEmail || '').toLowerCase(),
+        requester_share_scopes_json: String(requesterShareScopesJson || '{}'),
+        target_share_scopes_json: String(targetShareScopesJson || '{}'),
+        requester_approved_at_ms: requesterApprovedAtMs === null || typeof requesterApprovedAtMs === 'undefined'
+          ? null
+          : Number(requesterApprovedAtMs || 0) || null,
+        target_approved_at_ms: targetApprovedAtMs === null || typeof targetApprovedAtMs === 'undefined'
+          ? null
+          : Number(targetApprovedAtMs || 0) || null,
+        created_at_ms: Number(createdAtMs || 0) || 0,
+        updated_at_ms: Number(updatedAtMs || 0) || 0,
+        activated_at_ms: activatedAtMs === null || typeof activatedAtMs === 'undefined'
+          ? null
+          : Number(activatedAtMs || 0) || null,
+        declined_at_ms: declinedAtMs === null || typeof declinedAtMs === 'undefined'
+          ? null
+          : Number(declinedAtMs || 0) || null,
+        unlinked_at_ms: unlinkedAtMs === null || typeof unlinkedAtMs === 'undefined'
+          ? null
+          : Number(unlinkedAtMs || 0) || null
+      };
+      this.db.accountLinkRows.set(row.id, row);
+      return { success: true, meta: { changes: 1 } };
+    }
+
     if (this.sql.startsWith('insert into media_cache_entries')) {
       const [
         cacheKey,
@@ -340,6 +406,35 @@ class MemoryD1Statement {
 
   async first() {
     const key = String(this.params[0] || '');
+    if (this.sql.includes('from account_user_capabilities')) {
+      const email = String(this.params[0] || '').toLowerCase();
+      const rows = [...this.db.accountCapabilityRows.values()]
+        .filter((row) => row.email === email)
+        .sort((a, b) => Number(b.updated_at_ms || 0) - Number(a.updated_at_ms || 0));
+      return rows[0] ? { ...rows[0] } : null;
+    }
+
+    if (this.sql.includes('from account_links') && this.sql.includes('where id = ?1')) {
+      const row = this.db.accountLinkRows.get(key);
+      return row ? { ...row } : null;
+    }
+
+    if (this.sql.includes('from account_links') && this.sql.includes("status in ('pending', 'active')")) {
+      const [userId, email, excludeLinkId] = this.params;
+      const normalizedUserId = String(userId || '');
+      const normalizedEmail = String(email || '').toLowerCase();
+      const excluded = String(excludeLinkId || '');
+      const row = [...this.db.accountLinkRows.values()].find((entry) => {
+        if (String(entry.id || '') === excluded) return false;
+        if (!['pending', 'active'].includes(String(entry.status || ''))) return false;
+        return entry.requester_user_id === normalizedUserId
+          || entry.target_user_id === normalizedUserId
+          || entry.requester_email === normalizedEmail
+          || entry.target_email === normalizedEmail;
+      });
+      return row ? { ...row } : null;
+    }
+
     if (this.sql.includes('select migrated_at_ms')) {
       const syncState = this.db.syncStateRows.get(key);
       if (!syncState) return null;
@@ -393,6 +488,21 @@ class MemoryD1Statement {
   }
 
   async all() {
+    if (this.sql.includes('from account_links')) {
+      const [userId, email] = this.params;
+      const normalizedUserId = String(userId || '');
+      const normalizedEmail = String(email || '').toLowerCase();
+      const results = [...this.db.accountLinkRows.values()]
+        .filter((row) => row.requester_user_id === normalizedUserId
+          || row.target_user_id === normalizedUserId
+          || row.requester_email === normalizedEmail
+          || row.target_email === normalizedEmail)
+        .sort((a, b) => Number(b.updated_at_ms || 0) - Number(a.updated_at_ms || 0))
+        .slice(0, 50)
+        .map((row) => ({ ...row }));
+      return { results };
+    }
+
     if (this.sql.includes('from list_sync_items')) {
       const [userId, sinceMs, limit] = this.params;
       const normalizedUserId = String(userId || '');
@@ -450,6 +560,8 @@ class MemoryD1 {
     this.mediaRows = new Map();
     this.mediaQueryRows = new Map();
     this.mediaLocks = new Map();
+    this.accountCapabilityRows = new Map();
+    this.accountLinkRows = new Map();
   }
 
   prepare(sql) {
@@ -478,8 +590,9 @@ function createEnv({
 
 function createVerifier() {
   return async (token) => {
-    if (token === 'valid-token') return { sub: USER_ID };
-    if (token === 'other-token') return { sub: OTHER_USER_ID };
+    if (token === 'valid-token') return { sub: USER_ID, email: 'alice@example.com' };
+    if (token === 'other-token') return { sub: OTHER_USER_ID, email: 'bob@example.com' };
+    if (token === 'third-token') return { sub: THIRD_USER_ID, email: 'charlie@example.com' };
     throw new Error('invalid token');
   };
 }
@@ -1381,6 +1494,193 @@ describe('data api', () => {
     const body = await response.json();
     expect(body.code).toBe('sector_payload_too_large');
     expect(body.requestId).toBeTruthy();
+  });
+
+  it('creates account links with non-chat scopes and watch later support', async () => {
+    const response = await worker.fetch(new Request('https://data-api.watchbilm.org/links/request', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        targetEmail: 'Bob@Example.com',
+        shareScopes: {
+          favorites: true,
+          watch_later: true,
+          secretChat: true
+        }
+      })
+    }), env);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    const body = await response.json();
+    expect(body.link.status).toBe('pending');
+    expect(body.link.partner.email).toBe('bob@example.com');
+    expect(body.link.me.shareScopes.favorites).toBe(true);
+    expect(body.link.me.shareScopes.watchLater).toBe(true);
+    expect(body.link.me.shareScopes.secretChat).toBeUndefined();
+  });
+
+  it('rejects self links and blocks a second pending link', async () => {
+    const selfLink = await worker.fetch(new Request('https://data-api.watchbilm.org/links/request', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        targetEmail: 'alice@example.com',
+        shareScopes: { favorites: true }
+      })
+    }), env);
+    expect(selfLink.status).toBe(400);
+    expect((await selfLink.json()).code).toBe('self_link_forbidden');
+
+    const first = await worker.fetch(new Request('https://data-api.watchbilm.org/links/request', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        targetEmail: 'bob@example.com',
+        shareScopes: { favorites: true }
+      })
+    }), env);
+    expect(first.status).toBe(200);
+
+    const second = await worker.fetch(new Request('https://data-api.watchbilm.org/links/request', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        targetEmail: 'charlie@example.com',
+        shareScopes: { watchHistory: true }
+      })
+    }), env);
+    expect(second.status).toBe(409);
+    expect((await second.json()).code).toBe('requester_link_conflict');
+  });
+
+  it('approves links and shared-feed returns approved non-chat sectors with a signature', async () => {
+    const createResponse = await worker.fetch(new Request('https://data-api.watchbilm.org/links/request', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        targetEmail: 'bob@example.com',
+        shareScopes: {
+          favorites: true,
+          watchLater: true,
+          secretChat: true
+        }
+      })
+    }), env);
+    expect(createResponse.status).toBe(200);
+    const created = await createResponse.json();
+    const linkId = created.link.id;
+
+    const approveResponse = await worker.fetch(new Request('https://data-api.watchbilm.org/links/respond', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer other-token'
+      },
+      body: JSON.stringify({
+        userId: OTHER_USER_ID,
+        linkId,
+        action: 'approve',
+        shareScopes: { continueWatching: true }
+      })
+    }), env);
+    expect(approveResponse.status).toBe(200);
+    const approved = await approveResponse.json();
+    expect(approved.link.status).toBe('active');
+    expect(approved.link.me.shareScopes.continueWatching).toBe(true);
+
+    const pushResponse = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        operations: [
+          {
+            sectorKey: 'favorites',
+            itemKey: 'movie:10',
+            updatedAtMs: 1726000000000,
+            deleted: false,
+            payload: { key: 'tmdb:movie:10', title: 'Favorite Movie', updatedAt: 1726000000000 }
+          },
+          {
+            sectorKey: 'watch_later',
+            itemKey: 'movie:11',
+            updatedAtMs: 1726000000100,
+            deleted: false,
+            payload: { key: 'tmdb:movie:11', title: 'Later Movie', updatedAt: 1726000000100 }
+          },
+          {
+            sectorKey: 'chat_messages',
+            itemKey: 'chat:1',
+            updatedAtMs: 1726000000200,
+            deleted: false,
+            payload: { id: 'chat-1', text: 'not shared', createdAtMs: 1726000000200 }
+          }
+        ]
+      })
+    }), env);
+    expect(pushResponse.status).toBe(200);
+
+    const feedResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/links/shared-feed?userId=${OTHER_USER_ID}&since=0`, {
+      headers: { authorization: 'Bearer other-token' }
+    }), env);
+    expect(feedResponse.status).toBe(200);
+    const feed = await feedResponse.json();
+    expect(feed.linkSignature).toContain(linkId);
+    expect(feed.operations.map((operation) => operation.sectorKey)).toEqual(['favorites', 'watch_later']);
+    expect(feed.operations.some((operation) => operation.sectorKey === 'chat_messages')).toBe(false);
+  });
+
+  it('keeps target capability lookup non-enumerating', async () => {
+    const response = await worker.fetch(new Request(`https://data-api.watchbilm.org/links/target-capabilities?userId=${USER_ID}&email=bob@example.com`, {
+      headers: { authorization: 'Bearer valid-token' }
+    }), env);
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.targetEmail).toBe('bob@example.com');
+    expect(body.accountFound).toBe(false);
+    expect(body.chatEligible).toBeUndefined();
+  });
+
+  it('rate limits account-link endpoints per user', async () => {
+    env.ACCOUNT_LINK_RATE_LIMIT_READ = '1';
+    env.ACCOUNT_LINK_RATE_LIMIT_READ_WINDOW_MS = '60000';
+
+    const first = await worker.fetch(new Request(`https://data-api.watchbilm.org/links?userId=${THIRD_USER_ID}`, {
+      headers: { authorization: 'Bearer third-token' }
+    }), env);
+    expect(first.status).toBe(200);
+
+    const second = await worker.fetch(new Request(`https://data-api.watchbilm.org/links?userId=${THIRD_USER_ID}`, {
+      headers: { authorization: 'Bearer third-token' }
+    }), env);
+    expect(second.status).toBe(429);
+    expect(second.headers.get('retry-after')).toBeTruthy();
+    expect((await second.json()).code).toBe('account_link_rate_limited');
   });
 
   it('purges expired tombstones on scheduled run', async () => {

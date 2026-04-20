@@ -357,7 +357,7 @@ const LIST_ACCOUNT_LINKS_FOR_USER_SQL = `
   LIMIT 50
 `;
 const SELECT_BLOCKING_ACCOUNT_LINK_SQL = `
-  SELECT id, status
+  SELECT id, status, created_at_ms, updated_at_ms
   FROM account_links
   WHERE status IN ('pending', 'active')
     AND id != ?3
@@ -419,6 +419,14 @@ const MEDIA_CACHE_PROFILE_MS = Object.freeze({
   metadata: { freshMs: 7 * 24 * 60 * 60 * 1000, staleMs: 30 * 24 * 60 * 60 * 1000 },
   error: { freshMs: 5 * 60 * 1000, staleMs: 60 * 60 * 1000 }
 });
+const ACCOUNT_LINK_PENDING_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const ACCOUNT_LINK_RATE_LIMIT_STORE = new Map();
+let nextAccountLinkRateLimitSweepAtMs = 0;
+const ACCOUNT_LINK_RATE_LIMIT_STORE_SOFT_CAP = 5000;
+const DEFAULT_ACCOUNT_LINK_RATE_LIMITS = Object.freeze({
+  read: Object.freeze({ limit: 120, windowMs: 60_000 }),
+  mutation: Object.freeze({ limit: 30, windowMs: 60_000 })
+});
 const DISALLOWED_CREDENTIAL_KEYS = new Set([
   'password',
   'passwordhash',
@@ -454,26 +462,27 @@ const ACCOUNT_LINK_STATUS_PENDING = 'pending';
 const ACCOUNT_LINK_STATUS_ACTIVE = 'active';
 const ACCOUNT_LINK_STATUS_DECLINED = 'declined';
 const ACCOUNT_LINK_STATUS_UNLINKED = 'unlinked';
+const ACCOUNT_LINK_STATUS_EXPIRED = 'expired';
 const ACCOUNT_LINK_SCOPE_KEYS = Object.freeze([
   'continueWatching',
   'favorites',
+  'watchLater',
   'watchHistory',
-  'searchHistory',
-  'secretChat'
+  'searchHistory'
 ]);
 const ACCOUNT_LINK_SCOPE_TO_SECTORS = Object.freeze({
   continueWatching: ['continue_watching'],
   favorites: ['favorites'],
+  watchLater: ['watch_later'],
   watchHistory: ['watch_history'],
-  searchHistory: ['search_history'],
-  secretChat: ['chat_messages']
+  searchHistory: ['search_history']
 });
 const DEFAULT_ACCOUNT_LINK_SCOPES = Object.freeze({
   continueWatching: false,
   favorites: false,
+  watchLater: false,
   watchHistory: false,
-  searchHistory: false,
-  secretChat: false
+  searchHistory: false
 });
 
 const firebaseJwks = createRemoteJWKSet(new URL(FIREBASE_JWKS_URL));
@@ -947,6 +956,99 @@ function assertD1Configured(env, corsOrigin) {
   }
 }
 
+function parseEnvInt(env, name, fallback, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const raw = String(env?.[name] ?? '').trim();
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(parsed)));
+}
+
+function getAccountLinkRateLimitPolicy(env, kind = 'read') {
+  const normalizedKind = kind === 'mutation' ? 'mutation' : 'read';
+  const defaults = DEFAULT_ACCOUNT_LINK_RATE_LIMITS[normalizedKind];
+  const envPrefix = normalizedKind === 'mutation'
+    ? 'ACCOUNT_LINK_RATE_LIMIT_MUTATION'
+    : 'ACCOUNT_LINK_RATE_LIMIT_READ';
+  return {
+    limit: parseEnvInt(env, envPrefix, defaults.limit, { min: 1, max: 1000 }),
+    windowMs: parseEnvInt(env, `${envPrefix}_WINDOW_MS`, defaults.windowMs, { min: 1000, max: 60 * 60 * 1000 })
+  };
+}
+
+function sweepAccountLinkRateLimitStore(nowMs) {
+  if (nowMs < nextAccountLinkRateLimitSweepAtMs && ACCOUNT_LINK_RATE_LIMIT_STORE.size < ACCOUNT_LINK_RATE_LIMIT_STORE_SOFT_CAP) return;
+  for (const [key, entry] of ACCOUNT_LINK_RATE_LIMIT_STORE.entries()) {
+    if (!entry || Number(entry.resetAtMs || 0) <= nowMs) {
+      ACCOUNT_LINK_RATE_LIMIT_STORE.delete(key);
+    }
+  }
+  nextAccountLinkRateLimitSweepAtMs = nowMs + 60_000;
+}
+
+function consumeAccountLinkRateLimit({ key, policy }) {
+  const nowMs = Date.now();
+  sweepAccountLinkRateLimitStore(nowMs);
+  const normalizedLimit = Math.max(1, Number(policy?.limit || 1));
+  const windowMs = Math.max(1000, Number(policy?.windowMs || 60_000));
+  const storeKey = String(key || 'unknown').slice(0, 160);
+  let entry = ACCOUNT_LINK_RATE_LIMIT_STORE.get(storeKey);
+  if (!entry || Number(entry.resetAtMs || 0) <= nowMs) {
+    entry = { count: 0, resetAtMs: nowMs + windowMs };
+  }
+  if (entry.count >= normalizedLimit) {
+    ACCOUNT_LINK_RATE_LIMIT_STORE.set(storeKey, entry);
+    return {
+      allowed: false,
+      retryAfterSeconds: Math.max(1, Math.ceil((entry.resetAtMs - nowMs) / 1000))
+    };
+  }
+  entry.count += 1;
+  ACCOUNT_LINK_RATE_LIMIT_STORE.set(storeKey, entry);
+  return {
+    allowed: true,
+    retryAfterSeconds: 0
+  };
+}
+
+function enforceAccountLinkRateLimit({ env, authContext, corsOrigin, requestId, kind = 'read' }) {
+  const policy = getAccountLinkRateLimitPolicy(env, kind);
+  const actorKey = normalizeUserId(authContext?.userId) || normalizeEmail(authContext?.email) || 'anonymous';
+  const state = consumeAccountLinkRateLimit({
+    key: `account-link:${kind}:${actorKey}`,
+    policy
+  });
+  if (state.allowed) return;
+  throw errorResponse(429, {
+    error: 'rate_limited',
+    message: 'Too many account-link requests. Please wait and try again.',
+    retryable: true,
+    code: 'account_link_rate_limited',
+    requestId
+  }, corsOrigin, {
+    'retry-after': String(state.retryAfterSeconds)
+  });
+}
+
+function isPendingAccountLinkExpired(linkRow, nowMs = Date.now()) {
+  const normalized = normalizeAccountLinkRow(linkRow);
+  if (normalized.status !== ACCOUNT_LINK_STATUS_PENDING) return false;
+  const basis = normalized.createdAtMs || normalized.updatedAtMs || 0;
+  return basis > 0 && nowMs - basis > ACCOUNT_LINK_PENDING_TTL_MS;
+}
+
+async function expireAccountLinkIfNeeded({ db, link, nowMs = Date.now() }) {
+  if (!isPendingAccountLinkExpired(link, nowMs)) return normalizeAccountLinkRow(link);
+  const next = {
+    ...normalizeAccountLinkRow(link),
+    status: ACCOUNT_LINK_STATUS_EXPIRED,
+    updatedAtMs: nowMs,
+    unlinkedAtMs: nowMs
+  };
+  await saveAccountLinkRow({ db, link: next });
+  return next;
+}
+
 async function upsertAccountUserCapability({
   db,
   userId,
@@ -985,19 +1087,23 @@ function normalizeAccountLinkRow(row = {}) {
   return {
     id: String(row?.id || '').trim(),
     status: String(row?.status || '').trim().toLowerCase(),
-    requesterUserId: normalizeUserId(row?.requester_user_id),
-    requesterEmail: normalizeEmail(row?.requester_email),
-    targetUserId: normalizeUserId(row?.target_user_id),
-    targetEmail: normalizeEmail(row?.target_email),
-    requesterShareScopes: parseAccountLinkScopesJson(row?.requester_share_scopes_json),
-    targetShareScopes: parseAccountLinkScopesJson(row?.target_share_scopes_json),
-    requesterApprovedAtMs: toOptionalTimestamp(row?.requester_approved_at_ms),
-    targetApprovedAtMs: toOptionalTimestamp(row?.target_approved_at_ms),
-    createdAtMs: toOptionalTimestamp(row?.created_at_ms) || Date.now(),
-    updatedAtMs: toOptionalTimestamp(row?.updated_at_ms) || Date.now(),
-    activatedAtMs: toOptionalTimestamp(row?.activated_at_ms),
-    declinedAtMs: toOptionalTimestamp(row?.declined_at_ms),
-    unlinkedAtMs: toOptionalTimestamp(row?.unlinked_at_ms)
+    requesterUserId: normalizeUserId(row?.requester_user_id ?? row?.requesterUserId),
+    requesterEmail: normalizeEmail(row?.requester_email ?? row?.requesterEmail),
+    targetUserId: normalizeUserId(row?.target_user_id ?? row?.targetUserId),
+    targetEmail: normalizeEmail(row?.target_email ?? row?.targetEmail),
+    requesterShareScopes: row?.requesterShareScopes && typeof row.requesterShareScopes === 'object'
+      ? normalizeAccountLinkScopes(row.requesterShareScopes)
+      : parseAccountLinkScopesJson(row?.requester_share_scopes_json),
+    targetShareScopes: row?.targetShareScopes && typeof row.targetShareScopes === 'object'
+      ? normalizeAccountLinkScopes(row.targetShareScopes)
+      : parseAccountLinkScopesJson(row?.target_share_scopes_json),
+    requesterApprovedAtMs: toOptionalTimestamp(row?.requester_approved_at_ms ?? row?.requesterApprovedAtMs),
+    targetApprovedAtMs: toOptionalTimestamp(row?.target_approved_at_ms ?? row?.targetApprovedAtMs),
+    createdAtMs: toOptionalTimestamp(row?.created_at_ms ?? row?.createdAtMs) || Date.now(),
+    updatedAtMs: toOptionalTimestamp(row?.updated_at_ms ?? row?.updatedAtMs) || Date.now(),
+    activatedAtMs: toOptionalTimestamp(row?.activated_at_ms ?? row?.activatedAtMs),
+    declinedAtMs: toOptionalTimestamp(row?.declined_at_ms ?? row?.declinedAtMs),
+    unlinkedAtMs: toOptionalTimestamp(row?.unlinked_at_ms ?? row?.unlinkedAtMs)
   };
 }
 
@@ -1083,6 +1189,7 @@ async function findBlockingAccountLink({ db, userId, email, excludeLinkId = '' }
     String(excludeLinkId || '').trim()
   ).first();
   if (!row?.id) return null;
+  if (isPendingAccountLinkExpired(row)) return null;
   return {
     id: String(row.id || '').trim(),
     status: String(row.status || '').trim().toLowerCase()
@@ -2348,6 +2455,7 @@ async function handleListAccountLinks({ request, env, corsOrigin, verifyIdToken,
     userId,
     requestId
   });
+  enforceAccountLinkRateLimit({ env, authContext, corsOrigin, requestId, kind: 'read' });
   const db = getD1Database(env);
   await upsertAccountUserCapability({
     db,
@@ -2355,24 +2463,22 @@ async function handleListAccountLinks({ request, env, corsOrigin, verifyIdToken,
     email: authContext.email
   });
 
-  const links = await listAccountLinksForActor({
+  const linkRows = await listAccountLinksForActor({
     db,
     userId: authContext.userId,
     email: authContext.email
   });
+  const links = [];
+  for (const row of linkRows) {
+    links.push(await expireAccountLinkIfNeeded({ db, link: row }));
+  }
   const formatted = links.map((row) => formatAccountLinkForActor(row, authContext.userId, authContext.email));
   const activeLink = formatted.find((link) => link?.status === ACCOUNT_LINK_STATUS_ACTIVE) || null;
   const incomingRequests = formatted.filter((link) => link?.status === ACCOUNT_LINK_STATUS_PENDING && link.canApprove);
   const pendingRequests = formatted.filter((link) => link?.status === ACCOUNT_LINK_STATUS_PENDING);
 
-  const selfCapability = await readAccountUserCapabilityByEmail({
-    db,
-    email: authContext.email
-  });
-
   return jsonResponse(200, {
     ok: true,
-    chatReady: selfCapability?.chatReady === true,
     links: formatted,
     activeLink,
     incomingRequests,
@@ -2392,6 +2498,7 @@ async function handleGetAccountLinkTargetCapabilities({ request, env, corsOrigin
     userId,
     requestId
   });
+  enforceAccountLinkRateLimit({ env, authContext, corsOrigin, requestId, kind: 'read' });
   const db = getD1Database(env);
   await upsertAccountUserCapability({
     db,
@@ -2419,15 +2526,6 @@ async function handleGetAccountLinkTargetCapabilities({ request, env, corsOrigin
     }, corsOrigin);
   }
 
-  const targetCapability = await readAccountUserCapabilityByEmail({
-    db,
-    email: targetEmail
-  });
-  const targetBlocking = await findBlockingAccountLink({
-    db,
-    userId: targetCapability?.userId || '',
-    email: targetEmail
-  });
   const requesterBlocking = await findBlockingAccountLink({
     db,
     userId: authContext.userId,
@@ -2437,10 +2535,10 @@ async function handleGetAccountLinkTargetCapabilities({ request, env, corsOrigin
   return jsonResponse(200, {
     ok: true,
     targetEmail,
-    accountFound: Boolean(targetCapability?.userId),
-    chatEligible: targetCapability?.chatReady === true,
+    accountFound: false,
     requesterBlocked: Boolean(requesterBlocking),
-    targetBlocked: Boolean(targetBlocking)
+    targetBlocked: false,
+    canRequest: !requesterBlocking
   }, corsOrigin, { 'x-request-id': requestId });
 }
 
@@ -2456,6 +2554,7 @@ async function handleCreateAccountLinkRequest({ request, env, corsOrigin, verify
     userId,
     requestId
   });
+  enforceAccountLinkRateLimit({ env, authContext, corsOrigin, requestId, kind: 'mutation' });
   const targetEmail = normalizeEmail(body?.targetEmail);
   if (!isValidEmail(targetEmail)) {
     return errorResponse(400, {
@@ -2521,19 +2620,9 @@ async function handleCreateAccountLinkRequest({ request, env, corsOrigin, verify
   if (targetBlocking) {
     return errorResponse(409, {
       error: 'target_link_conflict',
-      message: 'That account already has a pending or active account link.',
+      message: 'That account cannot receive a new link request right now.',
       retryable: false,
       code: 'target_link_conflict',
-      requestId
-    }, corsOrigin);
-  }
-
-  if (requesterShareScopes.secretChat === true && targetCapability?.chatReady !== true) {
-    return errorResponse(400, {
-      error: 'secret_chat_unavailable',
-      message: 'Secret Chat can only be shared when the target account has chat history.',
-      retryable: false,
-      code: 'secret_chat_unavailable',
       requestId
     }, corsOrigin);
   }
@@ -2593,6 +2682,7 @@ async function handleRespondToAccountLinkRequest({ request, env, corsOrigin, ver
     userId,
     requestId
   });
+  enforceAccountLinkRateLimit({ env, authContext, corsOrigin, requestId, kind: 'mutation' });
   const linkId = String(body?.linkId || '').trim();
   const action = String(body?.action || '').trim().toLowerCase();
   if (!linkId) {
@@ -2621,7 +2711,7 @@ async function handleRespondToAccountLinkRequest({ request, env, corsOrigin, ver
     email: authContext.email
   });
 
-  const existing = await readAccountLinkById({ db, linkId });
+  let existing = await readAccountLinkById({ db, linkId });
   if (!existing) {
     return errorResponse(404, {
       error: 'link_not_found',
@@ -2646,6 +2736,7 @@ async function handleRespondToAccountLinkRequest({ request, env, corsOrigin, ver
       requestId
     }, corsOrigin);
   }
+  existing = await expireAccountLinkIfNeeded({ db, link: existing });
   if (existing.status !== ACCOUNT_LINK_STATUS_PENDING) {
     return errorResponse(409, {
       error: 'link_not_pending',
@@ -2700,22 +2791,9 @@ async function handleRespondToAccountLinkRequest({ request, env, corsOrigin, ver
     if (targetBlocking) {
       return errorResponse(409, {
         error: 'target_link_conflict',
-        message: 'Your account already has another pending or active link.',
+        message: 'This account cannot approve a new link right now.',
         retryable: false,
         code: 'target_link_conflict',
-        requestId
-      }, corsOrigin);
-    }
-    const requesterCapability = await readAccountUserCapabilityByEmail({
-      db,
-      email: next.requesterEmail
-    });
-    if (next.targetShareScopes.secretChat === true && requesterCapability?.chatReady !== true) {
-      return errorResponse(400, {
-        error: 'secret_chat_unavailable',
-        message: 'Secret Chat can only be shared when the partner account has chat history.',
-        retryable: false,
-        code: 'secret_chat_unavailable',
         requestId
       }, corsOrigin);
     }
@@ -2741,6 +2819,7 @@ async function handleUpdateAccountLinkScopes({ request, env, corsOrigin, verifyI
     userId,
     requestId
   });
+  enforceAccountLinkRateLimit({ env, authContext, corsOrigin, requestId, kind: 'mutation' });
   const linkId = String(body?.linkId || '').trim();
   if (!linkId) {
     return errorResponse(400, {
@@ -2794,32 +2873,8 @@ async function handleUpdateAccountLinkScopes({ request, env, corsOrigin, verifyI
   };
   const normalizedScopes = normalizeAccountLinkScopes(body?.shareScopes);
   if (role === 'requester') {
-    if (normalizedScopes.secretChat === true) {
-      const targetCapability = await readAccountUserCapabilityByEmail({ db, email: next.targetEmail });
-      if (targetCapability?.chatReady !== true) {
-        return errorResponse(400, {
-          error: 'secret_chat_unavailable',
-          message: 'Secret Chat can only be shared when the partner account has chat history.',
-          retryable: false,
-          code: 'secret_chat_unavailable',
-          requestId
-        }, corsOrigin);
-      }
-    }
     next.requesterShareScopes = normalizedScopes;
   } else {
-    if (normalizedScopes.secretChat === true) {
-      const requesterCapability = await readAccountUserCapabilityByEmail({ db, email: next.requesterEmail });
-      if (requesterCapability?.chatReady !== true) {
-        return errorResponse(400, {
-          error: 'secret_chat_unavailable',
-          message: 'Secret Chat can only be shared when the partner account has chat history.',
-          retryable: false,
-          code: 'secret_chat_unavailable',
-          requestId
-        }, corsOrigin);
-      }
-    }
     next.targetShareScopes = normalizedScopes;
   }
 
@@ -2843,6 +2898,7 @@ async function handleUnlinkAccountLink({ request, env, corsOrigin, verifyIdToken
     userId,
     requestId
   });
+  enforceAccountLinkRateLimit({ env, authContext, corsOrigin, requestId, kind: 'mutation' });
   const linkId = String(body?.linkId || '').trim();
   if (!linkId) {
     return errorResponse(400, {
@@ -2905,20 +2961,12 @@ async function handleMarkAccountChatReady({ request, env, corsOrigin, verifyIdTo
     userId,
     requestId
   });
-  const db = getD1Database(env);
-  const nowMs = Date.now();
-  await upsertAccountUserCapability({
-    db,
-    userId: authContext.userId,
-    email: authContext.email,
-    chatReady: true,
-    lastChatSeenAtMs: nowMs
-  });
+  enforceAccountLinkRateLimit({ env, authContext, corsOrigin, requestId, kind: 'mutation' });
   return jsonResponse(200, {
     ok: true,
+    deprecated: true,
     userId: authContext.userId,
-    chatReady: true,
-    lastChatSeenAtMs: nowMs
+    chatReady: false
   }, corsOrigin, { 'x-request-id': requestId });
 }
 
@@ -2934,6 +2982,7 @@ async function handlePullLinkedSharedFeed({ request, env, corsOrigin, verifyIdTo
     userId,
     requestId
   });
+  enforceAccountLinkRateLimit({ env, authContext, corsOrigin, requestId, kind: 'read' });
   const sinceMs = parseSinceMs(url.searchParams.get('since'));
   const limit = parsePullLimit(url.searchParams.get('limit'));
   const db = getD1Database(env);
@@ -2955,6 +3004,7 @@ async function handlePullLinkedSharedFeed({ request, env, corsOrigin, verifyIdTo
     .sort();
 
   const operations = [];
+  const linkSignatureParts = [];
 
   for (const link of activeLinks) {
     const role = getAccountLinkRole({
@@ -2968,6 +3018,12 @@ async function handlePullLinkedSharedFeed({ request, env, corsOrigin, verifyIdTo
     const sourceEmail = role === 'requester' ? link.targetEmail : link.requesterEmail;
     const sourceScopes = role === 'requester' ? link.targetShareScopes : link.requesterShareScopes;
     const sectors = getEnabledSharedSectorsFromScopes(sourceScopes);
+    linkSignatureParts.push([
+      String(link.id || '').trim(),
+      String(link.updatedAtMs || 0),
+      String(sourceUserId || '').trim(),
+      sectors.slice().sort().join(',')
+    ].join(':'));
     if (!sourceUserId || !sectors.length) continue;
 
     const statement = buildSharedSyncItemsStatement({
@@ -3030,6 +3086,7 @@ async function handlePullLinkedSharedFeed({ request, env, corsOrigin, verifyIdTo
     cursorMs: limitedCursorMs,
     hasMore,
     activeLinkIds,
+    linkSignature: linkSignatureParts.sort().join('|'),
     operations: limited
   }, corsOrigin, { 'x-request-id': requestId });
 }
