@@ -427,6 +427,15 @@ const DEFAULT_ACCOUNT_LINK_RATE_LIMITS = Object.freeze({
   read: Object.freeze({ limit: 120, windowMs: 60_000 }),
   mutation: Object.freeze({ limit: 30, windowMs: 60_000 })
 });
+const PRIVATE_ENDPOINT_RATE_LIMIT_STORE = new Map();
+let nextPrivateEndpointRateLimitSweepAtMs = 0;
+const PRIVATE_ENDPOINT_RATE_LIMIT_STORE_SOFT_CAP = 8000;
+const DEFAULT_PRIVATE_ENDPOINT_RATE_LIMITS = Object.freeze({
+  snapshotRead: Object.freeze({ limit: 180, windowMs: 60_000 }),
+  snapshotWrite: Object.freeze({ limit: 60, windowMs: 60_000 }),
+  syncRead: Object.freeze({ limit: 240, windowMs: 60_000 }),
+  syncWrite: Object.freeze({ limit: 90, windowMs: 60_000 })
+});
 const DISALLOWED_CREDENTIAL_KEYS = new Set([
   'password',
   'passwordhash',
@@ -769,7 +778,7 @@ function isSnapshotLikePayload(value) {
 }
 
 function extractSnapshotFromSaveBody(body = {}) {
-  const queue = [body?.data, body?.snapshot, body?.export, body?.backup, body?.value];
+  const queue = [body, body?.data, body?.snapshot, body?.export, body?.backup, body?.value];
   const seen = new Set();
   let inspected = 0;
 
@@ -1009,6 +1018,72 @@ function consumeAccountLinkRateLimit({ key, policy }) {
     allowed: true,
     retryAfterSeconds: 0
   };
+}
+
+function getPrivateEndpointRateLimitPolicy(env, kind = 'snapshotRead') {
+  const normalizedKind = Object.prototype.hasOwnProperty.call(DEFAULT_PRIVATE_ENDPOINT_RATE_LIMITS, kind)
+    ? kind
+    : 'snapshotRead';
+  const defaults = DEFAULT_PRIVATE_ENDPOINT_RATE_LIMITS[normalizedKind];
+  const envPrefix = `BILM_RATE_LIMIT_${normalizedKind.replace(/[A-Z]/g, (letter) => `_${letter}`).toUpperCase()}`;
+  return {
+    limit: parseEnvInt(env, envPrefix, defaults.limit, { min: 1, max: 2000 }),
+    windowMs: parseEnvInt(env, `${envPrefix}_WINDOW_MS`, defaults.windowMs, { min: 1000, max: 60 * 60 * 1000 })
+  };
+}
+
+function sweepPrivateEndpointRateLimitStore(nowMs) {
+  if (nowMs < nextPrivateEndpointRateLimitSweepAtMs && PRIVATE_ENDPOINT_RATE_LIMIT_STORE.size < PRIVATE_ENDPOINT_RATE_LIMIT_STORE_SOFT_CAP) return;
+  for (const [key, entry] of PRIVATE_ENDPOINT_RATE_LIMIT_STORE.entries()) {
+    if (!entry || Number(entry.resetAtMs || 0) <= nowMs) {
+      PRIVATE_ENDPOINT_RATE_LIMIT_STORE.delete(key);
+    }
+  }
+  nextPrivateEndpointRateLimitSweepAtMs = nowMs + 60_000;
+}
+
+function consumePrivateEndpointRateLimit({ key, policy }) {
+  const nowMs = Date.now();
+  sweepPrivateEndpointRateLimitStore(nowMs);
+  const normalizedLimit = Math.max(1, Number(policy?.limit || 1));
+  const windowMs = Math.max(1000, Number(policy?.windowMs || 60_000));
+  const storeKey = String(key || 'unknown').slice(0, 180);
+  let entry = PRIVATE_ENDPOINT_RATE_LIMIT_STORE.get(storeKey);
+  if (!entry || Number(entry.resetAtMs || 0) <= nowMs) {
+    entry = { count: 0, resetAtMs: nowMs + windowMs };
+  }
+  if (entry.count >= normalizedLimit) {
+    PRIVATE_ENDPOINT_RATE_LIMIT_STORE.set(storeKey, entry);
+    return {
+      allowed: false,
+      retryAfterSeconds: Math.max(1, Math.ceil((entry.resetAtMs - nowMs) / 1000))
+    };
+  }
+  entry.count += 1;
+  PRIVATE_ENDPOINT_RATE_LIMIT_STORE.set(storeKey, entry);
+  return {
+    allowed: true,
+    retryAfterSeconds: 0
+  };
+}
+
+function enforcePrivateEndpointRateLimit({ env, userId, corsOrigin, requestId, kind = 'snapshotRead' }) {
+  const policy = getPrivateEndpointRateLimitPolicy(env, kind);
+  const normalizedUserId = normalizeUserId(userId) || 'anonymous';
+  const state = consumePrivateEndpointRateLimit({
+    key: `private:${kind}:${normalizedUserId}`,
+    policy
+  });
+  if (state.allowed) return;
+  throw errorResponse(429, {
+    error: 'rate_limited',
+    message: 'Too many private data requests. Please wait and try again.',
+    retryable: true,
+    code: 'private_data_rate_limited',
+    requestId
+  }, corsOrigin, {
+    'retry-after': String(state.retryAfterSeconds)
+  });
 }
 
 function enforceAccountLinkRateLimit({ env, authContext, corsOrigin, requestId, kind = 'read' }) {
@@ -3091,22 +3166,35 @@ async function handlePullLinkedSharedFeed({ request, env, corsOrigin, verifyIdTo
   }, corsOrigin, { 'x-request-id': requestId });
 }
 
-async function handleListSyncPush({ request, env, corsOrigin, verifyIdToken }) {
+async function handleListSyncPush({ request, env, corsOrigin, verifyIdToken, requestId }) {
   assertD1Configured(env, corsOrigin);
-  const body = await parseJsonBody(request, corsOrigin);
+  const body = await parseJsonBody(request, corsOrigin, requestId);
   const userId = normalizeUserId(body?.userId);
   if (!isValidUserId(userId)) {
-    return jsonResponse(400, { error: 'invalid_user_id', message: 'Invalid or missing userId.' }, corsOrigin);
+    return errorResponse(400, {
+      error: 'invalid_user_id',
+      message: 'Invalid or missing userId.',
+      retryable: false,
+      code: 'invalid_user_id',
+      requestId
+    }, corsOrigin);
   }
 
-  await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId });
+  await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId, requestId });
+  enforcePrivateEndpointRateLimit({ env, userId, corsOrigin, requestId, kind: 'syncWrite' });
 
   const operations = Array.isArray(body?.operations) ? body.operations : [];
   if (!operations.length) {
-    return jsonResponse(200, { ok: true, processed: 0, cursorMs: parseSinceMs(body?.cursorMs) }, corsOrigin);
+    return jsonResponse(200, { ok: true, processed: 0, cursorMs: parseSinceMs(body?.cursorMs) }, corsOrigin, { 'x-request-id': requestId });
   }
   if (operations.length > 1000) {
-    return jsonResponse(400, { error: 'too_many_operations', message: 'Maximum 1000 operations per request.' }, corsOrigin);
+    return errorResponse(400, {
+      error: 'too_many_operations',
+      message: 'Maximum 1000 operations per request.',
+      retryable: false,
+      code: 'too_many_operations',
+      requestId
+    }, corsOrigin);
   }
 
   const db = getD1Database(env);
@@ -3138,18 +3226,25 @@ async function handleListSyncPush({ request, env, corsOrigin, verifyIdToken }) {
     }
   }
 
-  return jsonResponse(200, { ok: true, processed, cursorMs }, corsOrigin);
+  return jsonResponse(200, { ok: true, processed, cursorMs }, corsOrigin, { 'x-request-id': requestId });
 }
 
-async function handleListSyncPull({ request, env, corsOrigin, verifyIdToken }) {
+async function handleListSyncPull({ request, env, corsOrigin, verifyIdToken, requestId }) {
   assertD1Configured(env, corsOrigin);
   const url = new URL(request.url);
   const userId = normalizeUserId(url.searchParams.get('userId'));
   if (!isValidUserId(userId)) {
-    return jsonResponse(400, { error: 'invalid_user_id', message: 'Invalid or missing userId.' }, corsOrigin);
+    return errorResponse(400, {
+      error: 'invalid_user_id',
+      message: 'Invalid or missing userId.',
+      retryable: false,
+      code: 'invalid_user_id',
+      requestId
+    }, corsOrigin);
   }
 
-  await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId });
+  await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId, requestId });
+  enforcePrivateEndpointRateLimit({ env, userId, corsOrigin, requestId, kind: 'syncRead' });
 
   const sinceMs = parseSinceMs(url.searchParams.get('since'));
   const limit = parsePullLimit(url.searchParams.get('limit'));
@@ -3202,7 +3297,7 @@ async function handleListSyncPull({ request, env, corsOrigin, verifyIdToken }) {
     sinceMs,
     cursorMs,
     operations
-  }, corsOrigin);
+  }, corsOrigin, { 'x-request-id': requestId });
 }
 
 async function handleSectorSyncPush({ request, env, corsOrigin, verifyIdToken, requestId }) {
@@ -3220,6 +3315,7 @@ async function handleSectorSyncPush({ request, env, corsOrigin, verifyIdToken, r
   }
 
   await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId, requestId });
+  enforcePrivateEndpointRateLimit({ env, userId, corsOrigin, requestId, kind: 'syncWrite' });
 
   const operations = Array.isArray(body?.operations) ? body.operations : [];
   if (!operations.length) {
@@ -3311,6 +3407,7 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
   }
 
   await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId, requestId });
+  enforcePrivateEndpointRateLimit({ env, userId, corsOrigin, requestId, kind: 'syncRead' });
 
   const sinceMs = parseSinceMs(url.searchParams.get('since'));
   const limit = parsePullLimit(url.searchParams.get('limit'));
@@ -3400,6 +3497,7 @@ async function handleSectorSyncBootstrap({ request, env, corsOrigin, verifyIdTok
   }
 
   await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId, requestId });
+  enforcePrivateEndpointRateLimit({ env, userId, corsOrigin, requestId, kind: 'syncWrite' });
 
   const db = getD1Database(env);
   const currentState = await readUserSyncState({ db, userId });
@@ -3554,45 +3652,68 @@ async function handleBulkImportRequest({ request, env, corsOrigin }) {
   return jsonResponse(200, { ok: true, imported: count }, corsOrigin);
 }
 
-async function handleGetSnapshot({ request, env, corsOrigin, verifyIdToken }) {
+async function handleGetSnapshot({ request, env, corsOrigin, verifyIdToken, requestId }) {
   assertStorageConfigured(env, corsOrigin);
   const url = new URL(request.url);
   const userId = normalizeUserId(url.searchParams.get('userId'));
   if (!isValidUserId(userId)) {
-    return jsonResponse(400, { error: 'invalid_user_id', message: 'Invalid or missing userId.' }, corsOrigin);
+    return errorResponse(400, {
+      error: 'invalid_user_id',
+      message: 'Invalid or missing userId.',
+      retryable: false,
+      code: 'invalid_user_id',
+      requestId
+    }, corsOrigin);
   }
 
-  await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId });
+  await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId, requestId });
+  enforcePrivateEndpointRateLimit({ env, userId, corsOrigin, requestId, kind: 'snapshotRead' });
 
   const wantsMeta = url.searchParams.get('meta') === 'true';
 
   if (wantsMeta) {
-    return jsonResponse(200, await readSnapshotMeta({ env, userId }), corsOrigin);
+    return jsonResponse(200, await readSnapshotMeta({ env, userId }), corsOrigin, { 'x-request-id': requestId });
   }
 
   const value = await readSnapshotValue({ env, userId });
   if (value === null) {
-    return jsonResponse(404, { error: 'not_found', message: 'No snapshot found for this user.' }, corsOrigin);
+    return errorResponse(404, {
+      error: 'not_found',
+      message: 'No cloud backup found for this account yet. Open Bilm Settings > Account > Data Transfer and use Cloud Export first.',
+      retryable: false,
+      code: 'snapshot_not_found',
+      requestId
+    }, corsOrigin);
   }
 
-  return textResponse(200, value, corsOrigin);
+  return textResponse(200, value, corsOrigin, { 'x-request-id': requestId });
 }
 
-async function handleSaveSnapshot({ request, env, corsOrigin, verifyIdToken }) {
+async function handleSaveSnapshot({ request, env, corsOrigin, verifyIdToken, requestId }) {
   assertStorageConfigured(env, corsOrigin);
-  const body = await parseJsonBody(request, corsOrigin);
+  const body = await parseJsonBody(request, corsOrigin, requestId);
   const userId = normalizeUserId(body?.userId);
   if (!isValidUserId(userId)) {
-    return jsonResponse(400, { error: 'invalid_user_id', message: 'Invalid or missing userId.' }, corsOrigin);
+    return errorResponse(400, {
+      error: 'invalid_user_id',
+      message: 'Invalid or missing userId.',
+      retryable: false,
+      code: 'invalid_user_id',
+      requestId
+    }, corsOrigin);
   }
 
-  await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId });
+  await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId, requestId });
+  enforcePrivateEndpointRateLimit({ env, userId, corsOrigin, requestId, kind: 'snapshotWrite' });
 
   const payload = extractSnapshotFromSaveBody(body);
   if (!payload) {
-    return jsonResponse(400, {
+    return errorResponse(400, {
       error: 'missing_data',
-      message: 'Snapshot data is required. Provide a bilm-backup snapshot in data/snapshot/value.'
+      message: 'Backup data is missing. Use Cloud Export in Bilm Settings, or send a bilm-backup-v1 JSON object as data, snapshot, value, backup, export, or the request body.',
+      retryable: false,
+      code: 'missing_snapshot_data',
+      requestId
     }, corsOrigin);
   }
 
@@ -3602,7 +3723,7 @@ async function handleSaveSnapshot({ request, env, corsOrigin, verifyIdToken }) {
     ok: true,
     saved: true,
     bytes: result?.bytes || 0
-  }, corsOrigin);
+  }, corsOrigin, { 'x-request-id': requestId });
 }
 
 function buildHealthPayload(env) {
@@ -3720,11 +3841,11 @@ export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOri
         }
 
         if (request.method === 'POST' && url.pathname === '/sync/lists/push') {
-          return await handleListSyncPush({ request, env, corsOrigin, verifyIdToken });
+          return await handleListSyncPush({ request, env, corsOrigin, verifyIdToken, requestId });
         }
 
         if (request.method === 'GET' && url.pathname === '/sync/lists/pull') {
-          return await handleListSyncPull({ request, env, corsOrigin, verifyIdToken });
+          return await handleListSyncPull({ request, env, corsOrigin, verifyIdToken, requestId });
         }
 
         if (request.method === 'POST' && url.searchParams.get('import') === 'true') {
@@ -3745,11 +3866,11 @@ export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOri
         }
 
         if (request.method === 'GET') {
-          return await handleGetSnapshot({ request, env, corsOrigin, verifyIdToken });
+          return await handleGetSnapshot({ request, env, corsOrigin, verifyIdToken, requestId });
         }
 
         if (request.method === 'POST') {
-          return await handleSaveSnapshot({ request, env, corsOrigin, verifyIdToken });
+          return await handleSaveSnapshot({ request, env, corsOrigin, verifyIdToken, requestId });
         }
 
         return errorResponse(405, {

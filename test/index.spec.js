@@ -698,6 +698,83 @@ describe('data api', () => {
     expect(loaded.meta.deviceId).toBe('device-legacy');
   });
 
+  it('accepts raw backup JSON as the snapshot save body', async () => {
+    const payload = {
+      userId: OTHER_USER_ID,
+      schema: 'bilm-backup-v1',
+      meta: {
+        updatedAtMs: 1712222222222,
+        deviceId: 'device-raw'
+      },
+      localStorage: {
+        'bilm-favorites': '[]'
+      },
+      sessionStorage: {}
+    };
+
+    const saveResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/?userId=${OTHER_USER_ID}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer other-token',
+        origin: ALLOWED_ORIGIN
+      },
+      body: JSON.stringify(payload)
+    }), env);
+
+    expect(saveResponse.status).toBe(200);
+    const loaded = JSON.parse(d1.rows.get(OTHER_USER_ID).snapshot_json);
+    expect(loaded.schema).toBe('bilm-backup-v1');
+    expect(loaded.meta.deviceId).toBe('device-raw');
+  });
+
+  it('returns a user-friendly missing snapshot error', async () => {
+    const response = await worker.fetch(new Request(`https://data-api.watchbilm.org/?userId=${USER_ID}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token',
+        origin: ALLOWED_ORIGIN
+      },
+      body: JSON.stringify({ userId: USER_ID })
+    }), env);
+
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.code).toBe('missing_snapshot_data');
+    expect(body.message).toContain('Cloud Export');
+  });
+
+  it('rate limits private snapshot writes per user', async () => {
+    env.BILM_RATE_LIMIT_SNAPSHOT_WRITE = '1';
+    env.BILM_RATE_LIMIT_SNAPSHOT_WRITE_WINDOW_MS = '60000';
+    const payload = {
+      schema: 'bilm-backup-v1',
+      meta: {
+        updatedAtMs: 1713333333333,
+        deviceId: 'device-rate'
+      },
+      localStorage: {}
+    };
+    const requestInit = {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer third-token',
+        origin: ALLOWED_ORIGIN
+      },
+      body: JSON.stringify({ userId: THIRD_USER_ID, data: payload })
+    };
+
+    const first = await worker.fetch(new Request(`https://data-api.watchbilm.org/?userId=${THIRD_USER_ID}`, requestInit), env);
+    expect(first.status).toBe(200);
+
+    const second = await worker.fetch(new Request(`https://data-api.watchbilm.org/?userId=${THIRD_USER_ID}`, requestInit), env);
+    expect(second.status).toBe(429);
+    expect(second.headers.get('retry-after')).toBeTruthy();
+    expect((await second.json()).code).toBe('private_data_rate_limited');
+  });
+
   it('returns service health metadata', async () => {
     const response = await worker.fetch(new Request('https://data-api.watchbilm.org/health', {
       method: 'GET',
