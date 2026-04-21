@@ -540,6 +540,40 @@ function normalizeEmail(value) {
   return String(value || '').trim().toLowerCase();
 }
 
+function canonicalizeEmailForMatching(value) {
+  const normalized = normalizeEmail(value);
+  if (!normalized || !normalized.includes('@')) return normalized;
+  const [localPartRaw, domainRaw] = normalized.split('@');
+  const localPart = String(localPartRaw || '').trim();
+  const domain = String(domainRaw || '').trim();
+  if (!localPart || !domain) return normalized;
+
+  if (domain === 'gmail.com' || domain === 'googlemail.com') {
+    const plusIndex = localPart.indexOf('+');
+    const baseLocal = (plusIndex >= 0 ? localPart.slice(0, plusIndex) : localPart).replace(/\./g, '');
+    if (!baseLocal) return normalized;
+    return `${baseLocal}@gmail.com`;
+  }
+
+  return normalized;
+}
+
+function getEmailMatchVariants(value) {
+  const normalized = normalizeEmail(value);
+  if (!normalized) return [];
+  const variants = new Set([normalized]);
+  const canonical = canonicalizeEmailForMatching(normalized);
+  if (canonical) variants.add(canonical);
+  return [...variants];
+}
+
+function emailsLikelySameAccount(left, right) {
+  const leftVariants = new Set(getEmailMatchVariants(left));
+  const rightVariants = getEmailMatchVariants(right);
+  if (!leftVariants.size || !rightVariants.length) return false;
+  return rightVariants.some((candidate) => leftVariants.has(candidate));
+}
+
 function isValidEmail(value) {
   const normalized = normalizeEmail(value);
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized);
@@ -576,12 +610,25 @@ function createAccountLinkId() {
 }
 
 function getAccountLinkRole(row, actorUserId = '', actorEmail = '') {
-  const requesterUserId = normalizeUserId(row?.requester_user_id);
-  const targetUserId = normalizeUserId(row?.target_user_id);
-  const requesterEmail = normalizeEmail(row?.requester_email);
-  const targetEmail = normalizeEmail(row?.target_email);
-  if ((actorUserId && requesterUserId === actorUserId) || (actorEmail && requesterEmail === actorEmail)) return 'requester';
-  if ((actorUserId && targetUserId === actorUserId) || (actorEmail && targetEmail === actorEmail)) return 'target';
+  const normalizedActorUserId = normalizeUserId(actorUserId);
+  const normalizedActorEmail = normalizeEmail(actorEmail);
+  const requesterUserId = normalizeUserId(row?.requester_user_id ?? row?.requesterUserId);
+  const targetUserId = normalizeUserId(row?.target_user_id ?? row?.targetUserId);
+  const requesterEmail = normalizeEmail(row?.requester_email ?? row?.requesterEmail);
+  const targetEmail = normalizeEmail(row?.target_email ?? row?.targetEmail);
+
+  const isRequester = (
+    (normalizedActorUserId && requesterUserId === normalizedActorUserId)
+    || (normalizedActorEmail && emailsLikelySameAccount(requesterEmail, normalizedActorEmail))
+  );
+  if (isRequester) return 'requester';
+
+  const isTarget = (
+    (normalizedActorUserId && targetUserId === normalizedActorUserId)
+    || (normalizedActorEmail && emailsLikelySameAccount(targetEmail, normalizedActorEmail))
+  );
+  if (isTarget) return 'target';
+
   return '';
 }
 
@@ -915,7 +962,7 @@ async function requireAccountLinkAuthContext({
     userId: normalizedUserId,
     requestId
   });
-  const email = normalizeEmail(payload?.email || request?.headers?.get?.('x-bilm-auth-email'));
+  const email = canonicalizeEmailForMatching(payload?.email || request?.headers?.get?.('x-bilm-auth-email'));
   if (!isValidEmail(email)) {
     throw errorResponse(403, {
       error: 'email_required',
@@ -1132,7 +1179,7 @@ async function upsertAccountUserCapability({
   lastChatSeenAtMs = null
 }) {
   const normalizedUserId = normalizeUserId(userId);
-  const normalizedEmail = normalizeEmail(email);
+  const normalizedEmail = canonicalizeEmailForMatching(email);
   if (!normalizedUserId || !isValidEmail(normalizedEmail)) return;
   const nowMs = Date.now();
   await db.prepare(UPSERT_ACCOUNT_USER_CAPABILITY_SQL).bind(
@@ -1145,9 +1192,19 @@ async function upsertAccountUserCapability({
 }
 
 async function readAccountUserCapabilityByEmail({ db, email }) {
-  const normalizedEmail = normalizeEmail(email);
+  const normalizedEmail = canonicalizeEmailForMatching(email);
   if (!normalizedEmail || !isValidEmail(normalizedEmail)) return null;
-  const row = await db.prepare(SELECT_ACCOUNT_USER_CAPABILITY_BY_EMAIL_SQL).bind(normalizedEmail).first();
+  const emailVariants = getEmailMatchVariants(normalizedEmail);
+  if (!emailVariants.length) return null;
+  const placeholders = emailVariants.map((_, index) => `?${index + 1}`).join(', ');
+  const statement = db.prepare(`
+    SELECT user_id, email, chat_ready, last_chat_seen_at_ms, updated_at_ms
+    FROM account_user_capabilities
+    WHERE email IN (${placeholders})
+    ORDER BY updated_at_ms DESC
+    LIMIT 1
+  `).bind(...emailVariants);
+  const row = await statement.first();
   if (!row) return null;
   return {
     userId: normalizeUserId(row?.user_id),
@@ -1163,9 +1220,9 @@ function normalizeAccountLinkRow(row = {}) {
     id: String(row?.id || '').trim(),
     status: String(row?.status || '').trim().toLowerCase(),
     requesterUserId: normalizeUserId(row?.requester_user_id ?? row?.requesterUserId),
-    requesterEmail: normalizeEmail(row?.requester_email ?? row?.requesterEmail),
+    requesterEmail: canonicalizeEmailForMatching(row?.requester_email ?? row?.requesterEmail),
     targetUserId: normalizeUserId(row?.target_user_id ?? row?.targetUserId),
-    targetEmail: normalizeEmail(row?.target_email ?? row?.targetEmail),
+    targetEmail: canonicalizeEmailForMatching(row?.target_email ?? row?.targetEmail),
     requesterShareScopes: row?.requesterShareScopes && typeof row.requesterShareScopes === 'object'
       ? normalizeAccountLinkScopes(row.requesterShareScopes)
       : parseAccountLinkScopesJson(row?.requester_share_scopes_json),
@@ -1184,17 +1241,7 @@ function normalizeAccountLinkRow(row = {}) {
 
 function formatAccountLinkForActor(linkRow, actorUserId = '', actorEmail = '') {
   const normalized = normalizeAccountLinkRow(linkRow);
-  const role = (
-    (actorUserId && normalized.requesterUserId === actorUserId)
-      || (actorEmail && normalized.requesterEmail === actorEmail)
-  )
-    ? 'requester'
-    : (
-      ((actorUserId && normalized.targetUserId === actorUserId)
-        || (actorEmail && normalized.targetEmail === actorEmail))
-        ? 'target'
-        : ''
-    );
+  const role = getAccountLinkRole(normalized, actorUserId, actorEmail);
 
   const requesterPayload = {
     userId: normalized.requesterUserId || null,
@@ -1246,10 +1293,55 @@ async function listAccountLinksForActor({ db, userId, email }) {
   const normalizedUserId = normalizeUserId(userId);
   const normalizedEmail = normalizeEmail(email);
   if (!normalizedUserId && !normalizedEmail) return [];
-  const query = await db.prepare(LIST_ACCOUNT_LINKS_FOR_USER_SQL).bind(
-    normalizedUserId || '',
-    normalizedEmail || ''
-  ).all();
+  const emailVariants = getEmailMatchVariants(normalizedEmail);
+  const bindings = [];
+  const matchClauses = [];
+
+  if (normalizedUserId) {
+    bindings.push(normalizedUserId);
+    const userIndex = bindings.length;
+    matchClauses.push(`requester_user_id = ?${userIndex}`);
+    matchClauses.push(`target_user_id = ?${userIndex}`);
+  }
+
+  if (emailVariants.length) {
+    const requesterStart = bindings.length + 1;
+    const requesterPlaceholders = emailVariants.map((_, index) => `?${requesterStart + index}`).join(', ');
+    bindings.push(...emailVariants);
+
+    const targetStart = bindings.length + 1;
+    const targetPlaceholders = emailVariants.map((_, index) => `?${targetStart + index}`).join(', ');
+    bindings.push(...emailVariants);
+
+    matchClauses.push(`requester_email IN (${requesterPlaceholders})`);
+    matchClauses.push(`target_email IN (${targetPlaceholders})`);
+  }
+
+  if (!matchClauses.length) return [];
+
+  const sql = `
+    SELECT
+      id,
+      status,
+      requester_user_id,
+      requester_email,
+      target_user_id,
+      target_email,
+      requester_share_scopes_json,
+      target_share_scopes_json,
+      requester_approved_at_ms,
+      target_approved_at_ms,
+      created_at_ms,
+      updated_at_ms,
+      activated_at_ms,
+      declined_at_ms,
+      unlinked_at_ms
+    FROM account_links
+    WHERE ${matchClauses.join(' OR ')}
+    ORDER BY updated_at_ms DESC
+    LIMIT 50
+  `;
+  const query = await db.prepare(sql).bind(...bindings).all();
   const rows = Array.isArray(query?.results) ? query.results : [];
   return rows.map((row) => normalizeAccountLinkRow(row));
 }
@@ -1258,11 +1350,44 @@ async function findBlockingAccountLink({ db, userId, email, excludeLinkId = '' }
   const normalizedUserId = normalizeUserId(userId);
   const normalizedEmail = normalizeEmail(email);
   if (!normalizedUserId && !normalizedEmail) return null;
-  const row = await db.prepare(SELECT_BLOCKING_ACCOUNT_LINK_SQL).bind(
-    normalizedUserId || '',
-    normalizedEmail || '',
-    String(excludeLinkId || '').trim()
-  ).first();
+  const emailVariants = getEmailMatchVariants(normalizedEmail);
+  const bindings = [];
+  const matchClauses = [];
+
+  if (normalizedUserId) {
+    bindings.push(normalizedUserId);
+    const userIndex = bindings.length;
+    matchClauses.push(`requester_user_id = ?${userIndex}`);
+    matchClauses.push(`target_user_id = ?${userIndex}`);
+  }
+
+  if (emailVariants.length) {
+    const requesterStart = bindings.length + 1;
+    const requesterPlaceholders = emailVariants.map((_, index) => `?${requesterStart + index}`).join(', ');
+    bindings.push(...emailVariants);
+
+    const targetStart = bindings.length + 1;
+    const targetPlaceholders = emailVariants.map((_, index) => `?${targetStart + index}`).join(', ');
+    bindings.push(...emailVariants);
+
+    matchClauses.push(`requester_email IN (${requesterPlaceholders})`);
+    matchClauses.push(`target_email IN (${targetPlaceholders})`);
+  }
+
+  if (!matchClauses.length) return null;
+
+  bindings.push(String(excludeLinkId || '').trim());
+  const excludeIndex = bindings.length;
+
+  const sql = `
+    SELECT id, status, created_at_ms, updated_at_ms
+    FROM account_links
+    WHERE status IN ('pending', 'active')
+      AND id != ?${excludeIndex}
+      AND (${matchClauses.join(' OR ')})
+    LIMIT 1
+  `;
+  const row = await db.prepare(sql).bind(...bindings).first();
   if (!row?.id) return null;
   if (isPendingAccountLinkExpired(row)) return null;
   return {
@@ -2581,7 +2706,7 @@ async function handleGetAccountLinkTargetCapabilities({ request, env, corsOrigin
     email: authContext.email
   });
 
-  const targetEmail = normalizeEmail(url.searchParams.get('email'));
+  const targetEmail = canonicalizeEmailForMatching(url.searchParams.get('email'));
   if (!isValidEmail(targetEmail)) {
     return errorResponse(400, {
       error: 'invalid_target_email',
@@ -2591,7 +2716,7 @@ async function handleGetAccountLinkTargetCapabilities({ request, env, corsOrigin
       requestId
     }, corsOrigin);
   }
-  if (targetEmail === authContext.email) {
+  if (emailsLikelySameAccount(targetEmail, authContext.email)) {
     return errorResponse(400, {
       error: 'self_link_forbidden',
       message: 'You cannot link your account to itself.',
@@ -2630,7 +2755,7 @@ async function handleCreateAccountLinkRequest({ request, env, corsOrigin, verify
     requestId
   });
   enforceAccountLinkRateLimit({ env, authContext, corsOrigin, requestId, kind: 'mutation' });
-  const targetEmail = normalizeEmail(body?.targetEmail);
+  const targetEmail = canonicalizeEmailForMatching(body?.targetEmail);
   if (!isValidEmail(targetEmail)) {
     return errorResponse(400, {
       error: 'invalid_target_email',
@@ -2640,7 +2765,7 @@ async function handleCreateAccountLinkRequest({ request, env, corsOrigin, verify
       requestId
     }, corsOrigin);
   }
-  if (targetEmail === authContext.email) {
+  if (emailsLikelySameAccount(targetEmail, authContext.email)) {
     return errorResponse(400, {
       error: 'self_link_forbidden',
       message: 'You cannot link your account to itself.',

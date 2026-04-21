@@ -4,6 +4,7 @@ import { createWorker } from '../src/index.js';
 const USER_ID = '12345678901234567890123456';
 const OTHER_USER_ID = 'abcdefghijklmnopqrstuvwxyz12';
 const THIRD_USER_ID = '33333333333333333333333333';
+const GMAIL_USER_ID = '44444444444444444444444444';
 const ALLOWED_ORIGIN = 'https://watchbilm.org';
 const ALLOWED_FLY_ORIGIN = 'https://bilm.fly.dev';
 const DISALLOWED_ORIGIN = 'https://evil.example';
@@ -407,9 +408,11 @@ class MemoryD1Statement {
   async first() {
     const key = String(this.params[0] || '');
     if (this.sql.includes('from account_user_capabilities')) {
-      const email = String(this.params[0] || '').toLowerCase();
+      const emails = this.params
+        .map((value) => String(value || '').toLowerCase())
+        .filter((value) => value.includes('@'));
       const rows = [...this.db.accountCapabilityRows.values()]
-        .filter((row) => row.email === email)
+        .filter((row) => emails.includes(String(row.email || '').toLowerCase()))
         .sort((a, b) => Number(b.updated_at_ms || 0) - Number(a.updated_at_ms || 0));
       return rows[0] ? { ...rows[0] } : null;
     }
@@ -420,17 +423,26 @@ class MemoryD1Statement {
     }
 
     if (this.sql.includes('from account_links') && this.sql.includes("status in ('pending', 'active')")) {
-      const [userId, email, excludeLinkId] = this.params;
-      const normalizedUserId = String(userId || '');
-      const normalizedEmail = String(email || '').toLowerCase();
-      const excluded = String(excludeLinkId || '');
+      const excluded = String(this.params[this.params.length - 1] || '');
+      const actorUserIds = this.params
+        .slice(0, -1)
+        .map((value) => String(value || '').trim())
+        .filter((value) => value && !value.includes('@'));
+      const actorEmails = this.params
+        .slice(0, -1)
+        .map((value) => String(value || '').toLowerCase().trim())
+        .filter((value) => value.includes('@'));
       const row = [...this.db.accountLinkRows.values()].find((entry) => {
         if (String(entry.id || '') === excluded) return false;
         if (!['pending', 'active'].includes(String(entry.status || ''))) return false;
-        return entry.requester_user_id === normalizedUserId
-          || entry.target_user_id === normalizedUserId
-          || entry.requester_email === normalizedEmail
-          || entry.target_email === normalizedEmail;
+        const requesterUserId = String(entry.requester_user_id || '');
+        const targetUserId = String(entry.target_user_id || '');
+        const requesterEmail = String(entry.requester_email || '').toLowerCase();
+        const targetEmail = String(entry.target_email || '').toLowerCase();
+        return actorUserIds.includes(requesterUserId)
+          || actorUserIds.includes(targetUserId)
+          || actorEmails.includes(requesterEmail)
+          || actorEmails.includes(targetEmail);
       });
       return row ? { ...row } : null;
     }
@@ -489,14 +501,17 @@ class MemoryD1Statement {
 
   async all() {
     if (this.sql.includes('from account_links')) {
-      const [userId, email] = this.params;
-      const normalizedUserId = String(userId || '');
-      const normalizedEmail = String(email || '').toLowerCase();
+      const userIds = this.params
+        .map((value) => String(value || '').trim())
+        .filter((value) => value && !value.includes('@'));
+      const emails = this.params
+        .map((value) => String(value || '').toLowerCase().trim())
+        .filter((value) => value.includes('@'));
       const results = [...this.db.accountLinkRows.values()]
-        .filter((row) => row.requester_user_id === normalizedUserId
-          || row.target_user_id === normalizedUserId
-          || row.requester_email === normalizedEmail
-          || row.target_email === normalizedEmail)
+        .filter((row) => userIds.includes(String(row.requester_user_id || ''))
+          || userIds.includes(String(row.target_user_id || ''))
+          || emails.includes(String(row.requester_email || '').toLowerCase())
+          || emails.includes(String(row.target_email || '').toLowerCase()))
         .sort((a, b) => Number(b.updated_at_ms || 0) - Number(a.updated_at_ms || 0))
         .slice(0, 50)
         .map((row) => ({ ...row }));
@@ -593,6 +608,7 @@ function createVerifier() {
     if (token === 'valid-token') return { sub: USER_ID, email: 'alice@example.com' };
     if (token === 'other-token') return { sub: OTHER_USER_ID, email: 'bob@example.com' };
     if (token === 'third-token') return { sub: THIRD_USER_ID, email: 'charlie@example.com' };
+    if (token === 'gmail-token') return { sub: GMAIL_USER_ID, email: 'worldsforming@gmail.com' };
     throw new Error('invalid token');
   };
 }
@@ -1599,6 +1615,34 @@ describe('data api', () => {
     expect(body.link.me.shareScopes.favorites).toBe(true);
     expect(body.link.me.shareScopes.watchLater).toBe(true);
     expect(body.link.me.shareScopes.secretChat).toBeUndefined();
+  });
+
+  it('surfaces pending requests for equivalent gmail aliases', async () => {
+    const createResponse = await worker.fetch(new Request('https://data-api.watchbilm.org/links/request', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        targetEmail: 'worlds.forming+watch@googlemail.com',
+        shareScopes: {
+          favorites: true
+        }
+      })
+    }), env);
+    expect(createResponse.status).toBe(200);
+
+    const listResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/links?userId=${GMAIL_USER_ID}`, {
+      headers: { authorization: 'Bearer gmail-token' }
+    }), env);
+    expect(listResponse.status).toBe(200);
+    const payload = await listResponse.json();
+    expect(Array.isArray(payload.incomingRequests)).toBe(true);
+    expect(payload.incomingRequests.length).toBe(1);
+    expect(payload.incomingRequests[0].myRole).toBe('target');
+    expect(payload.incomingRequests[0].canApprove).toBe(true);
   });
 
   it('rejects self links and blocks a second pending link', async () => {
