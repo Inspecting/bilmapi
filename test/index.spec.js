@@ -1813,6 +1813,11 @@ describe('data api', () => {
   });
 
   it('creates account links with non-chat scopes and watch later support', async () => {
+    const registerTarget = await worker.fetch(new Request(`https://data-api.watchbilm.org/links?userId=${OTHER_USER_ID}`, {
+      headers: { authorization: 'Bearer other-token' }
+    }), env);
+    expect(registerTarget.status).toBe(200);
+
     const response = await worker.fetch(new Request('https://data-api.watchbilm.org/links/request', {
       method: 'POST',
       headers: {
@@ -1841,6 +1846,11 @@ describe('data api', () => {
   });
 
   it('surfaces pending requests for equivalent gmail aliases', async () => {
+    const registerTarget = await worker.fetch(new Request(`https://data-api.watchbilm.org/links?userId=${GMAIL_USER_ID}`, {
+      headers: { authorization: 'Bearer gmail-token' }
+    }), env);
+    expect(registerTarget.status).toBe(200);
+
     const createResponse = await worker.fetch(new Request('https://data-api.watchbilm.org/links/request', {
       method: 'POST',
       headers: {
@@ -1884,6 +1894,11 @@ describe('data api', () => {
     expect(selfLink.status).toBe(400);
     expect((await selfLink.json()).code).toBe('self_link_forbidden');
 
+    const registerBob = await worker.fetch(new Request(`https://data-api.watchbilm.org/links?userId=${OTHER_USER_ID}`, {
+      headers: { authorization: 'Bearer other-token' }
+    }), env);
+    expect(registerBob.status).toBe(200);
+
     const first = await worker.fetch(new Request('https://data-api.watchbilm.org/links/request', {
       method: 'POST',
       headers: {
@@ -1914,7 +1929,31 @@ describe('data api', () => {
     expect((await second.json()).code).toBe('requester_link_conflict');
   });
 
+  it('rejects account-link requests when target email is unknown', async () => {
+    const response = await worker.fetch(new Request('https://data-api.watchbilm.org/links/request', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        targetEmail: 'missing-user@example.com',
+        shareScopes: { favorites: true }
+      })
+    }), env);
+
+    expect(response.status).toBe(404);
+    const body = await response.json();
+    expect(body.code).toBe('target_account_not_found');
+  });
+
   it('approves links and shared-feed returns approved non-chat sectors with a signature', async () => {
+    const registerTarget = await worker.fetch(new Request(`https://data-api.watchbilm.org/links?userId=${OTHER_USER_ID}`, {
+      headers: { authorization: 'Bearer other-token' }
+    }), env);
+    expect(registerTarget.status).toBe(200);
+
     const createResponse = await worker.fetch(new Request('https://data-api.watchbilm.org/links/request', {
       method: 'POST',
       headers: {
@@ -1998,7 +2037,12 @@ describe('data api', () => {
     expect(feed.operations.some((operation) => operation.sectorKey === 'chat_messages')).toBe(false);
   });
 
-  it('keeps target capability lookup non-enumerating', async () => {
+  it('returns target capability availability for known and unknown accounts', async () => {
+    const registerTarget = await worker.fetch(new Request(`https://data-api.watchbilm.org/links?userId=${OTHER_USER_ID}`, {
+      headers: { authorization: 'Bearer other-token' }
+    }), env);
+    expect(registerTarget.status).toBe(200);
+
     const response = await worker.fetch(new Request(`https://data-api.watchbilm.org/links/target-capabilities?userId=${USER_ID}&email=bob@example.com`, {
       headers: { authorization: 'Bearer valid-token' }
     }), env);
@@ -2006,8 +2050,17 @@ describe('data api', () => {
     expect(response.status).toBe(200);
     const body = await response.json();
     expect(body.targetEmail).toBe('bob@example.com');
-    expect(body.accountFound).toBe(false);
+    expect(body.accountFound).toBe(true);
+    expect(body.canRequest).toBe(true);
     expect(body.chatEligible).toBeUndefined();
+
+    const missingResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/links/target-capabilities?userId=${USER_ID}&email=nobody@example.com`, {
+      headers: { authorization: 'Bearer valid-token' }
+    }), env);
+    expect(missingResponse.status).toBe(200);
+    const missingBody = await missingResponse.json();
+    expect(missingBody.accountFound).toBe(false);
+    expect(missingBody.canRequest).toBe(false);
   });
 
   it('rate limits account-link endpoints per user', async () => {

@@ -2759,14 +2759,26 @@ async function handleGetAccountLinkTargetCapabilities({ request, env, corsOrigin
     userId: authContext.userId,
     email: authContext.email
   });
+  const targetCapability = await readAccountUserCapabilityByEmail({
+    db,
+    email: targetEmail
+  });
+  const accountFound = Boolean(targetCapability?.userId);
+  const targetBlocking = accountFound
+    ? await findBlockingAccountLink({
+      db,
+      userId: targetCapability.userId,
+      email: targetCapability.email || targetEmail
+    })
+    : null;
 
   return jsonResponse(200, {
     ok: true,
     targetEmail,
-    accountFound: false,
+    accountFound,
     requesterBlocked: Boolean(requesterBlocking),
-    targetBlocked: false,
-    canRequest: !requesterBlocking
+    targetBlocked: Boolean(targetBlocking),
+    canRequest: accountFound && !requesterBlocking && !targetBlocking
   }, corsOrigin, { 'x-request-id': requestId });
 }
 
@@ -2840,10 +2852,20 @@ async function handleCreateAccountLinkRequest({ request, env, corsOrigin, verify
     db,
     email: targetEmail
   });
+  if (!targetCapability?.userId) {
+    return errorResponse(404, {
+      error: 'target_account_not_found',
+      message: 'No account found for that email.',
+      retryable: false,
+      code: 'target_account_not_found',
+      requestId
+    }, corsOrigin);
+  }
+  const canonicalTargetEmail = canonicalizeEmailForMatching(targetCapability?.email || targetEmail);
   const targetBlocking = await findBlockingAccountLink({
     db,
-    userId: targetCapability?.userId || '',
-    email: targetEmail
+    userId: targetCapability.userId,
+    email: canonicalTargetEmail || targetEmail
   });
   if (targetBlocking) {
     return errorResponse(409, {
@@ -2861,8 +2883,8 @@ async function handleCreateAccountLinkRequest({ request, env, corsOrigin, verify
     status: ACCOUNT_LINK_STATUS_PENDING,
     requesterUserId: authContext.userId,
     requesterEmail: authContext.email,
-    targetUserId: targetCapability?.userId || null,
-    targetEmail,
+    targetUserId: targetCapability.userId,
+    targetEmail: canonicalTargetEmail || targetEmail,
     requesterShareScopes,
     targetShareScopes: { ...DEFAULT_ACCOUNT_LINK_SCOPES },
     requesterApprovedAtMs: nowMs,
