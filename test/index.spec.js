@@ -613,18 +613,46 @@ class MemoryD1Statement {
     }
 
     if (this.sql.includes('from sync_items')) {
-      const [userId, sinceMs] = this.params;
+      const [userId, sinceMsOrCursorMs] = this.params;
       const max = Number(this.params[this.params.length - 1] || 250) || 250;
       const normalizedUserId = String(userId || '');
-      const since = Number(sinceMs || 0) || 0;
+      const useTupleCursor = this.sql.includes("coalesce(op_id, '') > ?3");
+      const since = Number(sinceMsOrCursorMs || 0) || 0;
+      const cursorOpId = useTupleCursor ? String(this.params[2] || '') : '';
+      const cursorSectorKey = useTupleCursor ? String(this.params[3] || '') : '';
+      const cursorItemKey = useTupleCursor ? String(this.params[4] || '') : '';
       const sectorFilters = this.params
-        .slice(2, this.params.length - 1)
+        .slice(useTupleCursor ? 5 : 2, this.params.length - 1)
         .map((entry) => String(entry || ''))
         .filter(Boolean);
       const results = [...this.db.syncRows.values()]
-        .filter((row) => row.user_id === normalizedUserId && Number(row.updated_at_ms || 0) > since)
+        .filter((row) => {
+          if (row.user_id !== normalizedUserId) return false;
+          const rowUpdatedAtMs = Number(row.updated_at_ms || 0) || 0;
+          if (!useTupleCursor) {
+            return rowUpdatedAtMs > since;
+          }
+          if (rowUpdatedAtMs > since) return true;
+          if (rowUpdatedAtMs < since) return false;
+          const rowOpId = String(row.op_id || '');
+          if (rowOpId > cursorOpId) return true;
+          if (rowOpId < cursorOpId) return false;
+          const rowSectorKey = String(row.sector_key || '');
+          if (rowSectorKey > cursorSectorKey) return true;
+          if (rowSectorKey < cursorSectorKey) return false;
+          const rowItemKey = String(row.item_key || '');
+          return rowItemKey > cursorItemKey;
+        })
         .filter((row) => !sectorFilters.length || sectorFilters.includes(String(row.sector_key || '')))
-        .sort((a, b) => Number(a.updated_at_ms || 0) - Number(b.updated_at_ms || 0))
+        .sort((a, b) => {
+          const timeDiff = (Number(a.updated_at_ms || 0) || 0) - (Number(b.updated_at_ms || 0) || 0);
+          if (timeDiff !== 0) return timeDiff;
+          const opDiff = String(a.op_id || '').localeCompare(String(b.op_id || ''));
+          if (opDiff !== 0) return opDiff;
+          const sectorDiff = String(a.sector_key || '').localeCompare(String(b.sector_key || ''));
+          if (sectorDiff !== 0) return sectorDiff;
+          return String(a.item_key || '').localeCompare(String(b.item_key || ''));
+        })
         .slice(0, Math.max(1, max))
         .map((row) => ({
           sector_key: row.sector_key,
@@ -2035,6 +2063,118 @@ describe('data api', () => {
     expect(feed.linkSignature).toContain(linkId);
     expect(feed.operations.map((operation) => operation.sectorKey)).toEqual(['favorites', 'watch_later']);
     expect(feed.operations.some((operation) => operation.sectorKey === 'chat_messages')).toBe(false);
+  });
+
+  it('paginates shared-feed safely when many records share the same timestamp', async () => {
+    const registerTarget = await worker.fetch(new Request(`https://data-api.watchbilm.org/links?userId=${OTHER_USER_ID}`, {
+      headers: { authorization: 'Bearer other-token' }
+    }), env);
+    expect(registerTarget.status).toBe(200);
+
+    const createResponse = await worker.fetch(new Request('https://data-api.watchbilm.org/links/request', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        targetEmail: 'bob@example.com',
+        shareScopes: { favorites: true }
+      })
+    }), env);
+    expect(createResponse.status).toBe(200);
+    const created = await createResponse.json();
+    const linkId = created.link.id;
+
+    const approveResponse = await worker.fetch(new Request('https://data-api.watchbilm.org/links/respond', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer other-token'
+      },
+      body: JSON.stringify({
+        userId: OTHER_USER_ID,
+        linkId,
+        action: 'approve',
+        shareScopes: { favorites: true }
+      })
+    }), env);
+    expect(approveResponse.status).toBe(200);
+
+    const sharedTimestamp = 1727000000000;
+    const operations = Array.from({ length: 130 }, (_, index) => {
+      const itemNumber = index + 1;
+      return {
+        sectorKey: 'favorites',
+        itemKey: `movie:${itemNumber}`,
+        opId: `op-${String(itemNumber).padStart(4, '0')}`,
+        updatedAtMs: sharedTimestamp,
+        deleted: false,
+        payload: {
+          key: `tmdb:movie:${itemNumber}`,
+          title: `Favorite ${itemNumber}`,
+          updatedAt: sharedTimestamp
+        }
+      };
+    });
+
+    const pushResponse = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        operations
+      })
+    }), env);
+    expect(pushResponse.status).toBe(200);
+
+    const receivedItemKeys = [];
+    let cursorUpdatedAtMs = 0;
+    let cursorOpId = '';
+    let cursorSectorKey = '';
+    let cursorItemKey = '';
+    let hasMore = true;
+    let safetyCounter = 0;
+
+    while (hasMore && safetyCounter < 20) {
+      safetyCounter += 1;
+      const params = new URLSearchParams({
+        userId: OTHER_USER_ID,
+        since: '0',
+        limit: '25'
+      });
+      if (cursorUpdatedAtMs > 0 || cursorOpId || cursorSectorKey || cursorItemKey) {
+        params.set('cursorUpdatedAtMs', String(cursorUpdatedAtMs));
+        params.set('cursorOpId', cursorOpId);
+        params.set('cursorSectorKey', cursorSectorKey);
+        params.set('cursorItemKey', cursorItemKey);
+      }
+
+      const response = await worker.fetch(new Request(`https://data-api.watchbilm.org/links/shared-feed?${params.toString()}`, {
+        headers: { authorization: 'Bearer other-token' }
+      }), env);
+      expect(response.status).toBe(200);
+      const body = await response.json();
+
+      expect(Array.isArray(body.operations)).toBe(true);
+      body.operations.forEach((operation) => {
+        receivedItemKeys.push(operation.itemKey);
+      });
+
+      cursorUpdatedAtMs = Number(body.cursorUpdatedAtMs || body.cursorMs || 0) || 0;
+      cursorOpId = String(body.cursorOpId || '');
+      cursorSectorKey = String(body.cursorSectorKey || '');
+      cursorItemKey = String(body.cursorItemKey || '');
+      hasMore = body.hasMore === true;
+    }
+
+    expect(safetyCounter).toBeLessThan(20);
+    expect(receivedItemKeys.length).toBe(130);
+    expect(new Set(receivedItemKeys).size).toBe(130);
   });
 
   it('returns target capability availability for known and unknown accounts', async () => {

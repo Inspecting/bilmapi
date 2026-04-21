@@ -407,7 +407,6 @@ const SELECT_SHARED_SYNC_ITEMS_BASE_SQL = `
     op_id
   FROM sync_items
   WHERE user_id = ?1
-    AND updated_at_ms > ?2
 `;
 const LIST_SYNC_KEYS = new Set([
   'bilm-favorites',
@@ -2657,16 +2656,94 @@ function parsePullLimit(rawValue) {
   return Math.max(1, Math.min(500, Math.floor(value)));
 }
 
-function buildSharedSyncItemsStatement({ db, userId, sinceMs, sectors, limit }) {
+function normalizeSharedFeedCursor({
+  updatedAtMs = 0,
+  opId = '',
+  sectorKey = '',
+  itemKey = ''
+} = {}) {
+  const normalizedUpdatedAtMs = parseSinceMs(updatedAtMs);
+  const normalizedOpId = normalizeOperationId(opId);
+  const normalizedSectorKey = normalizeSectorKey(sectorKey);
+  const normalizedItemKey = normalizeItemKey(itemKey);
+  const hasCursor = normalizedUpdatedAtMs > 0
+    || Boolean(normalizedOpId)
+    || Boolean(normalizedSectorKey)
+    || Boolean(normalizedItemKey);
+  if (!hasCursor) return null;
+  return {
+    updatedAtMs: normalizedUpdatedAtMs,
+    opId: normalizedOpId,
+    sectorKey: normalizedSectorKey,
+    itemKey: normalizedItemKey
+  };
+}
+
+function compareSharedFeedTuple(left = {}, right = {}) {
+  const leftUpdatedAtMs = parseSinceMs(left?.updatedAtMs);
+  const rightUpdatedAtMs = parseSinceMs(right?.updatedAtMs);
+  if (leftUpdatedAtMs !== rightUpdatedAtMs) return leftUpdatedAtMs - rightUpdatedAtMs;
+  const leftOpId = normalizeOperationId(left?.opId);
+  const rightOpId = normalizeOperationId(right?.opId);
+  if (leftOpId !== rightOpId) return leftOpId.localeCompare(rightOpId);
+  const leftSectorKey = normalizeSectorKey(left?.sectorKey);
+  const rightSectorKey = normalizeSectorKey(right?.sectorKey);
+  if (leftSectorKey !== rightSectorKey) return leftSectorKey.localeCompare(rightSectorKey);
+  const leftItemKey = normalizeItemKey(left?.itemKey);
+  const rightItemKey = normalizeItemKey(right?.itemKey);
+  if (leftItemKey !== rightItemKey) return leftItemKey.localeCompare(rightItemKey);
+  return 0;
+}
+
+function buildSharedFeedCursorFromOperation(operation = {}) {
+  return {
+    updatedAtMs: parseSinceMs(operation?.updatedAtMs),
+    opId: normalizeOperationId(operation?.opId),
+    sectorKey: normalizeSectorKey(operation?.sectorKey),
+    itemKey: normalizeItemKey(operation?.itemKey)
+  };
+}
+
+function buildSharedSyncItemsStatement({ db, userId, sinceMs, sectors, limit, cursor = null }) {
   const validSectors = Array.isArray(sectors)
     ? [...new Set(sectors.map((sector) => normalizeSectorKey(sector)).filter((sector) => isValidSectorKey(sector)))]
     : [];
   if (!validSectors.length) return null;
-  const bindings = [userId, sinceMs];
-  const placeholders = validSectors.map((_, index) => `?${index + 3}`).join(', ');
+  const bindings = [userId];
   let sql = `${SELECT_SHARED_SYNC_ITEMS_BASE_SQL}`;
+  if (cursor) {
+    bindings.push(
+      parseSinceMs(cursor.updatedAtMs),
+      normalizeOperationId(cursor.opId),
+      normalizeSectorKey(cursor.sectorKey),
+      normalizeItemKey(cursor.itemKey)
+    );
+    sql += `
+      AND (
+        updated_at_ms > ?2
+        OR (
+          updated_at_ms = ?2
+          AND (
+            COALESCE(op_id, '') > ?3
+            OR (
+              COALESCE(op_id, '') = ?3
+              AND (
+                sector_key > ?4
+                OR (sector_key = ?4 AND item_key > ?5)
+              )
+            )
+          )
+        )
+      )`;
+  } else {
+    bindings.push(sinceMs);
+    sql += ` AND updated_at_ms > ?2`;
+  }
+  const sectorPlaceholderStart = bindings.length + 1;
+  const placeholders = validSectors.map((_, index) => `?${sectorPlaceholderStart + index}`).join(', ');
   sql += ` AND sector_key IN (${placeholders})`;
-  sql += ` ORDER BY updated_at_ms ASC LIMIT ?${bindings.length + validSectors.length + 1}`;
+  sql += ` ORDER BY updated_at_ms ASC, COALESCE(op_id, '') ASC, sector_key ASC, item_key ASC`;
+  sql += ` LIMIT ?${sectorPlaceholderStart + validSectors.length}`;
   bindings.push(...validSectors, limit);
   return db.prepare(sql).bind(...bindings);
 }
@@ -3312,6 +3389,12 @@ async function handlePullLinkedSharedFeed({ request, env, corsOrigin, verifyIdTo
   });
   enforceAccountLinkRateLimit({ env, authContext, corsOrigin, requestId, kind: 'read' });
   const sinceMs = parseSinceMs(url.searchParams.get('since'));
+  const cursor = normalizeSharedFeedCursor({
+    updatedAtMs: url.searchParams.get('cursorUpdatedAtMs'),
+    opId: url.searchParams.get('cursorOpId'),
+    sectorKey: url.searchParams.get('cursorSectorKey'),
+    itemKey: url.searchParams.get('cursorItemKey')
+  });
   const limit = parsePullLimit(url.searchParams.get('limit'));
   const db = getD1Database(env);
 
@@ -3332,6 +3415,7 @@ async function handlePullLinkedSharedFeed({ request, env, corsOrigin, verifyIdTo
     .sort();
 
   const operations = [];
+  let hasAdditionalResults = false;
   const linkSignatureParts = [];
 
   for (const link of activeLinks) {
@@ -3359,11 +3443,16 @@ async function handlePullLinkedSharedFeed({ request, env, corsOrigin, verifyIdTo
       userId: sourceUserId,
       sinceMs,
       sectors,
-      limit
+      limit: limit + 1,
+      cursor
     });
     if (!statement) continue;
     const query = await statement.all();
-    const rows = Array.isArray(query?.results) ? query.results : [];
+    const rawRows = Array.isArray(query?.results) ? query.results : [];
+    const rows = rawRows.slice(0, limit);
+    if (rawRows.length > rows.length) {
+      hasAdditionalResults = true;
+    }
     rows.forEach((row) => {
       const updatedAtMs = parseSinceMs(row?.updated_at_ms);
       const sectorKey = normalizeSectorKey(row?.sector_key);
@@ -3394,24 +3483,38 @@ async function handlePullLinkedSharedFeed({ request, env, corsOrigin, verifyIdTo
   }
 
   operations.sort((left, right) => {
-    const leftTime = Number(left?.updatedAtMs || 0);
-    const rightTime = Number(right?.updatedAtMs || 0);
-    if (leftTime !== rightTime) return leftTime - rightTime;
-    const leftKey = `${left?.linkId || ''}:${left?.sectorKey || ''}:${left?.itemKey || ''}`;
-    const rightKey = `${right?.linkId || ''}:${right?.sectorKey || ''}:${right?.itemKey || ''}`;
-    return leftKey.localeCompare(rightKey);
+    const tupleCompare = compareSharedFeedTuple(
+      buildSharedFeedCursorFromOperation(left),
+      buildSharedFeedCursorFromOperation(right)
+    );
+    if (tupleCompare !== 0) return tupleCompare;
+    const leftLinkId = String(left?.linkId || '').trim();
+    const rightLinkId = String(right?.linkId || '').trim();
+    if (leftLinkId !== rightLinkId) return leftLinkId.localeCompare(rightLinkId);
+    const leftSourceUserId = String(left?.sourceUserId || '').trim();
+    const rightSourceUserId = String(right?.sourceUserId || '').trim();
+    return leftSourceUserId.localeCompare(rightSourceUserId);
   });
   const limited = operations.slice(0, limit);
-  const limitedCursorMs = limited.reduce(
-    (max, operation) => Math.max(max, parseSinceMs(operation?.updatedAtMs)),
-    sinceMs
-  );
-  const hasMore = operations.length > limited.length;
+  const fallbackCursor = cursor || {
+    updatedAtMs: sinceMs,
+    opId: '',
+    sectorKey: '',
+    itemKey: ''
+  };
+  const nextCursor = limited.length
+    ? buildSharedFeedCursorFromOperation(limited[limited.length - 1])
+    : fallbackCursor;
+  const hasMore = hasAdditionalResults || operations.length > limited.length;
 
   return jsonResponse(200, {
     ok: true,
     sinceMs,
-    cursorMs: limitedCursorMs,
+    cursorMs: parseSinceMs(nextCursor.updatedAtMs),
+    cursorUpdatedAtMs: parseSinceMs(nextCursor.updatedAtMs),
+    cursorOpId: normalizeOperationId(nextCursor.opId),
+    cursorSectorKey: normalizeSectorKey(nextCursor.sectorKey),
+    cursorItemKey: normalizeItemKey(nextCursor.itemKey),
     hasMore,
     activeLinkIds,
     linkSignature: linkSignatureParts.sort().join('|'),
