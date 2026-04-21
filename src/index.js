@@ -25,6 +25,34 @@ const SELECT_SNAPSHOT_META_SQL = `
   WHERE user_id = ?1
   LIMIT 1
 `;
+const DELETE_SNAPSHOT_FOR_USER_SQL = `
+  DELETE FROM user_snapshots
+  WHERE user_id = ?1
+`;
+const DELETE_LIST_SYNC_ITEMS_FOR_USER_SQL = `
+  DELETE FROM list_sync_items
+  WHERE user_id = ?1
+`;
+const DELETE_SECTOR_SYNC_ITEMS_FOR_USER_SQL = `
+  DELETE FROM sync_items
+  WHERE user_id = ?1
+`;
+const DELETE_USER_SYNC_STATE_FOR_USER_SQL = `
+  DELETE FROM user_sync_state
+  WHERE user_id = ?1
+`;
+const DELETE_ACCOUNT_LINKS_FOR_USER_SQL = `
+  DELETE FROM account_links
+  WHERE requester_user_id = ?1
+     OR target_user_id = ?1
+     OR requester_email = ?2
+     OR target_email = ?2
+`;
+const DELETE_ACCOUNT_USER_CAPABILITY_FOR_USER_SQL = `
+  DELETE FROM account_user_capabilities
+  WHERE user_id = ?1
+     OR email = ?2
+`;
 const UPSERT_LIST_SYNC_ITEM_SQL = `
   INSERT INTO list_sync_items (
     user_id,
@@ -3170,6 +3198,84 @@ async function handleMarkAccountChatReady({ request, env, corsOrigin, verifyIdTo
   }, corsOrigin, { 'x-request-id': requestId });
 }
 
+async function handleResetAccountData({ request, env, corsOrigin, verifyIdToken, requestId }) {
+  assertStorageConfigured(env, corsOrigin);
+  const body = await parseJsonBody(request, corsOrigin, requestId);
+  const url = new URL(request.url);
+  const userId = normalizeUserId(body?.userId || url.searchParams.get('userId'));
+  const authContext = await requireAccountLinkAuthContext({
+    request,
+    env,
+    corsOrigin,
+    verifyIdToken,
+    userId,
+    requestId
+  });
+  enforcePrivateEndpointRateLimit({
+    env,
+    userId: authContext.userId,
+    corsOrigin,
+    requestId,
+    kind: 'snapshotWrite'
+  });
+
+  const canonicalEmail = canonicalizeEmailForMatching(authContext.email);
+  const db = getD1Database(env);
+  const deleted = {
+    snapshots: 0,
+    sectorSyncItems: 0,
+    listSyncItems: 0,
+    syncState: 0,
+    accountLinks: 0,
+    accountCapabilities: 0,
+    kvSnapshots: 0
+  };
+
+  if (db) {
+    const snapshotDeleteResult = await db.prepare(DELETE_SNAPSHOT_FOR_USER_SQL).bind(authContext.userId).run();
+    deleted.snapshots = Number(snapshotDeleteResult?.meta?.changes || 0) || 0;
+
+    const sectorDeleteResult = await db.prepare(DELETE_SECTOR_SYNC_ITEMS_FOR_USER_SQL).bind(authContext.userId).run();
+    deleted.sectorSyncItems = Number(sectorDeleteResult?.meta?.changes || 0) || 0;
+
+    const listDeleteResult = await db.prepare(DELETE_LIST_SYNC_ITEMS_FOR_USER_SQL).bind(authContext.userId).run();
+    deleted.listSyncItems = Number(listDeleteResult?.meta?.changes || 0) || 0;
+
+    const syncStateDeleteResult = await db.prepare(DELETE_USER_SYNC_STATE_FOR_USER_SQL).bind(authContext.userId).run();
+    deleted.syncState = Number(syncStateDeleteResult?.meta?.changes || 0) || 0;
+
+    const linkDeleteResult = await db
+      .prepare(DELETE_ACCOUNT_LINKS_FOR_USER_SQL)
+      .bind(authContext.userId, canonicalEmail)
+      .run();
+    deleted.accountLinks = Number(linkDeleteResult?.meta?.changes || 0) || 0;
+
+    const capabilityDeleteResult = await db
+      .prepare(DELETE_ACCOUNT_USER_CAPABILITY_FOR_USER_SQL)
+      .bind(authContext.userId, canonicalEmail)
+      .run();
+    deleted.accountCapabilities = Number(capabilityDeleteResult?.meta?.changes || 0) || 0;
+  }
+
+  const kv = getKvNamespace(env);
+  if (kv) {
+    if (typeof kv.delete === 'function') {
+      await kv.delete(`user-${authContext.userId}`);
+      deleted.kvSnapshots = 1;
+    } else if (typeof kv.put === 'function') {
+      await kv.put(`user-${authContext.userId}`, '', { expirationTtl: 1 });
+      deleted.kvSnapshots = 1;
+    }
+  }
+
+  return jsonResponse(200, {
+    ok: true,
+    userId: authContext.userId,
+    email: canonicalEmail,
+    deleted
+  }, corsOrigin, { 'x-request-id': requestId });
+}
+
 async function handlePullLinkedSharedFeed({ request, env, corsOrigin, verifyIdToken, requestId }) {
   assertD1Configured(env, corsOrigin);
   const url = new URL(request.url);
@@ -3878,6 +3984,7 @@ function buildHealthPayload(env) {
       { id: 'account_links_list', method: 'GET', path: '/links?userId=<uid>', expectedStatuses: [200, 401] },
       { id: 'account_links_request', method: 'POST', path: '/links/request', expectedStatuses: [200, 400, 401, 409] },
       { id: 'account_links_shared_feed', method: 'GET', path: '/links/shared-feed?userId=<uid>&since=0', expectedStatuses: [200, 401] },
+      { id: 'account_reset', method: 'POST', path: '/account/reset', expectedStatuses: [200, 400, 401, 403] },
       { id: 'import_admin_guard', method: 'POST', path: '/?import=true', expectedStatuses: [200, 401, 403] }
     ]
   };
@@ -3951,6 +4058,10 @@ export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOri
 
         if (request.method === 'POST' && url.pathname === '/links/chat-ready') {
           return await handleMarkAccountChatReady({ request, env, corsOrigin, verifyIdToken, requestId });
+        }
+
+        if (request.method === 'POST' && url.pathname === '/account/reset') {
+          return await handleResetAccountData({ request, env, corsOrigin, verifyIdToken, requestId });
         }
 
         if (request.method === 'POST' && url.pathname === '/sync/sectors/push') {

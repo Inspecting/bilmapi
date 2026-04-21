@@ -34,6 +34,10 @@ class MemoryKv {
       metadata: item?.metadata || null
     };
   }
+
+  async delete(key) {
+    this.map.delete(String(key));
+  }
 }
 
 class MemoryR2Object {
@@ -338,7 +342,24 @@ class MemoryD1Statement {
       return { success: true, meta: { changes: 1 } };
     }
 
+    if (this.sql.startsWith('delete from user_snapshots')) {
+      const userId = String(this.params[0] || '');
+      const had = this.db.rows.delete(userId);
+      return { success: true, meta: { changes: had ? 1 : 0 } };
+    }
+
     if (this.sql.startsWith('delete from sync_items')) {
+      if (this.sql.includes('where user_id = ?1')) {
+        const userId = String(this.params[0] || '');
+        let deleted = 0;
+        for (const [key, row] of this.db.syncRows.entries()) {
+          if (String(row.user_id || '') === userId) {
+            this.db.syncRows.delete(key);
+            deleted += 1;
+          }
+        }
+        return { success: true, meta: { changes: deleted } };
+      }
       const cutoffMs = Number(this.params[0] || 0) || 0;
       let deleted = 0;
       for (const [key, row] of this.db.syncRows.entries()) {
@@ -390,12 +411,66 @@ class MemoryD1Statement {
     }
 
     if (this.sql.startsWith('delete from list_sync_items')) {
+      if (this.sql.includes('where user_id = ?1')) {
+        const userId = String(this.params[0] || '');
+        let deleted = 0;
+        for (const [key, row] of this.db.listRows.entries()) {
+          if (String(row.user_id || '') === userId) {
+            this.db.listRows.delete(key);
+            deleted += 1;
+          }
+        }
+        return { success: true, meta: { changes: deleted } };
+      }
       const cutoffMs = Number(this.params[0] || 0) || 0;
       let deleted = 0;
       for (const [key, row] of this.db.listRows.entries()) {
         const deletedAtMs = Number(row.deleted_at_ms || 0) || 0;
         if (deletedAtMs > 0 && deletedAtMs < cutoffMs) {
           this.db.listRows.delete(key);
+          deleted += 1;
+        }
+      }
+      return { success: true, meta: { changes: deleted } };
+    }
+
+    if (this.sql.startsWith('delete from user_sync_state')) {
+      const userId = String(this.params[0] || '');
+      const had = this.db.syncStateRows.delete(userId);
+      return { success: true, meta: { changes: had ? 1 : 0 } };
+    }
+
+    if (this.sql.startsWith('delete from account_links')) {
+      const userId = String(this.params[0] || '');
+      const email = String(this.params[1] || '').toLowerCase();
+      let deleted = 0;
+      for (const [key, row] of this.db.accountLinkRows.entries()) {
+        const requesterUserId = String(row.requester_user_id || '');
+        const targetUserId = String(row.target_user_id || '');
+        const requesterEmail = String(row.requester_email || '').toLowerCase();
+        const targetEmail = String(row.target_email || '').toLowerCase();
+        if (
+          requesterUserId === userId
+          || targetUserId === userId
+          || requesterEmail === email
+          || targetEmail === email
+        ) {
+          this.db.accountLinkRows.delete(key);
+          deleted += 1;
+        }
+      }
+      return { success: true, meta: { changes: deleted } };
+    }
+
+    if (this.sql.startsWith('delete from account_user_capabilities')) {
+      const userId = String(this.params[0] || '');
+      const email = String(this.params[1] || '').toLowerCase();
+      let deleted = 0;
+      for (const [key, row] of this.db.accountCapabilityRows.entries()) {
+        const rowUserId = String(row.user_id || '');
+        const rowEmail = String(row.email || '').toLowerCase();
+        if (rowUserId === userId || rowEmail === email) {
+          this.db.accountCapabilityRows.delete(key);
           deleted += 1;
         }
       }
@@ -791,6 +866,153 @@ describe('data api', () => {
     expect((await second.json()).code).toBe('private_data_rate_limited');
   });
 
+  it('resets all saved account data for the authenticated user', async () => {
+    d1.rows.set(USER_ID, {
+      user_id: USER_ID,
+      snapshot_json: JSON.stringify({ schema: 'bilm-backup-v1' }),
+      updated_at_ms: 1710000000000,
+      device_id: 'device-reset',
+      schema: 'bilm-backup-v1',
+      saved_at: new Date().toISOString()
+    });
+    d1.rows.set(OTHER_USER_ID, {
+      user_id: OTHER_USER_ID,
+      snapshot_json: JSON.stringify({ schema: 'bilm-backup-v1' }),
+      updated_at_ms: 1710000000100,
+      device_id: 'device-other',
+      schema: 'bilm-backup-v1',
+      saved_at: new Date().toISOString()
+    });
+
+    d1.syncRows.set(`${USER_ID}|favorites|movie:1`, {
+      user_id: USER_ID,
+      sector_key: 'favorites',
+      item_key: 'movie:1',
+      item_json: '{"id":1}',
+      updated_at_ms: 1710000000000,
+      deleted_at_ms: null,
+      device_id: 'device-reset',
+      op_id: 'op-reset',
+      saved_at: new Date().toISOString()
+    });
+    d1.syncRows.set(`${OTHER_USER_ID}|favorites|movie:2`, {
+      user_id: OTHER_USER_ID,
+      sector_key: 'favorites',
+      item_key: 'movie:2',
+      item_json: '{"id":2}',
+      updated_at_ms: 1710000000200,
+      deleted_at_ms: null,
+      device_id: 'device-other',
+      op_id: 'op-other',
+      saved_at: new Date().toISOString()
+    });
+
+    d1.listRows.set(`${USER_ID}|bilm-favorites|movie:1`, {
+      user_id: USER_ID,
+      list_key: 'bilm-favorites',
+      item_key: 'movie:1',
+      item_json: '{"id":1}',
+      updated_at_ms: 1710000000000,
+      deleted_at_ms: null,
+      device_id: 'device-reset',
+      saved_at: new Date().toISOString()
+    });
+    d1.listRows.set(`${OTHER_USER_ID}|bilm-favorites|movie:2`, {
+      user_id: OTHER_USER_ID,
+      list_key: 'bilm-favorites',
+      item_key: 'movie:2',
+      item_json: '{"id":2}',
+      updated_at_ms: 1710000000200,
+      deleted_at_ms: null,
+      device_id: 'device-other',
+      saved_at: new Date().toISOString()
+    });
+
+    d1.syncStateRows.set(USER_ID, {
+      user_id: USER_ID,
+      migrated_at_ms: 1710000000000,
+      migration_source: 'firebase_snapshot',
+      updated_at_ms: 1710000000000,
+      saved_at: new Date().toISOString()
+    });
+
+    d1.accountCapabilityRows.set(USER_ID, {
+      user_id: USER_ID,
+      email: 'alice@example.com',
+      chat_ready: 0,
+      last_chat_seen_at_ms: null,
+      updated_at_ms: 1710000000000
+    });
+    d1.accountLinkRows.set('link-reset', {
+      id: 'link-reset',
+      status: 'pending',
+      requester_user_id: USER_ID,
+      requester_email: 'alice@example.com',
+      target_user_id: OTHER_USER_ID,
+      target_email: 'bob@example.com',
+      requester_share_scopes_json: '{"favorites":true}',
+      target_share_scopes_json: '{}',
+      requester_approved_at_ms: 1710000000000,
+      target_approved_at_ms: null,
+      created_at_ms: 1710000000000,
+      updated_at_ms: 1710000000000,
+      activated_at_ms: null,
+      declined_at_ms: null,
+      unlinked_at_ms: null
+    });
+
+    await kv.put(`user-${USER_ID}`, JSON.stringify({ schema: 'bilm-backup-v1', userId: USER_ID }));
+    await kv.put(`user-${OTHER_USER_ID}`, JSON.stringify({ schema: 'bilm-backup-v1', userId: OTHER_USER_ID }));
+
+    const response = await worker.fetch(new Request('https://data-api.watchbilm.org/account/reset', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token',
+        origin: ALLOWED_ORIGIN
+      },
+      body: JSON.stringify({ userId: USER_ID })
+    }), env);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('access-control-allow-origin')).toBe(ALLOWED_ORIGIN);
+    const body = await response.json();
+    expect(body.ok).toBe(true);
+    expect(body.userId).toBe(USER_ID);
+    expect(body.deleted.snapshots).toBe(1);
+    expect(body.deleted.sectorSyncItems).toBe(1);
+    expect(body.deleted.listSyncItems).toBe(1);
+    expect(body.deleted.syncState).toBe(1);
+    expect(body.deleted.accountLinks).toBe(1);
+    expect(body.deleted.accountCapabilities).toBe(1);
+    expect(body.deleted.kvSnapshots).toBe(1);
+
+    expect(d1.rows.has(USER_ID)).toBe(false);
+    expect(d1.rows.has(OTHER_USER_ID)).toBe(true);
+    expect([...d1.syncRows.values()].every((row) => row.user_id !== USER_ID)).toBe(true);
+    expect([...d1.syncRows.values()].some((row) => row.user_id === OTHER_USER_ID)).toBe(true);
+    expect([...d1.listRows.values()].every((row) => row.user_id !== USER_ID)).toBe(true);
+    expect([...d1.listRows.values()].some((row) => row.user_id === OTHER_USER_ID)).toBe(true);
+    expect(d1.syncStateRows.has(USER_ID)).toBe(false);
+    expect(d1.accountCapabilityRows.has(USER_ID)).toBe(false);
+    expect(d1.accountLinkRows.has('link-reset')).toBe(false);
+    expect(await kv.get(`user-${USER_ID}`)).toBeNull();
+    expect(await kv.get(`user-${OTHER_USER_ID}`)).not.toBeNull();
+  });
+
+  it('rejects account reset when token subject does not match userId', async () => {
+    const response = await worker.fetch(new Request('https://data-api.watchbilm.org/account/reset', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer other-token'
+      },
+      body: JSON.stringify({ userId: USER_ID })
+    }), env);
+    expect(response.status).toBe(403);
+    expect((await response.json()).code).toBe('forbidden');
+  });
+
   it('returns service health metadata', async () => {
     const response = await worker.fetch(new Request('https://data-api.watchbilm.org/health', {
       method: 'GET',
@@ -805,6 +1027,7 @@ describe('data api', () => {
     expect(body.storage?.snapshotStorageReady).toBe(true);
     expect(Array.isArray(body.endpoints)).toBe(true);
     expect(body.endpoints.some((entry) => entry.id === 'cloud_export_save')).toBe(true);
+    expect(body.endpoints.some((entry) => entry.id === 'account_reset')).toBe(true);
   });
 
   it('returns snapshot metadata from meta route (D1)', async () => {
