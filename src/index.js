@@ -4009,6 +4009,26 @@ export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOri
         });
       } catch (error) {
         if (error instanceof Response) return error;
+        const errorMessage = String(error?.message || error || 'unknown_error');
+        const errorStack = String(error?.stack || '');
+        console.error('data-api request failed', {
+          requestId,
+          method: request.method,
+          pathname: url.pathname,
+          search: url.search,
+          message: errorMessage,
+          stack: errorStack ? errorStack.slice(0, 2000) : ''
+        });
+
+        if (/no such table|no such column|sqlite|d1/i.test(`${errorMessage}\n${errorStack}`)) {
+          return errorResponse(503, {
+            error: 'storage_unavailable',
+            message: 'Storage is initializing. Please retry shortly.',
+            retryable: true,
+            code: 'storage_unavailable',
+            requestId
+          }, corsOrigin);
+        }
         return errorResponse(500, {
           error: 'internal_error',
           message: 'Unexpected server error.',
