@@ -488,7 +488,6 @@ const DEFAULT_ALLOWED_ORIGINS = new Set([
   'https://watchbilm.org',
   'https://www.watchbilm.org',
   'https://bilm.fly.dev',
-  'https://inspecting.github.io',
   'https://data-api.watchbilm.org',
   'https://data-api.reidmhit.workers.dev',
   'https://bilm-backend.reidmhit.workers.dev'
@@ -706,7 +705,7 @@ function createCorsHeaders(corsOrigin = '') {
   return {
     'Access-Control-Allow-Origin': corsOrigin,
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-admin-token, x-bilm-auth-bypass',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-admin-token',
     'Access-Control-Max-Age': '86400',
     'Vary': 'Origin'
   };
@@ -4090,9 +4089,6 @@ function buildHealthPayload(env) {
     ok: true,
     service: 'data-api',
     checkedAtMs: Date.now(),
-    auth: {
-      bypassEnabled: isAuthTemporarilyDisabled(env)
-    },
     storage: {
       d1: hasD1,
       kv: hasKv,
@@ -4251,7 +4247,7 @@ export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOri
           requestId,
           method: request.method,
           pathname: url.pathname,
-          search: url.search,
+          searchParamKeys: [...new Set(url.searchParams.keys())].slice(0, 20),
           message: errorMessage,
           stack: errorStack ? errorStack.slice(0, 2000) : ''
         });
