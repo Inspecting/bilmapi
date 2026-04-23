@@ -1046,6 +1046,195 @@ function parseEnvInt(env, name, fallback, { min = 1, max = Number.MAX_SAFE_INTEG
   return Math.max(min, Math.min(max, Math.floor(parsed)));
 }
 
+function parseEnvBool(env, name, fallback = false) {
+  const raw = String(env?.[name] ?? '').trim().toLowerCase();
+  if (!raw) return fallback;
+  if (raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on') return true;
+  if (raw === '0' || raw === 'false' || raw === 'no' || raw === 'off') return false;
+  return fallback;
+}
+
+function normalizeSupabaseProjectUrl(rawValue = '') {
+  const candidate = String(rawValue || '').trim();
+  if (!candidate) return '';
+  try {
+    const parsed = new URL(candidate);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return '';
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    return '';
+  }
+}
+
+function sanitizeMirrorUserId(value) {
+  const normalized = normalizeUserId(value);
+  if (!isValidUserId(normalized)) return null;
+  return normalized;
+}
+
+function resolveSupabaseMirrorConfig(env) {
+  const enabled = parseEnvBool(env, 'SUPABASE_MIRROR_ENABLED', true);
+  const projectUrl = normalizeSupabaseProjectUrl(env?.SUPABASE_PROJECT_URL || env?.SUPABASE_URL || '');
+  const serviceRoleKey = String(env?.SUPABASE_SERVICE_ROLE_KEY || env?.SUPABASE_SERVICE_KEY || '').trim();
+  const table = String(env?.SUPABASE_MIRROR_TABLE || 'cloudflare_mirror_events').trim().toLowerCase();
+  const timeoutMs = parseEnvInt(env, 'SUPABASE_MIRROR_TIMEOUT_MS', 10_000, { min: 1000, max: 60_000 });
+  const validTable = /^[a-z0-9_.-]{1,128}$/i.test(table);
+  return {
+    enabled,
+    active: enabled && Boolean(projectUrl && serviceRoleKey && validTable),
+    projectUrl,
+    serviceRoleKey,
+    table: validTable ? table : 'cloudflare_mirror_events',
+    timeoutMs
+  };
+}
+
+function buildSupabaseMirrorUrl(config) {
+  const url = new URL(`/rest/v1/${encodeURIComponent(config.table)}`, `${config.projectUrl}/`);
+  url.searchParams.set('on_conflict', 'event_id');
+  return url.toString();
+}
+
+function toMirrorBodySummary(value) {
+  if (value === null || typeof value === 'undefined') {
+    return { json: null, text: null, bytes: 0 };
+  }
+  try {
+    const serialized = typeof value === 'string' ? value : JSON.stringify(value);
+    const bytes = calculateJsonBytes(serialized);
+    if (typeof value === 'object' && value && !Array.isArray(value)) {
+      return { json: value, text: null, bytes };
+    }
+    const parsed = safeParse(serialized, null);
+    if (parsed && typeof parsed === 'object') {
+      return { json: parsed, text: null, bytes };
+    }
+    return { json: null, text: serialized.slice(0, 120_000), bytes };
+  } catch {
+    const fallbackText = String(value || '');
+    return {
+      json: null,
+      text: fallbackText.slice(0, 120_000),
+      bytes: calculateJsonBytes(fallbackText)
+    };
+  }
+}
+
+function shouldMirrorToSupabase(pathname = '', method = 'GET', status = 0) {
+  const normalizedPath = String(pathname || '').trim();
+  const normalizedMethod = String(method || 'GET').trim().toUpperCase();
+  if (!(status >= 200 && status < 300)) return false;
+  if (normalizedMethod !== 'POST') return false;
+  if (normalizedPath === '/') return true;
+  if (normalizedPath === '/account/reset') return true;
+  if (normalizedPath.startsWith('/sync/lists/')) return true;
+  if (normalizedPath.startsWith('/sync/sectors/')) return true;
+  if (normalizedPath.startsWith('/links/')) return true;
+  return false;
+}
+
+async function mirrorWriteEventToSupabase({
+  env,
+  path = '',
+  method = 'POST',
+  userId = '',
+  requestId = '',
+  requestBody = null,
+  responseBody = null,
+  status = 200
+} = {}) {
+  const config = resolveSupabaseMirrorConfig(env);
+  if (!config.active) return false;
+  if (!shouldMirrorToSupabase(path, method, status)) return false;
+
+  const occurredAt = new Date().toISOString();
+  const eventId = createRequestId();
+  const requestSummary = toMirrorBodySummary(requestBody);
+  const responseSummary = toMirrorBodySummary(responseBody);
+  const event = {
+    event_id: eventId,
+    idempotency_key: eventId,
+    source: 'data-api-worker',
+    occurred_at: occurredAt,
+    mirrored_at: new Date().toISOString(),
+    user_id: sanitizeMirrorUserId(userId),
+    method: String(method || '').toUpperCase(),
+    path: String(path || '').trim(),
+    query_params: {},
+    request_headers: {
+      'x-request-id': String(requestId || '').trim() || null
+    },
+    request_content_type: 'application/json',
+    request_body_json: requestSummary.json,
+    request_body_text: requestSummary.text,
+    request_body_bytes: requestSummary.bytes,
+    response_status: Number(status || 0) || 0,
+    response_content_type: 'application/json',
+    response_body_json: responseSummary.json,
+    response_body_text: responseSummary.text,
+    response_body_bytes: responseSummary.bytes,
+    retry_count: 0
+  };
+
+  const abortController = new AbortController();
+  const timeoutId = setTimeout(() => abortController.abort(), config.timeoutMs);
+  try {
+    const response = await fetch(buildSupabaseMirrorUrl(config), {
+      method: 'POST',
+      headers: {
+        apikey: config.serviceRoleKey,
+        authorization: `Bearer ${config.serviceRoleKey}`,
+        'content-type': 'application/json',
+        prefer: 'resolution=merge-duplicates,return=minimal'
+      },
+      body: JSON.stringify([event]),
+      signal: abortController.signal
+    });
+    if (!response.ok) {
+      const responseText = await response.text().catch(() => '');
+      console.warn(`[api][${requestId || 'no-request-id'}] supabase mirror write failed (${response.status}): ${responseText.slice(0, 300)}`);
+      return false;
+    }
+    return true;
+  } catch (error) {
+    const message = error?.name === 'AbortError'
+      ? 'supabase mirror write timed out'
+      : `supabase mirror request failed: ${String(error?.message || error || 'unknown')}`;
+    console.warn(`[api][${requestId || 'no-request-id'}] ${message}`);
+    return false;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function queueSupabaseMirrorWrite({
+  executionContext = null,
+  env,
+  path = '',
+  method = 'POST',
+  userId = '',
+  requestId = '',
+  requestBody = null,
+  responseBody = null,
+  status = 200
+} = {}) {
+  const task = mirrorWriteEventToSupabase({
+    env,
+    path,
+    method,
+    userId,
+    requestId,
+    requestBody,
+    responseBody,
+    status
+  });
+  if (executionContext && typeof executionContext.waitUntil === 'function') {
+    executionContext.waitUntil(task);
+    return;
+  }
+  void task;
+}
+
 function getAccountLinkRateLimitPolicy(env, kind = 'read') {
   const normalizedKind = kind === 'mutation' ? 'mutation' : 'read';
   const defaults = DEFAULT_ACCOUNT_LINK_RATE_LIMITS[normalizedKind];
@@ -3296,7 +3485,7 @@ async function handleMarkAccountChatReady({ request, env, corsOrigin, verifyIdTo
   }, corsOrigin, { 'x-request-id': requestId });
 }
 
-async function handleResetAccountData({ request, env, corsOrigin, verifyIdToken, requestId }) {
+async function handleResetAccountData({ request, env, corsOrigin, verifyIdToken, requestId, executionContext = null }) {
   assertStorageConfigured(env, corsOrigin);
   const body = await parseJsonBody(request, corsOrigin, requestId);
   const url = new URL(request.url);
@@ -3366,12 +3555,24 @@ async function handleResetAccountData({ request, env, corsOrigin, verifyIdToken,
     }
   }
 
-  return jsonResponse(200, {
+  const responsePayload = {
     ok: true,
     userId: authContext.userId,
     email: canonicalEmail,
     deleted
-  }, corsOrigin, { 'x-request-id': requestId });
+  };
+  queueSupabaseMirrorWrite({
+    executionContext,
+    env,
+    path: '/account/reset',
+    method: request.method,
+    userId: authContext.userId,
+    requestId,
+    requestBody: body,
+    responseBody: responsePayload,
+    status: 200
+  });
+  return jsonResponse(200, responsePayload, corsOrigin, { 'x-request-id': requestId });
 }
 
 async function handlePullLinkedSharedFeed({ request, env, corsOrigin, verifyIdToken, requestId }) {
@@ -3521,7 +3722,7 @@ async function handlePullLinkedSharedFeed({ request, env, corsOrigin, verifyIdTo
   }, corsOrigin, { 'x-request-id': requestId });
 }
 
-async function handleListSyncPush({ request, env, corsOrigin, verifyIdToken, requestId }) {
+async function handleListSyncPush({ request, env, corsOrigin, verifyIdToken, requestId, executionContext = null }) {
   assertD1Configured(env, corsOrigin);
   const body = await parseJsonBody(request, corsOrigin, requestId);
   const userId = normalizeUserId(body?.userId);
@@ -3540,7 +3741,19 @@ async function handleListSyncPush({ request, env, corsOrigin, verifyIdToken, req
 
   const operations = Array.isArray(body?.operations) ? body.operations : [];
   if (!operations.length) {
-    return jsonResponse(200, { ok: true, processed: 0, cursorMs: parseSinceMs(body?.cursorMs) }, corsOrigin, { 'x-request-id': requestId });
+    const responsePayload = { ok: true, processed: 0, cursorMs: parseSinceMs(body?.cursorMs) };
+    queueSupabaseMirrorWrite({
+      executionContext,
+      env,
+      path: '/sync/lists/push',
+      method: request.method,
+      userId,
+      requestId,
+      requestBody: body,
+      responseBody: responsePayload,
+      status: 200
+    });
+    return jsonResponse(200, responsePayload, corsOrigin, { 'x-request-id': requestId });
   }
   if (operations.length > 1000) {
     return errorResponse(400, {
@@ -3581,7 +3794,19 @@ async function handleListSyncPush({ request, env, corsOrigin, verifyIdToken, req
     }
   }
 
-  return jsonResponse(200, { ok: true, processed, cursorMs }, corsOrigin, { 'x-request-id': requestId });
+  const responsePayload = { ok: true, processed, cursorMs };
+  queueSupabaseMirrorWrite({
+    executionContext,
+    env,
+    path: '/sync/lists/push',
+    method: request.method,
+    userId,
+    requestId,
+    requestBody: body,
+    responseBody: responsePayload,
+    status: 200
+  });
+  return jsonResponse(200, responsePayload, corsOrigin, { 'x-request-id': requestId });
 }
 
 async function handleListSyncPull({ request, env, corsOrigin, verifyIdToken, requestId }) {
@@ -3655,7 +3880,7 @@ async function handleListSyncPull({ request, env, corsOrigin, verifyIdToken, req
   }, corsOrigin, { 'x-request-id': requestId });
 }
 
-async function handleSectorSyncPush({ request, env, corsOrigin, verifyIdToken, requestId }) {
+async function handleSectorSyncPush({ request, env, corsOrigin, verifyIdToken, requestId, executionContext = null }) {
   assertD1Configured(env, corsOrigin);
   const body = await parseJsonBody(request, corsOrigin, requestId);
   const userId = normalizeUserId(body?.userId);
@@ -3675,13 +3900,25 @@ async function handleSectorSyncPush({ request, env, corsOrigin, verifyIdToken, r
   const operations = Array.isArray(body?.operations) ? body.operations : [];
   if (!operations.length) {
     const state = await readUserSyncState({ db: getD1Database(env), userId });
-    return jsonResponse(200, {
+    const responsePayload = {
       ok: true,
       processed: 0,
       cursorMs: parseSinceMs(body?.cursorMs),
       rejected: [],
       state
-    }, corsOrigin, { 'x-request-id': requestId });
+    };
+    queueSupabaseMirrorWrite({
+      executionContext,
+      env,
+      path: '/sync/sectors/push',
+      method: request.method,
+      userId,
+      requestId,
+      requestBody: body,
+      responseBody: responsePayload,
+      status: 200
+    });
+    return jsonResponse(200, responsePayload, corsOrigin, { 'x-request-id': requestId });
   }
   if (operations.length > 1000) {
     return errorResponse(400, {
@@ -3738,13 +3975,25 @@ async function handleSectorSyncPush({ request, env, corsOrigin, verifyIdToken, r
   }
 
   const state = await readUserSyncState({ db, userId });
-  return jsonResponse(200, {
+  const responsePayload = {
     ok: true,
     processed,
     cursorMs,
     rejected: [],
     state
-  }, corsOrigin, { 'x-request-id': requestId });
+  };
+  queueSupabaseMirrorWrite({
+    executionContext,
+    env,
+    path: '/sync/sectors/push',
+    method: request.method,
+    userId,
+    requestId,
+    requestBody: body,
+    responseBody: responsePayload,
+    status: 200
+  });
+  return jsonResponse(200, responsePayload, corsOrigin, { 'x-request-id': requestId });
 }
 
 async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, requestId }) {
@@ -3837,7 +4086,7 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
   }, corsOrigin, { 'x-request-id': requestId });
 }
 
-async function handleSectorSyncBootstrap({ request, env, corsOrigin, verifyIdToken, requestId }) {
+async function handleSectorSyncBootstrap({ request, env, corsOrigin, verifyIdToken, requestId, executionContext = null }) {
   assertD1Configured(env, corsOrigin);
   const body = await parseJsonBody(request, corsOrigin, requestId);
   const userId = normalizeUserId(body?.userId);
@@ -3857,13 +4106,25 @@ async function handleSectorSyncBootstrap({ request, env, corsOrigin, verifyIdTok
   const db = getD1Database(env);
   const currentState = await readUserSyncState({ db, userId });
   if (currentState.migratedAtMs) {
-    return jsonResponse(200, {
+    const responsePayload = {
       ok: true,
       skipped: true,
       processed: 0,
       cursorMs: currentState.migratedAtMs,
       state: currentState
-    }, corsOrigin, { 'x-request-id': requestId });
+    };
+    queueSupabaseMirrorWrite({
+      executionContext,
+      env,
+      path: '/sync/sectors/bootstrap',
+      method: request.method,
+      userId,
+      requestId,
+      requestBody: body,
+      responseBody: responsePayload,
+      status: 200
+    });
+    return jsonResponse(200, responsePayload, corsOrigin, { 'x-request-id': requestId });
   }
 
   const operations = Array.isArray(body?.operations) ? body.operations : [];
@@ -3916,13 +4177,25 @@ async function handleSectorSyncBootstrap({ request, env, corsOrigin, verifyIdTok
     updatedAtMs: migratedAtMs
   });
   const state = await readUserSyncState({ db, userId });
-  return jsonResponse(200, {
+  const responsePayload = {
     ok: true,
     skipped: false,
     processed,
     cursorMs: Math.max(cursorMs, migratedAtMs),
     state
-  }, corsOrigin, { 'x-request-id': requestId });
+  };
+  queueSupabaseMirrorWrite({
+    executionContext,
+    env,
+    path: '/sync/sectors/bootstrap',
+    method: request.method,
+    userId,
+    requestId,
+    requestBody: body,
+    responseBody: responsePayload,
+    status: 200
+  });
+  return jsonResponse(200, responsePayload, corsOrigin, { 'x-request-id': requestId });
 }
 
 async function purgeExpiredTombstones({ env, retentionDays = TOMBSTONE_RETENTION_DAYS }) {
@@ -4044,7 +4317,7 @@ async function handleGetSnapshot({ request, env, corsOrigin, verifyIdToken, requ
   return textResponse(200, value, corsOrigin, { 'x-request-id': requestId });
 }
 
-async function handleSaveSnapshot({ request, env, corsOrigin, verifyIdToken, requestId }) {
+async function handleSaveSnapshot({ request, env, corsOrigin, verifyIdToken, requestId, executionContext = null }) {
   assertStorageConfigured(env, corsOrigin);
   const body = await parseJsonBody(request, corsOrigin, requestId);
   const userId = normalizeUserId(body?.userId);
@@ -4074,17 +4347,30 @@ async function handleSaveSnapshot({ request, env, corsOrigin, verifyIdToken, req
 
   const result = await persistSnapshot({ env, userId, snapshot: payload, corsOrigin });
 
-  return jsonResponse(200, {
+  const responsePayload = {
     ok: true,
     saved: true,
     bytes: result?.bytes || 0
-  }, corsOrigin, { 'x-request-id': requestId });
+  };
+  queueSupabaseMirrorWrite({
+    executionContext,
+    env,
+    path: '/',
+    method: request.method,
+    userId,
+    requestId,
+    requestBody: body,
+    responseBody: responsePayload,
+    status: 200
+  });
+  return jsonResponse(200, responsePayload, corsOrigin, { 'x-request-id': requestId });
 }
 
 function buildHealthPayload(env) {
   const hasD1 = Boolean(getD1Database(env));
   const hasKv = Boolean(getKvNamespace(env));
   const hasR2 = Boolean(getR2Bucket(env));
+  const supabaseMirror = resolveSupabaseMirrorConfig(env);
   return {
     ok: true,
     service: 'data-api',
@@ -4095,6 +4381,16 @@ function buildHealthPayload(env) {
       r2: hasR2,
       snapshotStorageReady: hasD1 || hasKv,
       syncStorageReady: hasD1
+    },
+    mirrors: {
+      supabase: {
+        enabled: supabaseMirror.enabled === true,
+        active: supabaseMirror.active === true,
+        projectConfigured: Boolean(supabaseMirror.projectUrl),
+        serviceRoleConfigured: Boolean(supabaseMirror.serviceRoleKey),
+        table: supabaseMirror.table,
+        timeoutMs: supabaseMirror.timeoutMs
+      }
     },
     endpoints: [
       { id: 'login_gate', method: 'GET', path: '/?userId=<uid>', expectedStatuses: [200, 401, 404] },
@@ -4117,7 +4413,7 @@ async function handleHealthCheck({ env, corsOrigin }) {
 
 export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOrigins = DEFAULT_ALLOWED_ORIGINS } = {}) {
   return {
-    async fetch(request, env) {
+    async fetch(request, env, ctx) {
       const url = new URL(request.url);
       const origin = request.headers.get('origin');
       const corsOrigin = origin && allowedOrigins.has(origin) ? origin : '';
@@ -4182,11 +4478,25 @@ export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOri
         }
 
         if (request.method === 'POST' && url.pathname === '/account/reset') {
-          return await handleResetAccountData({ request, env, corsOrigin, verifyIdToken, requestId });
+          return await handleResetAccountData({
+            request,
+            env,
+            corsOrigin,
+            verifyIdToken,
+            requestId,
+            executionContext: ctx
+          });
         }
 
         if (request.method === 'POST' && url.pathname === '/sync/sectors/push') {
-          return await handleSectorSyncPush({ request, env, corsOrigin, verifyIdToken, requestId });
+          return await handleSectorSyncPush({
+            request,
+            env,
+            corsOrigin,
+            verifyIdToken,
+            requestId,
+            executionContext: ctx
+          });
         }
 
         if (request.method === 'GET' && url.pathname === '/sync/sectors/pull') {
@@ -4194,11 +4504,25 @@ export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOri
         }
 
         if (request.method === 'POST' && url.pathname === '/sync/sectors/bootstrap') {
-          return await handleSectorSyncBootstrap({ request, env, corsOrigin, verifyIdToken, requestId });
+          return await handleSectorSyncBootstrap({
+            request,
+            env,
+            corsOrigin,
+            verifyIdToken,
+            requestId,
+            executionContext: ctx
+          });
         }
 
         if (request.method === 'POST' && url.pathname === '/sync/lists/push') {
-          return await handleListSyncPush({ request, env, corsOrigin, verifyIdToken, requestId });
+          return await handleListSyncPush({
+            request,
+            env,
+            corsOrigin,
+            verifyIdToken,
+            requestId,
+            executionContext: ctx
+          });
         }
 
         if (request.method === 'GET' && url.pathname === '/sync/lists/pull') {
@@ -4227,7 +4551,14 @@ export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOri
         }
 
         if (request.method === 'POST') {
-          return await handleSaveSnapshot({ request, env, corsOrigin, verifyIdToken, requestId });
+          return await handleSaveSnapshot({
+            request,
+            env,
+            corsOrigin,
+            verifyIdToken,
+            requestId,
+            executionContext: ctx
+          });
         }
 
         return errorResponse(405, {
