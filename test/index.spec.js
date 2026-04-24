@@ -2028,6 +2028,7 @@ describe('data api', () => {
         userId: USER_ID,
         targetEmail: 'bob@example.com',
         shareScopes: {
+          continueWatching: true,
           favorites: true,
           watchLater: true,
           secretChat: true
@@ -2080,6 +2081,16 @@ describe('data api', () => {
             payload: { key: 'tmdb:movie:11', title: 'Later Movie', updatedAt: 1726000000100 }
           },
           {
+            sectorKey: 'tv_progress',
+            itemKey: 'bilm-tv-progress-tmdb-101',
+            updatedAtMs: 1726000000150,
+            deleted: false,
+            payload: {
+              storageKey: 'bilm-tv-progress-tmdb-101',
+              value: JSON.stringify({ season: 2, episode: 5 })
+            }
+          },
+          {
             sectorKey: 'chat_messages',
             itemKey: 'chat:1',
             updatedAtMs: 1726000000200,
@@ -2097,7 +2108,9 @@ describe('data api', () => {
     expect(feedResponse.status).toBe(200);
     const feed = await feedResponse.json();
     expect(feed.linkSignature).toContain(linkId);
-    expect(feed.operations.map((operation) => operation.sectorKey)).toEqual(['favorites', 'watch_later']);
+    const sharedSectors = feed.operations.map((operation) => operation.sectorKey);
+    expect(sharedSectors).toEqual(expect.arrayContaining(['favorites', 'watch_later', 'tv_progress']));
+    expect(sharedSectors).toHaveLength(3);
     expect(feed.operations.some((operation) => operation.sectorKey === 'chat_messages')).toBe(false);
   });
 

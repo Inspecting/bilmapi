@@ -522,7 +522,7 @@ const ACCOUNT_LINK_SCOPE_KEYS = Object.freeze([
   'searchHistory'
 ]);
 const ACCOUNT_LINK_SCOPE_TO_SECTORS = Object.freeze({
-  continueWatching: ['continue_watching'],
+  continueWatching: ['continue_watching', 'tv_progress'],
   favorites: ['favorites'],
   watchLater: ['watch_later'],
   watchHistory: ['watch_history'],
