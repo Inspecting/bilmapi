@@ -3,6 +3,9 @@
 
 FIREBASE_PROJECT_ID=bilm-7bfe1
 BILM_DISABLE_AUTH=false
+# Optional temporary bypass secret for local-only testing.
+# Auth bypass is disabled unless BOTH BILM_DISABLE_AUTH=true and this token is set.
+BILM_AUTH_BYPASS_TOKEN=replace-with-local-bypass-token
 
 # Supabase mirror config (data-api backend)
 # Either SUPABASE_PROJECT_URL or SUPABASE_URL works in this codebase.

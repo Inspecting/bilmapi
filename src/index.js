@@ -537,6 +537,7 @@ const DEFAULT_ACCOUNT_LINK_SCOPES = Object.freeze({
 });
 
 const firebaseJwks = createRemoteJWKSet(new URL(FIREBASE_JWKS_URL));
+let authBypassWarningLogged = false;
 
 function getProjectId(env) {
   return String(env?.FIREBASE_PROJECT_ID || DEFAULT_PROJECT_ID).trim() || DEFAULT_PROJECT_ID;
@@ -559,14 +560,39 @@ function getR2Bucket(env) {
     : null;
 }
 
+function parseBooleanFlag(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
+}
+
+function secureCompareStrings(left, right) {
+  const leftValue = String(left || '');
+  const rightValue = String(right || '');
+  if (!leftValue || leftValue.length !== rightValue.length) return false;
+  let mismatch = 0;
+  for (let index = 0; index < leftValue.length; index += 1) {
+    mismatch |= leftValue.charCodeAt(index) ^ rightValue.charCodeAt(index);
+  }
+  return mismatch === 0;
+}
+
 function isAuthTemporarilyDisabled(env, request = null) {
-  const envFlag = String(env?.BILM_DISABLE_AUTH || '').trim().toLowerCase();
-  const envEnabled = envFlag === '1' || envFlag === 'true' || envFlag === 'yes' || envFlag === 'on';
+  const envEnabled = parseBooleanFlag(env?.BILM_DISABLE_AUTH);
   if (!envEnabled) return false;
-  if (!request) return true;
-  const headerValue = String(request?.headers?.get?.('x-bilm-auth-bypass') || '').trim().toLowerCase();
-  if (!headerValue) return true;
-  return headerValue === '1' || headerValue === 'true' || headerValue === 'yes' || headerValue === 'on';
+
+  const bypassToken = String(env?.BILM_AUTH_BYPASS_TOKEN || '').trim();
+  if (!bypassToken) {
+    if (!authBypassWarningLogged) {
+      console.warn('BILM_DISABLE_AUTH was set but BILM_AUTH_BYPASS_TOKEN is missing. Auth bypass remains disabled.');
+      authBypassWarningLogged = true;
+    }
+    return false;
+  }
+
+  if (!request) return false;
+  const headerValue = String(request?.headers?.get?.('x-bilm-auth-bypass') || '').trim();
+  if (!headerValue) return false;
+  return secureCompareStrings(headerValue, bypassToken);
 }
 
 function normalizeUserId(value) {
@@ -575,7 +601,7 @@ function normalizeUserId(value) {
 
 function isValidUserId(userId) {
   const normalized = normalizeUserId(userId);
-  return normalized.length >= 25 && normalized.length <= 30;
+  return /^[a-zA-Z0-9]{25,30}$/.test(normalized);
 }
 
 function normalizeEmail(value) {
@@ -721,7 +747,7 @@ function createCorsHeaders(corsOrigin = '') {
   return {
     'Access-Control-Allow-Origin': corsOrigin,
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-admin-token',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-admin-token, x-bilm-auth-bypass',
     'Access-Control-Max-Age': '86400',
     'Vary': 'Origin'
   };

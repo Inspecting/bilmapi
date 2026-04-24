@@ -691,7 +691,8 @@ function createEnv({
   kv = new MemoryKv(),
   d1 = new MemoryD1(),
   r2 = new MemoryR2(),
-  disableAuth = false
+  disableAuth = false,
+  authBypassToken = 'test-auth-bypass-token'
 } = {}) {
   return {
     BILM_DATA: kv,
@@ -700,6 +701,7 @@ function createEnv({
     FIREBASE_PROJECT_ID: 'bilm-7bfe1',
     BILM_ADMIN_TOKEN: 'top-secret-token',
     BILM_DISABLE_AUTH: disableAuth ? 'true' : 'false',
+    BILM_AUTH_BYPASS_TOKEN: String(authBypassToken || ''),
     TMDB_API_KEY: 'tmdb-test-key',
     TMDB_READ_ACCESS_TOKEN: '',
     OMDB_API_KEY: 'omdb-test-key'
@@ -1562,7 +1564,10 @@ describe('data api', () => {
     const bypassEnv = createEnv({ kv, d1, disableAuth: true });
     const response = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        'x-bilm-auth-bypass': 'test-auth-bypass-token'
+      },
       body: JSON.stringify({
         userId: USER_ID,
         operations: [
