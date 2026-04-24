@@ -1,0 +1,14 @@
+# Copy this file to `.dev.vars` for local Wrangler dev.
+# Do not commit real secrets.
+
+FIREBASE_PROJECT_ID=bilm-7bfe1
+BILM_DISABLE_AUTH=false
+
+# Supabase mirror config (data-api backend)
+# Either SUPABASE_PROJECT_URL or SUPABASE_URL works in this codebase.
+SUPABASE_PROJECT_URL=https://veoydbjuggetxwfgryzc.supabase.co
+SUPABASE_URL=https://veoydbjuggetxwfgryzc.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=sb_secret_********************
+SUPABASE_MIRROR_ENABLED=true
+SUPABASE_MIRROR_TABLE=cloudflare_mirror_events
+SUPABASE_MIRROR_TIMEOUT_MS=10000

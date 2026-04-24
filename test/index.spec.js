@@ -1957,7 +1957,7 @@ describe('data api', () => {
     expect((await second.json()).code).toBe('requester_link_conflict');
   });
 
-  it('rejects account-link requests when target email is unknown', async () => {
+  it('allows account-link requests when target email is not yet indexed in capabilities', async () => {
     const response = await worker.fetch(new Request('https://data-api.watchbilm.org/links/request', {
       method: 'POST',
       headers: {
@@ -1971,9 +1971,40 @@ describe('data api', () => {
       })
     }), env);
 
-    expect(response.status).toBe(404);
+    expect(response.status).toBe(200);
     const body = await response.json();
-    expect(body.code).toBe('target_account_not_found');
+    expect(body.ok).toBe(true);
+    expect(body.accountFound).toBe(false);
+    expect(body.link.status).toBe('pending');
+    expect(body.link.partner.email).toBe('missing-user@example.com');
+  });
+
+  it('indexes capability from authenticated snapshot writes for account-link lookup', async () => {
+    const saveResponse = await worker.fetch(new Request('https://data-api.watchbilm.org/', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer other-token'
+      },
+      body: JSON.stringify({
+        userId: OTHER_USER_ID,
+        data: {
+          schema: 'bilm-backup-v1',
+          meta: { updatedAtMs: 1727000000000 },
+          localStorage: {}
+        }
+      })
+    }), env);
+    expect(saveResponse.status).toBe(200);
+
+    const lookupResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/links/target-capabilities?userId=${USER_ID}&email=bob@example.com`, {
+      headers: { authorization: 'Bearer valid-token' }
+    }), env);
+    expect(lookupResponse.status).toBe(200);
+    const payload = await lookupResponse.json();
+    expect(payload.ok).toBe(true);
+    expect(payload.accountFound).toBe(true);
+    expect(payload.canRequest).toBe(true);
   });
 
   it('approves links and shared-feed returns approved non-chat sectors with a signature', async () => {
@@ -2200,7 +2231,7 @@ describe('data api', () => {
     expect(missingResponse.status).toBe(200);
     const missingBody = await missingResponse.json();
     expect(missingBody.accountFound).toBe(false);
-    expect(missingBody.canRequest).toBe(false);
+    expect(missingBody.canRequest).toBe(true);
   });
 
   it('rate limits account-link endpoints per user', async () => {

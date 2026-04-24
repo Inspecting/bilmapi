@@ -450,6 +450,16 @@ const ACCOUNT_LINK_PENDING_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const ACCOUNT_LINK_RATE_LIMIT_STORE = new Map();
 let nextAccountLinkRateLimitSweepAtMs = 0;
 const ACCOUNT_LINK_RATE_LIMIT_STORE_SOFT_CAP = 5000;
+const SUPABASE_MIRROR_RUNTIME = {
+  attempted: 0,
+  succeeded: 0,
+  failed: 0,
+  lastAttemptAtMs: 0,
+  lastSuccessAtMs: 0,
+  lastFailureAtMs: 0,
+  lastFailureStatus: 0,
+  lastError: ''
+};
 const DEFAULT_ACCOUNT_LINK_RATE_LIMITS = Object.freeze({
   read: Object.freeze({ limit: 120, windowMs: 60_000 }),
   mutation: Object.freeze({ limit: 30, windowMs: 60_000 })
@@ -958,6 +968,13 @@ async function requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, us
     }, corsOrigin);
   }
 
+  await upsertAccountCapabilityFromAuthPayload({
+    env,
+    userId: normalizedUserId,
+    payload,
+    requestId
+  });
+
   return payload;
 }
 
@@ -1133,6 +1150,30 @@ function shouldMirrorToSupabase(pathname = '', method = 'GET', status = 0) {
   return false;
 }
 
+async function upsertAccountCapabilityFromAuthPayload({
+  env,
+  userId = '',
+  payload = null,
+  requestId = ''
+} = {}) {
+  const normalizedUserId = normalizeUserId(userId);
+  if (!isValidUserId(normalizedUserId)) return;
+  const email = canonicalizeEmailForMatching(payload?.email || '');
+  if (!isValidEmail(email)) return;
+  const db = getD1Database(env);
+  if (!db) return;
+
+  try {
+    await upsertAccountUserCapability({
+      db,
+      userId: normalizedUserId,
+      email
+    });
+  } catch (error) {
+    console.warn(`[api][${requestId || 'no-request-id'}] account capability upsert skipped: ${String(error?.message || error || 'unknown')}`);
+  }
+}
+
 async function mirrorWriteEventToSupabase({
   env,
   path = '',
@@ -1146,6 +1187,9 @@ async function mirrorWriteEventToSupabase({
   const config = resolveSupabaseMirrorConfig(env);
   if (!config.active) return false;
   if (!shouldMirrorToSupabase(path, method, status)) return false;
+
+  SUPABASE_MIRROR_RUNTIME.attempted += 1;
+  SUPABASE_MIRROR_RUNTIME.lastAttemptAtMs = Date.now();
 
   const occurredAt = new Date().toISOString();
   const eventId = createRequestId();
@@ -1193,14 +1237,26 @@ async function mirrorWriteEventToSupabase({
     if (!response.ok) {
       const responseText = await response.text().catch(() => '');
       console.warn(`[api][${requestId || 'no-request-id'}] supabase mirror write failed (${response.status}): ${responseText.slice(0, 300)}`);
+      SUPABASE_MIRROR_RUNTIME.failed += 1;
+      SUPABASE_MIRROR_RUNTIME.lastFailureAtMs = Date.now();
+      SUPABASE_MIRROR_RUNTIME.lastFailureStatus = Number(response.status || 0) || 0;
+      SUPABASE_MIRROR_RUNTIME.lastError = `HTTP ${response.status}: ${responseText.slice(0, 240)}`;
       return false;
     }
+    SUPABASE_MIRROR_RUNTIME.succeeded += 1;
+    SUPABASE_MIRROR_RUNTIME.lastSuccessAtMs = Date.now();
+    SUPABASE_MIRROR_RUNTIME.lastFailureStatus = 0;
+    SUPABASE_MIRROR_RUNTIME.lastError = '';
     return true;
   } catch (error) {
     const message = error?.name === 'AbortError'
       ? 'supabase mirror write timed out'
       : `supabase mirror request failed: ${String(error?.message || error || 'unknown')}`;
     console.warn(`[api][${requestId || 'no-request-id'}] ${message}`);
+    SUPABASE_MIRROR_RUNTIME.failed += 1;
+    SUPABASE_MIRROR_RUNTIME.lastFailureAtMs = Date.now();
+    SUPABASE_MIRROR_RUNTIME.lastFailureStatus = 0;
+    SUPABASE_MIRROR_RUNTIME.lastError = message;
     return false;
   } finally {
     clearTimeout(timeoutId);
@@ -3028,14 +3084,14 @@ async function handleGetAccountLinkTargetCapabilities({ request, env, corsOrigin
     db,
     email: targetEmail
   });
-  const accountFound = Boolean(targetCapability?.userId);
-  const targetBlocking = accountFound
-    ? await findBlockingAccountLink({
-      db,
-      userId: targetCapability.userId,
-      email: targetCapability.email || targetEmail
-    })
-    : null;
+  const resolvedTargetUserId = normalizeUserId(targetCapability?.userId);
+  const resolvedTargetEmail = canonicalizeEmailForMatching(targetCapability?.email || targetEmail) || targetEmail;
+  const accountFound = Boolean(resolvedTargetUserId);
+  const targetBlocking = await findBlockingAccountLink({
+    db,
+    userId: resolvedTargetUserId,
+    email: resolvedTargetEmail
+  });
 
   return jsonResponse(200, {
     ok: true,
@@ -3043,7 +3099,7 @@ async function handleGetAccountLinkTargetCapabilities({ request, env, corsOrigin
     accountFound,
     requesterBlocked: Boolean(requesterBlocking),
     targetBlocked: Boolean(targetBlocking),
-    canRequest: accountFound && !requesterBlocking && !targetBlocking
+    canRequest: !requesterBlocking && !targetBlocking
   }, corsOrigin, { 'x-request-id': requestId });
 }
 
@@ -3117,19 +3173,11 @@ async function handleCreateAccountLinkRequest({ request, env, corsOrigin, verify
     db,
     email: targetEmail
   });
-  if (!targetCapability?.userId) {
-    return errorResponse(404, {
-      error: 'target_account_not_found',
-      message: 'No account found for that email.',
-      retryable: false,
-      code: 'target_account_not_found',
-      requestId
-    }, corsOrigin);
-  }
+  const resolvedTargetUserId = normalizeUserId(targetCapability?.userId);
   const canonicalTargetEmail = canonicalizeEmailForMatching(targetCapability?.email || targetEmail);
   const targetBlocking = await findBlockingAccountLink({
     db,
-    userId: targetCapability.userId,
+    userId: resolvedTargetUserId,
     email: canonicalTargetEmail || targetEmail
   });
   if (targetBlocking) {
@@ -3148,7 +3196,7 @@ async function handleCreateAccountLinkRequest({ request, env, corsOrigin, verify
     status: ACCOUNT_LINK_STATUS_PENDING,
     requesterUserId: authContext.userId,
     requesterEmail: authContext.email,
-    targetUserId: targetCapability.userId,
+    targetUserId: resolvedTargetUserId || null,
     targetEmail: canonicalTargetEmail || targetEmail,
     requesterShareScopes,
     targetShareScopes: { ...DEFAULT_ACCOUNT_LINK_SCOPES },
@@ -3181,6 +3229,7 @@ async function handleCreateAccountLinkRequest({ request, env, corsOrigin, verify
   const saved = await readAccountLinkById({ db, linkId: link.id });
   return jsonResponse(200, {
     ok: true,
+    accountFound: Boolean(resolvedTargetUserId),
     link: formatAccountLinkForActor(saved || link, authContext.userId, authContext.email)
   }, corsOrigin, { 'x-request-id': requestId });
 }
@@ -4389,7 +4438,15 @@ function buildHealthPayload(env) {
         projectConfigured: Boolean(supabaseMirror.projectUrl),
         serviceRoleConfigured: Boolean(supabaseMirror.serviceRoleKey),
         table: supabaseMirror.table,
-        timeoutMs: supabaseMirror.timeoutMs
+        timeoutMs: supabaseMirror.timeoutMs,
+        writesAttempted: Number(SUPABASE_MIRROR_RUNTIME.attempted || 0) || 0,
+        writesSucceeded: Number(SUPABASE_MIRROR_RUNTIME.succeeded || 0) || 0,
+        writesFailed: Number(SUPABASE_MIRROR_RUNTIME.failed || 0) || 0,
+        lastAttemptAtMs: Number(SUPABASE_MIRROR_RUNTIME.lastAttemptAtMs || 0) || 0,
+        lastSuccessAtMs: Number(SUPABASE_MIRROR_RUNTIME.lastSuccessAtMs || 0) || 0,
+        lastFailureAtMs: Number(SUPABASE_MIRROR_RUNTIME.lastFailureAtMs || 0) || 0,
+        lastFailureStatus: Number(SUPABASE_MIRROR_RUNTIME.lastFailureStatus || 0) || 0,
+        lastError: String(SUPABASE_MIRROR_RUNTIME.lastError || '')
       }
     },
     endpoints: [
