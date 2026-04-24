@@ -458,7 +458,11 @@ const SUPABASE_MIRROR_RUNTIME = {
   lastSuccessAtMs: 0,
   lastFailureAtMs: 0,
   lastFailureStatus: 0,
-  lastError: ''
+  lastError: '',
+  lastProbeAtMs: 0,
+  lastProbeStatus: 0,
+  lastProbeOk: false,
+  lastProbeError: ''
 };
 const DEFAULT_ACCOUNT_LINK_RATE_LIMITS = Object.freeze({
   read: Object.freeze({ limit: 120, windowMs: 60_000 }),
@@ -503,6 +507,8 @@ const DEFAULT_ALLOWED_ORIGINS = new Set([
   'https://bilm-backend.reidmhit.workers.dev'
 ]);
 const MAX_SNAPSHOT_BYTES = 1500000;
+const SUPABASE_MIRROR_MAX_JSON_BYTES = 64_000;
+const SUPABASE_MIRROR_MAX_TEXT_CHARS = 120_000;
 const ACCOUNT_LINK_STATUS_PENDING = 'pending';
 const ACCOUNT_LINK_STATUS_ACTIVE = 'active';
 const ACCOUNT_LINK_STATUS_DECLINED = 'declined';
@@ -752,6 +758,33 @@ function createRequestId() {
     // no-op
   }
   return `req-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function createUuidV4() {
+  try {
+    if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  } catch {
+    // no-op
+  }
+  try {
+    if (globalThis.crypto?.getRandomValues) {
+      const bytes = new Uint8Array(16);
+      globalThis.crypto.getRandomValues(bytes);
+      bytes[6] = (bytes[6] & 0x0f) | 0x40;
+      bytes[8] = (bytes[8] & 0x3f) | 0x80;
+      const hex = [...bytes].map((value) => value.toString(16).padStart(2, '0')).join('');
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+    }
+  } catch {
+    // no-op
+  }
+  const fallback = () => Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, '0');
+  const part1 = fallback();
+  const part2 = fallback().slice(0, 4);
+  const part3 = `4${fallback().slice(1, 4)}`;
+  const part4 = `${(8 + Math.floor(Math.random() * 4)).toString(16)}${fallback().slice(1, 4)}`;
+  const part5 = `${fallback()}${fallback().slice(0, 4)}`;
+  return `${part1}-${part2}-${part3}-${part4}-${part5}`;
 }
 
 function errorResponse(status, {
@@ -1112,6 +1145,13 @@ function buildSupabaseMirrorUrl(config) {
   return url.toString();
 }
 
+function buildSupabaseMirrorProbeUrl(config) {
+  const url = new URL(`/rest/v1/${encodeURIComponent(config.table)}`, `${config.projectUrl}/`);
+  url.searchParams.set('select', 'event_id');
+  url.searchParams.set('limit', '1');
+  return url.toString();
+}
+
 function toMirrorBodySummary(value) {
   if (value === null || typeof value === 'undefined') {
     return { json: null, text: null, bytes: 0 };
@@ -1119,19 +1159,25 @@ function toMirrorBodySummary(value) {
   try {
     const serialized = typeof value === 'string' ? value : JSON.stringify(value);
     const bytes = calculateJsonBytes(serialized);
-    if (typeof value === 'object' && value && !Array.isArray(value)) {
+    if (typeof value === 'object' && value && !Array.isArray(value) && bytes <= SUPABASE_MIRROR_MAX_JSON_BYTES) {
       return { json: value, text: null, bytes };
     }
-    const parsed = safeParse(serialized, null);
-    if (parsed && typeof parsed === 'object') {
+    const parsed = bytes <= SUPABASE_MIRROR_MAX_JSON_BYTES
+      ? safeParse(serialized, null)
+      : null;
+    if (parsed && typeof parsed === 'object' && bytes <= SUPABASE_MIRROR_MAX_JSON_BYTES) {
       return { json: parsed, text: null, bytes };
     }
-    return { json: null, text: serialized.slice(0, 120_000), bytes };
+    return {
+      json: null,
+      text: serialized.slice(0, SUPABASE_MIRROR_MAX_TEXT_CHARS),
+      bytes
+    };
   } catch {
     const fallbackText = String(value || '');
     return {
       json: null,
-      text: fallbackText.slice(0, 120_000),
+      text: fallbackText.slice(0, SUPABASE_MIRROR_MAX_TEXT_CHARS),
       bytes: calculateJsonBytes(fallbackText)
     };
   }
@@ -1192,7 +1238,7 @@ async function mirrorWriteEventToSupabase({
   SUPABASE_MIRROR_RUNTIME.lastAttemptAtMs = Date.now();
 
   const occurredAt = new Date().toISOString();
-  const eventId = createRequestId();
+  const eventId = createUuidV4();
   const requestSummary = toMirrorBodySummary(requestBody);
   const responseSummary = toMirrorBodySummary(responseBody);
   const event = {
@@ -1258,6 +1304,70 @@ async function mirrorWriteEventToSupabase({
     SUPABASE_MIRROR_RUNTIME.lastFailureStatus = 0;
     SUPABASE_MIRROR_RUNTIME.lastError = message;
     return false;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function probeSupabaseMirrorConnection(env) {
+  const config = resolveSupabaseMirrorConfig(env);
+  const checkedAtMs = Date.now();
+  if (!config.active) {
+    SUPABASE_MIRROR_RUNTIME.lastProbeAtMs = checkedAtMs;
+    SUPABASE_MIRROR_RUNTIME.lastProbeStatus = 0;
+    SUPABASE_MIRROR_RUNTIME.lastProbeOk = false;
+    SUPABASE_MIRROR_RUNTIME.lastProbeError = 'supabase_mirror_inactive';
+    return {
+      checkedAtMs,
+      active: false,
+      ok: false,
+      status: 0,
+      error: 'supabase_mirror_inactive'
+    };
+  }
+
+  const abortController = new AbortController();
+  const timeoutId = setTimeout(() => abortController.abort(), config.timeoutMs);
+  try {
+    const response = await fetch(buildSupabaseMirrorProbeUrl(config), {
+      method: 'GET',
+      headers: {
+        apikey: config.serviceRoleKey,
+        authorization: `Bearer ${config.serviceRoleKey}`,
+        accept: 'application/json'
+      },
+      signal: abortController.signal
+    });
+    const ok = response.ok;
+    const status = Number(response.status || 0) || 0;
+    const responseText = ok ? '' : (await response.text().catch(() => ''));
+    const error = ok ? '' : `HTTP ${status}: ${responseText.slice(0, 240)}`;
+    SUPABASE_MIRROR_RUNTIME.lastProbeAtMs = checkedAtMs;
+    SUPABASE_MIRROR_RUNTIME.lastProbeStatus = status;
+    SUPABASE_MIRROR_RUNTIME.lastProbeOk = ok;
+    SUPABASE_MIRROR_RUNTIME.lastProbeError = error;
+    return {
+      checkedAtMs,
+      active: true,
+      ok,
+      status,
+      error
+    };
+  } catch (error) {
+    const message = error?.name === 'AbortError'
+      ? 'supabase_probe_timeout'
+      : `supabase_probe_failed: ${String(error?.message || error || 'unknown')}`;
+    SUPABASE_MIRROR_RUNTIME.lastProbeAtMs = checkedAtMs;
+    SUPABASE_MIRROR_RUNTIME.lastProbeStatus = 0;
+    SUPABASE_MIRROR_RUNTIME.lastProbeOk = false;
+    SUPABASE_MIRROR_RUNTIME.lastProbeError = message;
+    return {
+      checkedAtMs,
+      active: true,
+      ok: false,
+      status: 0,
+      error: message
+    };
   } finally {
     clearTimeout(timeoutId);
   }
@@ -4446,7 +4556,11 @@ function buildHealthPayload(env) {
         lastSuccessAtMs: Number(SUPABASE_MIRROR_RUNTIME.lastSuccessAtMs || 0) || 0,
         lastFailureAtMs: Number(SUPABASE_MIRROR_RUNTIME.lastFailureAtMs || 0) || 0,
         lastFailureStatus: Number(SUPABASE_MIRROR_RUNTIME.lastFailureStatus || 0) || 0,
-        lastError: String(SUPABASE_MIRROR_RUNTIME.lastError || '')
+        lastError: String(SUPABASE_MIRROR_RUNTIME.lastError || ''),
+        lastProbeAtMs: Number(SUPABASE_MIRROR_RUNTIME.lastProbeAtMs || 0) || 0,
+        lastProbeStatus: Number(SUPABASE_MIRROR_RUNTIME.lastProbeStatus || 0) || 0,
+        lastProbeOk: SUPABASE_MIRROR_RUNTIME.lastProbeOk === true,
+        lastProbeError: String(SUPABASE_MIRROR_RUNTIME.lastProbeError || '')
       }
     },
     endpoints: [
@@ -4464,8 +4578,27 @@ function buildHealthPayload(env) {
   };
 }
 
-async function handleHealthCheck({ env, corsOrigin }) {
-  return jsonResponse(200, buildHealthPayload(env), corsOrigin);
+async function handleHealthCheck({ request, env, corsOrigin }) {
+  const url = new URL(request.url);
+  const shouldProbe = (
+    String(url.searchParams.get('probe') || '').trim() === '1'
+    || String(url.searchParams.get('probe') || '').trim().toLowerCase() === 'true'
+  );
+  const health = buildHealthPayload(env);
+  if (!shouldProbe) {
+    return jsonResponse(200, health, corsOrigin);
+  }
+  const probe = await probeSupabaseMirrorConnection(env);
+  return jsonResponse(200, {
+    ...health,
+    mirrors: {
+      ...(health?.mirrors || {}),
+      supabase: {
+        ...(health?.mirrors?.supabase || {}),
+        probe
+      }
+    }
+  }, corsOrigin);
 }
 
 export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOrigins = DEFAULT_ALLOWED_ORIGINS } = {}) {
@@ -4489,7 +4622,7 @@ export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOri
 
       try {
         if (request.method === 'GET' && (url.pathname === '/health' || url.pathname === '/healthz')) {
-          return await handleHealthCheck({ env, corsOrigin });
+          return await handleHealthCheck({ request, env, corsOrigin });
         }
 
         if (url.pathname.startsWith('/media/')) {
