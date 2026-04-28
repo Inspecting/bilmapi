@@ -2269,6 +2269,77 @@ describe('data api', () => {
     expect((await second.json()).code).toBe('account_link_rate_limited');
   });
 
+  it('mirrors snapshot saves to supabase canonical profile and user-data tables', async () => {
+    env.SUPABASE_PROJECT_URL = 'https://example.supabase.co';
+    env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-role-key';
+    env.SUPABASE_MIRROR_ENABLED = 'true';
+    env.SUPABASE_CANONICAL_ENABLED = 'true';
+    env.SUPABASE_MIRROR_TABLE = 'cloudflare_mirror_events';
+    env.SUPABASE_CANONICAL_PROFILE_TABLE = 'bilm_profiles';
+    env.SUPABASE_CANONICAL_USER_DATA_TABLE = 'bilm_user_data';
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('', { status: 201 }));
+    const waiters = [];
+
+    const payload = {
+      schema: 'bilm-backup-v1',
+      meta: {
+        updatedAtMs: 1710000000000,
+        deviceId: 'device-canonical'
+      },
+      localStorage: {
+        'bilm-shared-chat': '[]'
+      }
+    };
+    const response = await worker.fetch(new Request(`https://data-api.watchbilm.org/?userId=${USER_ID}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token',
+        origin: ALLOWED_ORIGIN
+      },
+      body: JSON.stringify({ userId: USER_ID, data: payload })
+    }), env, {
+      waitUntil(promise) {
+        waiters.push(promise);
+      }
+    });
+
+    expect(response.status).toBe(200);
+    await Promise.allSettled(waiters);
+
+    const calledUrls = fetchSpy.mock.calls.map(([url]) => String(url));
+    expect(calledUrls.some((url) => url.includes('/rest/v1/cloudflare_mirror_events'))).toBe(true);
+    expect(calledUrls.some((url) => url.includes('/rest/v1/bilm_profiles'))).toBe(true);
+    expect(calledUrls.some((url) => url.includes('/rest/v1/bilm_user_data'))).toBe(true);
+
+    const canonicalWriteCall = fetchSpy.mock.calls.find(([url]) => String(url).includes('/rest/v1/bilm_user_data'));
+    expect(canonicalWriteCall).toBeTruthy();
+    const canonicalBody = JSON.parse(String(canonicalWriteCall[1]?.body || '[]'));
+    expect(Array.isArray(canonicalBody)).toBe(true);
+    expect(canonicalBody[0]?.user_id).toBe(USER_ID);
+    expect(canonicalBody[0]?.data_scope).toBe('snapshot');
+    expect(canonicalBody[0]?.data_group).toBe('snapshot');
+    expect(canonicalBody[0]?.data_key).toBe('snapshot');
+  });
+
+  it('purges deleted supabase canonical rows on scheduled run', async () => {
+    env.SUPABASE_PROJECT_URL = 'https://example.supabase.co';
+    env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-role-key';
+    env.SUPABASE_CANONICAL_ENABLED = 'true';
+    env.SUPABASE_CANONICAL_USER_DATA_TABLE = 'bilm_user_data';
+    env.SUPABASE_CANONICAL_DELETED_RETENTION_DAYS = '7';
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(null, { status: 204 }));
+
+    await worker.scheduled({}, env, {});
+
+    const deleteCall = fetchSpy.mock.calls.find(([, init]) => String(init?.method || '').toUpperCase() === 'DELETE');
+    expect(deleteCall).toBeTruthy();
+    const deleteUrl = String(deleteCall[0] || '');
+    expect(deleteUrl).toContain('/rest/v1/bilm_user_data');
+    expect(deleteUrl).toContain('deleted_at_ms=not.is.null');
+    expect(deleteUrl).toContain('deleted_at_ms=lt.');
+  });
+
   it('purges expired tombstones on scheduled run', async () => {
     d1.syncRows.set(`${USER_ID}|watch_history|movie:1`, {
       user_id: USER_ID,

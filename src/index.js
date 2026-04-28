@@ -437,6 +437,7 @@ const TV_PROGRESS_SECTOR_KEY = 'tv_progress';
 const UI_PREFS_SECTOR_KEY = 'ui_prefs';
 const SYNC_FUTURE_TIME_WINDOW_MS = 10 * 60 * 1000;
 const TOMBSTONE_RETENTION_DAYS = 30;
+const SUPABASE_CANONICAL_DELETED_RETENTION_DAYS = 7;
 const MEDIA_CACHE_R2_INLINE_THRESHOLD_BYTES = 96 * 1024;
 const MEDIA_REFRESH_LOCK_MS = 30 * 1000;
 const MEDIA_CACHE_PROFILE_MS = Object.freeze({
@@ -463,6 +464,23 @@ const SUPABASE_MIRROR_RUNTIME = {
   lastProbeStatus: 0,
   lastProbeOk: false,
   lastProbeError: ''
+};
+const SUPABASE_CANONICAL_RUNTIME = {
+  attempted: 0,
+  succeeded: 0,
+  failed: 0,
+  lastAttemptAtMs: 0,
+  lastSuccessAtMs: 0,
+  lastFailureAtMs: 0,
+  lastFailureStatus: 0,
+  lastError: '',
+  purgeAttempted: 0,
+  purgeSucceeded: 0,
+  purgeFailed: 0,
+  lastPurgeAtMs: 0,
+  lastPurgeCutoffMs: 0,
+  lastPurgeStatus: 0,
+  lastPurgeError: ''
 };
 const DEFAULT_ACCOUNT_LINK_RATE_LIMITS = Object.freeze({
   read: Object.freeze({ limit: 120, windowMs: 60_000 }),
@@ -1172,6 +1190,41 @@ function resolveSupabaseMirrorConfig(env) {
   };
 }
 
+function resolveSupabaseCanonicalConfig(env) {
+  const enabled = parseEnvBool(env, 'SUPABASE_CANONICAL_ENABLED', true);
+  const projectUrl = normalizeSupabaseProjectUrl(env?.SUPABASE_PROJECT_URL || env?.SUPABASE_URL || '');
+  const serviceRoleKey = String(env?.SUPABASE_SERVICE_ROLE_KEY || env?.SUPABASE_SERVICE_KEY || '').trim();
+  const profileTable = String(env?.SUPABASE_CANONICAL_PROFILE_TABLE || env?.SUPABASE_PROFILE_TABLE || 'bilm_profiles').trim().toLowerCase();
+  const userDataTable = String(env?.SUPABASE_CANONICAL_USER_DATA_TABLE || env?.SUPABASE_USER_DATA_TABLE || 'bilm_user_data').trim().toLowerCase();
+  const timeoutMs = parseEnvInt(env, 'SUPABASE_CANONICAL_TIMEOUT_MS', 10_000, { min: 1000, max: 60_000 });
+  const maxRetries = parseEnvInt(env, 'SUPABASE_CANONICAL_MAX_RETRIES', 2, { min: 0, max: 6 });
+  const retryBaseMs = parseEnvInt(env, 'SUPABASE_CANONICAL_RETRY_BASE_MS', 250, { min: 25, max: 5000 });
+  const retryJitterMs = parseEnvInt(env, 'SUPABASE_CANONICAL_RETRY_JITTER_MS', 100, { min: 0, max: 1500 });
+  const batchSize = parseEnvInt(env, 'SUPABASE_CANONICAL_BATCH_SIZE', 250, { min: 1, max: 1000 });
+  const deletedRetentionDays = parseEnvInt(
+    env,
+    'SUPABASE_CANONICAL_DELETED_RETENTION_DAYS',
+    SUPABASE_CANONICAL_DELETED_RETENTION_DAYS,
+    { min: 1, max: 90 }
+  );
+  const validProfileTable = /^[a-z0-9_.-]{1,128}$/i.test(profileTable);
+  const validUserDataTable = /^[a-z0-9_.-]{1,128}$/i.test(userDataTable);
+  return {
+    enabled,
+    active: enabled && Boolean(projectUrl && serviceRoleKey && validProfileTable && validUserDataTable),
+    projectUrl,
+    serviceRoleKey,
+    profileTable: validProfileTable ? profileTable : 'bilm_profiles',
+    userDataTable: validUserDataTable ? userDataTable : 'bilm_user_data',
+    timeoutMs,
+    maxRetries,
+    retryBaseMs,
+    retryJitterMs,
+    batchSize,
+    deletedRetentionDays
+  };
+}
+
 function buildSupabaseMirrorUrl(config) {
   const url = new URL(`/rest/v1/${encodeURIComponent(config.table)}`, `${config.projectUrl}/`);
   url.searchParams.set('on_conflict', 'event_id');
@@ -1182,6 +1235,24 @@ function buildSupabaseMirrorProbeUrl(config) {
   const url = new URL(`/rest/v1/${encodeURIComponent(config.table)}`, `${config.projectUrl}/`);
   url.searchParams.set('select', 'event_id');
   url.searchParams.set('limit', '1');
+  return url.toString();
+}
+
+function buildSupabaseTableUrl({ projectUrl = '', table = '', searchParams = null } = {}) {
+  const url = new URL(`/rest/v1/${encodeURIComponent(String(table || '').trim())}`, `${String(projectUrl || '').trim()}/`);
+  if (searchParams && typeof searchParams === 'object') {
+    Object.entries(searchParams).forEach(([key, value]) => {
+      if (value === null || typeof value === 'undefined' || value === '') return;
+      if (Array.isArray(value)) {
+        value.forEach((entry) => {
+          if (entry === null || typeof entry === 'undefined' || entry === '') return;
+          url.searchParams.append(key, String(entry));
+        });
+        return;
+      }
+      url.searchParams.set(key, String(value));
+    });
+  }
   return url.toString();
 }
 
@@ -1261,6 +1332,563 @@ async function waitForSupabaseMirrorRetry(delayMs = 0) {
     } catch {}
   }
   await new Promise((resolve) => setTimeout(resolve, safeDelayMs));
+}
+
+function shouldWriteCanonicalSupabase(pathname = '', method = 'GET', status = 0) {
+  const normalizedPath = String(pathname || '').trim();
+  const normalizedMethod = String(method || 'GET').trim().toUpperCase();
+  if (!(status >= 200 && status < 300)) return false;
+  if (normalizedMethod !== 'POST') return false;
+  if (normalizedPath === '/') return true;
+  if (normalizedPath === '/sync/lists/push') return true;
+  if (normalizedPath === '/sync/sectors/push') return true;
+  if (normalizedPath === '/sync/sectors/bootstrap') return true;
+  if (normalizedPath === '/account/reset') return true;
+  return false;
+}
+
+function normalizeCanonicalPayloadObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value;
+}
+
+function toCanonicalListOperation(rawOperation) {
+  const listKey = normalizeListKey(rawOperation?.listKey);
+  const itemKey = normalizeItemKey(rawOperation?.itemKey);
+  if (!isValidListKey(listKey) || !itemKey || itemKey.length > 255) return null;
+  const updatedAtMs = normalizeUpdatedAtMs(rawOperation?.updatedAtMs ?? rawOperation?.deletedAtMs ?? Date.now());
+  const deleted = rawOperation?.deleted === true || Number(rawOperation?.deletedAtMs || 0) > 0;
+  const payload = normalizeCanonicalPayloadObject(rawOperation?.payload ?? rawOperation?.item ?? rawOperation?.value ?? null);
+  if (!deleted && !payload) return null;
+  return {
+    listKey,
+    itemKey,
+    updatedAtMs,
+    deleted,
+    payload: deleted ? null : payload
+  };
+}
+
+function toCanonicalSectorOperation(rawOperation) {
+  const sectorKey = normalizeSectorKey(rawOperation?.sectorKey ?? rawOperation?.listKey);
+  const itemKey = normalizeItemKey(rawOperation?.itemKey);
+  if (!isValidSectorKey(sectorKey) || !itemKey || itemKey.length > 255) return null;
+  const updatedAtMs = normalizeUpdatedAtMs(rawOperation?.updatedAtMs ?? rawOperation?.deletedAtMs ?? Date.now());
+  const deleted = rawOperation?.deleted === true || Number(rawOperation?.deletedAtMs || 0) > 0;
+  const payload = normalizeCanonicalPayloadObject(rawOperation?.payload ?? rawOperation?.item ?? rawOperation?.value ?? null);
+  const opId = normalizeOperationId(rawOperation?.opId || rawOperation?.operationId || '');
+  if (!deleted && !payload) return null;
+  return {
+    sectorKey,
+    itemKey,
+    updatedAtMs,
+    deleted,
+    opId: opId || null,
+    payload: deleted ? null : payload
+  };
+}
+
+function createCanonicalProfileRow({
+  userId = '',
+  path = '',
+  metadata = null,
+  email = null
+} = {}) {
+  const nowIso = new Date().toISOString();
+  const normalizedEmail = canonicalizeEmailForMatching(email || '');
+  const row = {
+    user_id: userId,
+    source: 'data-api-worker',
+    last_path: String(path || '').trim() || '/',
+    last_seen_at: nowIso,
+    updated_at: nowIso,
+    metadata_json: metadata && typeof metadata === 'object' && !Array.isArray(metadata) ? metadata : {}
+  };
+  if (isValidEmail(normalizedEmail)) {
+    row.email = normalizedEmail;
+  }
+  return row;
+}
+
+function createCanonicalUserDataRow({
+  userId = '',
+  scope = '',
+  group = '',
+  key = '',
+  payload = null,
+  updatedAtMs = 0,
+  deletedAtMs = null,
+  sourcePath = '',
+  requestId = '',
+  opId = null
+} = {}) {
+  return {
+    user_id: userId,
+    data_scope: String(scope || '').trim() || 'unknown',
+    data_group: String(group || '').trim() || 'unknown',
+    data_key: String(key || '').trim() || 'unknown',
+    op_id: opId ? String(opId).slice(0, 120) : null,
+    payload_json: payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : null,
+    updated_at_ms: normalizeUpdatedAtMs(updatedAtMs || Date.now()),
+    deleted_at_ms: deletedAtMs === null || typeof deletedAtMs === 'undefined'
+      ? null
+      : normalizeUpdatedAtMs(deletedAtMs || Date.now()),
+    source_path: String(sourcePath || '').trim() || '/',
+    request_id: String(requestId || '').trim() || null,
+    source: 'data-api-worker',
+    updated_at: new Date().toISOString()
+  };
+}
+
+function shouldReplaceCanonicalUserDataRow(currentRow, nextRow) {
+  if (!currentRow) return true;
+  const currentUpdatedAtMs = Number(currentRow?.updated_at_ms || 0) || 0;
+  const nextUpdatedAtMs = Number(nextRow?.updated_at_ms || 0) || 0;
+  if (nextUpdatedAtMs > currentUpdatedAtMs) return true;
+  if (nextUpdatedAtMs < currentUpdatedAtMs) return false;
+  const currentDeletedAtMs = Number(currentRow?.deleted_at_ms || 0) || 0;
+  const nextDeletedAtMs = Number(nextRow?.deleted_at_ms || 0) || 0;
+  if (nextDeletedAtMs > currentDeletedAtMs) return true;
+  if (nextDeletedAtMs < currentDeletedAtMs) return false;
+  const currentOpId = String(currentRow?.op_id || '');
+  const nextOpId = String(nextRow?.op_id || '');
+  return nextOpId >= currentOpId;
+}
+
+function compactCanonicalUserDataRows(rows = []) {
+  const map = new Map();
+  rows.forEach((row) => {
+    if (!row) return;
+    const key = [
+      String(row?.user_id || '').trim(),
+      String(row?.data_scope || '').trim(),
+      String(row?.data_group || '').trim(),
+      String(row?.data_key || '').trim()
+    ].join('|');
+    if (!key.replace(/\|/g, '')) return;
+    const current = map.get(key);
+    if (shouldReplaceCanonicalUserDataRow(current, row)) {
+      map.set(key, row);
+    }
+  });
+  return [...map.values()];
+}
+
+function chunkRows(rows = [], size = 250) {
+  const normalizedSize = Math.max(1, Number(size || 1) || 1);
+  const chunks = [];
+  for (let index = 0; index < rows.length; index += normalizedSize) {
+    chunks.push(rows.slice(index, index + normalizedSize));
+  }
+  return chunks;
+}
+
+function buildCanonicalRowsFromRequest({
+  path = '',
+  userId = '',
+  requestId = '',
+  requestBody = null,
+  responseBody = null
+} = {}) {
+  const normalizedPath = String(path || '').trim();
+  const nowMs = Date.now();
+  const email = responseBody?.email || requestBody?.email || null;
+  const profileMetadata = {
+    requestId: String(requestId || '').trim() || null,
+    path: normalizedPath || '/',
+    atMs: nowMs
+  };
+  const profileRow = createCanonicalProfileRow({
+    userId,
+    path: normalizedPath,
+    metadata: profileMetadata,
+    email
+  });
+  const userDataRows = [];
+  let markAllDeletedAtMs = null;
+
+  if (normalizedPath === '/') {
+    const snapshot = extractSnapshotFromSaveBody(requestBody || {});
+    if (snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot)) {
+      userDataRows.push(createCanonicalUserDataRow({
+        userId,
+        scope: 'snapshot',
+        group: 'snapshot',
+        key: 'snapshot',
+        payload: snapshot,
+        updatedAtMs: snapshot?.meta?.updatedAtMs || nowMs,
+        deletedAtMs: null,
+        sourcePath: '/',
+        requestId
+      }));
+      profileRow.metadata_json = {
+        ...(profileRow.metadata_json || {}),
+        snapshotSchema: String(snapshot?.schema || '').trim() || null
+      };
+    }
+  } else if (normalizedPath === '/sync/lists/push') {
+    const operations = Array.isArray(requestBody?.operations) ? requestBody.operations : [];
+    operations.forEach((rawOperation) => {
+      const operation = toCanonicalListOperation(rawOperation);
+      if (!operation) return;
+      userDataRows.push(createCanonicalUserDataRow({
+        userId,
+        scope: 'list',
+        group: operation.listKey,
+        key: operation.itemKey,
+        payload: operation.payload,
+        updatedAtMs: operation.updatedAtMs,
+        deletedAtMs: operation.deleted ? operation.updatedAtMs : null,
+        sourcePath: normalizedPath,
+        requestId
+      }));
+    });
+  } else if (normalizedPath === '/sync/sectors/push' || normalizedPath === '/sync/sectors/bootstrap') {
+    const operations = Array.isArray(requestBody?.operations) ? requestBody.operations : [];
+    operations.forEach((rawOperation) => {
+      const operation = toCanonicalSectorOperation(rawOperation);
+      if (!operation) return;
+      userDataRows.push(createCanonicalUserDataRow({
+        userId,
+        scope: 'sector',
+        group: operation.sectorKey,
+        key: operation.itemKey,
+        payload: operation.payload,
+        updatedAtMs: operation.updatedAtMs,
+        deletedAtMs: operation.deleted ? operation.updatedAtMs : null,
+        sourcePath: normalizedPath,
+        requestId,
+        opId: operation.opId
+      }));
+    });
+  } else if (normalizedPath === '/account/reset') {
+    markAllDeletedAtMs = nowMs;
+    userDataRows.push(createCanonicalUserDataRow({
+      userId,
+      scope: 'account',
+      group: 'account',
+      key: 'reset',
+      payload: {
+        deleted: responseBody?.deleted || null
+      },
+      updatedAtMs: nowMs,
+      deletedAtMs: null,
+      sourcePath: normalizedPath,
+      requestId
+    }));
+  }
+
+  return {
+    profileRow,
+    userDataRows: compactCanonicalUserDataRows(userDataRows),
+    markAllDeletedAtMs
+  };
+}
+
+async function performSupabaseCanonicalRequest({
+  config,
+  url = '',
+  method = 'POST',
+  requestId = '',
+  body = null,
+  preferHeader = 'return=minimal'
+} = {}) {
+  const totalAttempts = Math.max(1, (Number(config?.maxRetries || 0) || 0) + 1);
+  let lastFailureStatus = 0;
+  let lastFailureMessage = 'supabase canonical request failed';
+  for (let attempt = 0; attempt < totalAttempts; attempt += 1) {
+    const attemptNumber = attempt + 1;
+    const abortController = new AbortController();
+    const timeoutId = setTimeout(() => abortController.abort(), Number(config?.timeoutMs || 10_000) || 10_000);
+    try {
+      const headers = {
+        apikey: String(config?.serviceRoleKey || ''),
+        authorization: `Bearer ${String(config?.serviceRoleKey || '')}`,
+        accept: 'application/json',
+        prefer: String(preferHeader || 'return=minimal')
+      };
+      if (body !== null && typeof body !== 'undefined') {
+        headers['content-type'] = 'application/json';
+      }
+      const response = await fetch(url, {
+        method: String(method || 'POST').toUpperCase(),
+        headers,
+        body: body === null || typeof body === 'undefined' ? undefined : JSON.stringify(body),
+        signal: abortController.signal
+      });
+      if (response.ok) {
+        return {
+          ok: true,
+          status: Number(response.status || 0) || 0,
+          error: ''
+        };
+      }
+      const responseText = await response.text().catch(() => '');
+      const statusCode = Number(response.status || 0) || 0;
+      lastFailureStatus = statusCode;
+      lastFailureMessage = `HTTP ${statusCode}: ${responseText.slice(0, 240)}`;
+      const canRetry = attemptNumber < totalAttempts && shouldRetrySupabaseMirrorStatus(statusCode);
+      if (!canRetry) break;
+      const delayMs = computeSupabaseMirrorRetryDelayMs({
+        attempt,
+        baseMs: config.retryBaseMs,
+        jitterMs: config.retryJitterMs
+      });
+      console.warn(`[api][${requestId || 'no-request-id'}] supabase canonical retry ${attemptNumber}/${totalAttempts - 1} after HTTP ${statusCode}`);
+      await waitForSupabaseMirrorRetry(delayMs);
+    } catch (error) {
+      lastFailureStatus = 0;
+      lastFailureMessage = error?.name === 'AbortError'
+        ? 'supabase canonical request timed out'
+        : `supabase canonical request failed: ${String(error?.message || error || 'unknown')}`;
+      const canRetry = attemptNumber < totalAttempts;
+      if (!canRetry) break;
+      const delayMs = computeSupabaseMirrorRetryDelayMs({
+        attempt,
+        baseMs: config.retryBaseMs,
+        jitterMs: config.retryJitterMs
+      });
+      console.warn(`[api][${requestId || 'no-request-id'}] supabase canonical retry ${attemptNumber}/${totalAttempts - 1} after error`);
+      await waitForSupabaseMirrorRetry(delayMs);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+  return {
+    ok: false,
+    status: lastFailureStatus,
+    error: lastFailureMessage
+  };
+}
+
+async function upsertSupabaseCanonicalRows({
+  config,
+  table = '',
+  rows = [],
+  onConflict = '',
+  requestId = ''
+} = {}) {
+  const normalizedRows = Array.isArray(rows) ? rows.filter((row) => row && typeof row === 'object') : [];
+  if (!normalizedRows.length) {
+    return { ok: true, status: 0, error: '' };
+  }
+  const chunks = chunkRows(normalizedRows, config.batchSize);
+  let lastStatus = 0;
+  let lastError = '';
+  for (const chunk of chunks) {
+    const result = await performSupabaseCanonicalRequest({
+      config,
+      url: buildSupabaseTableUrl({
+        projectUrl: config.projectUrl,
+        table,
+        searchParams: {
+          on_conflict: onConflict
+        }
+      }),
+      method: 'POST',
+      requestId,
+      body: chunk,
+      preferHeader: 'resolution=merge-duplicates,return=minimal,missing=default'
+    });
+    if (!result.ok) {
+      lastStatus = result.status;
+      lastError = result.error;
+      return {
+        ok: false,
+        status: lastStatus,
+        error: lastError
+      };
+    }
+    lastStatus = result.status;
+  }
+  return {
+    ok: true,
+    status: lastStatus,
+    error: ''
+  };
+}
+
+async function markSupabaseCanonicalRowsDeletedForUser({
+  config,
+  userId = '',
+  deletedAtMs = 0,
+  requestId = '',
+  sourcePath = '/account/reset'
+} = {}) {
+  const normalizedDeletedAtMs = normalizeUpdatedAtMs(deletedAtMs || Date.now());
+  const result = await performSupabaseCanonicalRequest({
+    config,
+    url: buildSupabaseTableUrl({
+      projectUrl: config.projectUrl,
+      table: config.userDataTable,
+      searchParams: {
+        user_id: `eq.${userId}`,
+        deleted_at_ms: 'is.null'
+      }
+    }),
+    method: 'PATCH',
+    requestId,
+    body: {
+      deleted_at_ms: normalizedDeletedAtMs,
+      source_path: sourcePath,
+      request_id: String(requestId || '').trim() || null,
+      source: 'data-api-worker',
+      updated_at: new Date().toISOString()
+    },
+    preferHeader: 'return=minimal'
+  });
+  return result;
+}
+
+async function mirrorCanonicalDataToSupabase({
+  env,
+  path = '',
+  method = 'POST',
+  userId = '',
+  requestId = '',
+  requestBody = null,
+  responseBody = null,
+  status = 200
+} = {}) {
+  const config = resolveSupabaseCanonicalConfig(env);
+  if (!config.active) return false;
+  if (!shouldWriteCanonicalSupabase(path, method, status)) return false;
+  const normalizedUserId = sanitizeMirrorUserId(userId);
+  if (!normalizedUserId) return false;
+
+  SUPABASE_CANONICAL_RUNTIME.attempted += 1;
+  SUPABASE_CANONICAL_RUNTIME.lastAttemptAtMs = Date.now();
+
+  const {
+    profileRow,
+    userDataRows,
+    markAllDeletedAtMs
+  } = buildCanonicalRowsFromRequest({
+    path,
+    userId: normalizedUserId,
+    requestId,
+    requestBody,
+    responseBody
+  });
+  let failedStatus = 0;
+  let failedMessage = '';
+
+  const profileResult = await upsertSupabaseCanonicalRows({
+    config,
+    table: config.profileTable,
+    rows: profileRow ? [profileRow] : [],
+    onConflict: 'user_id',
+    requestId
+  });
+  if (!profileResult.ok) {
+    failedStatus = profileResult.status;
+    failedMessage = profileResult.error || 'supabase canonical profile upsert failed';
+  }
+
+  if (!failedMessage && markAllDeletedAtMs) {
+    const markDeletedResult = await markSupabaseCanonicalRowsDeletedForUser({
+      config,
+      userId: normalizedUserId,
+      deletedAtMs: markAllDeletedAtMs,
+      requestId
+    });
+    if (!markDeletedResult.ok) {
+      failedStatus = markDeletedResult.status;
+      failedMessage = markDeletedResult.error || 'supabase canonical account reset delete mark failed';
+    }
+  }
+
+  if (!failedMessage && userDataRows.length) {
+    const userDataResult = await upsertSupabaseCanonicalRows({
+      config,
+      table: config.userDataTable,
+      rows: userDataRows,
+      onConflict: 'user_id,data_scope,data_group,data_key',
+      requestId
+    });
+    if (!userDataResult.ok) {
+      failedStatus = userDataResult.status;
+      failedMessage = userDataResult.error || 'supabase canonical user data upsert failed';
+    }
+  }
+
+  if (!failedMessage) {
+    SUPABASE_CANONICAL_RUNTIME.succeeded += 1;
+    SUPABASE_CANONICAL_RUNTIME.lastSuccessAtMs = Date.now();
+    SUPABASE_CANONICAL_RUNTIME.lastFailureStatus = 0;
+    SUPABASE_CANONICAL_RUNTIME.lastError = '';
+    return true;
+  }
+
+  SUPABASE_CANONICAL_RUNTIME.failed += 1;
+  SUPABASE_CANONICAL_RUNTIME.lastFailureAtMs = Date.now();
+  SUPABASE_CANONICAL_RUNTIME.lastFailureStatus = Number(failedStatus || 0) || 0;
+  SUPABASE_CANONICAL_RUNTIME.lastError = failedMessage;
+  console.warn(`[api][${requestId || 'no-request-id'}] ${failedMessage}`);
+  return false;
+}
+
+async function purgeExpiredSupabaseCanonicalRows({ env }) {
+  const config = resolveSupabaseCanonicalConfig(env);
+  const checkedAtMs = Date.now();
+  if (!config.active) {
+    return {
+      ok: false,
+      active: false,
+      checkedAtMs,
+      cutoffMs: null,
+      status: 0,
+      error: 'supabase_canonical_inactive'
+    };
+  }
+  const cutoffMs = checkedAtMs - (Math.max(1, Number(config.deletedRetentionDays || SUPABASE_CANONICAL_DELETED_RETENTION_DAYS)) * 24 * 60 * 60 * 1000);
+  SUPABASE_CANONICAL_RUNTIME.purgeAttempted += 1;
+  SUPABASE_CANONICAL_RUNTIME.lastPurgeAtMs = checkedAtMs;
+  SUPABASE_CANONICAL_RUNTIME.lastPurgeCutoffMs = cutoffMs;
+
+  const result = await performSupabaseCanonicalRequest({
+    config,
+    url: buildSupabaseTableUrl({
+      projectUrl: config.projectUrl,
+      table: config.userDataTable,
+      searchParams: {
+        deleted_at_ms: [
+          `not.is.null`,
+          `lt.${cutoffMs}`
+        ]
+      }
+    }),
+    method: 'DELETE',
+    requestId: 'scheduled-purge',
+    body: null,
+    preferHeader: 'return=minimal'
+  });
+
+  if (result.ok) {
+    SUPABASE_CANONICAL_RUNTIME.purgeSucceeded += 1;
+    SUPABASE_CANONICAL_RUNTIME.lastPurgeStatus = Number(result.status || 0) || 0;
+    SUPABASE_CANONICAL_RUNTIME.lastPurgeError = '';
+    return {
+      ok: true,
+      active: true,
+      checkedAtMs,
+      cutoffMs,
+      status: Number(result.status || 0) || 0,
+      error: ''
+    };
+  }
+
+  SUPABASE_CANONICAL_RUNTIME.purgeFailed += 1;
+  SUPABASE_CANONICAL_RUNTIME.lastPurgeStatus = Number(result.status || 0) || 0;
+  SUPABASE_CANONICAL_RUNTIME.lastPurgeError = String(result.error || 'supabase canonical purge failed');
+  return {
+    ok: false,
+    active: true,
+    checkedAtMs,
+    cutoffMs,
+    status: Number(result.status || 0) || 0,
+    error: String(result.error || 'supabase canonical purge failed')
+  };
 }
 
 async function upsertAccountCapabilityFromAuthPayload({
@@ -1486,7 +2114,7 @@ function queueSupabaseMirrorWrite({
   responseBody = null,
   status = 200
 } = {}) {
-  const task = mirrorWriteEventToSupabase({
+  const mirrorTask = mirrorWriteEventToSupabase({
     env,
     path,
     method,
@@ -1496,6 +2124,17 @@ function queueSupabaseMirrorWrite({
     responseBody,
     status
   });
+  const canonicalTask = mirrorCanonicalDataToSupabase({
+    env,
+    path,
+    method,
+    userId,
+    requestId,
+    requestBody,
+    responseBody,
+    status
+  });
+  const task = Promise.allSettled([mirrorTask, canonicalTask]);
   if (executionContext && typeof executionContext.waitUntil === 'function') {
     executionContext.waitUntil(task);
     return;
@@ -4692,6 +5331,7 @@ function buildHealthPayload(env) {
   const hasKv = Boolean(getKvNamespace(env));
   const hasR2 = Boolean(getR2Bucket(env));
   const supabaseMirror = resolveSupabaseMirrorConfig(env);
+  const supabaseCanonical = resolveSupabaseCanonicalConfig(env);
   return {
     ok: true,
     service: 'data-api',
@@ -4722,7 +5362,31 @@ function buildHealthPayload(env) {
         lastProbeAtMs: Number(SUPABASE_MIRROR_RUNTIME.lastProbeAtMs || 0) || 0,
         lastProbeStatus: Number(SUPABASE_MIRROR_RUNTIME.lastProbeStatus || 0) || 0,
         lastProbeOk: SUPABASE_MIRROR_RUNTIME.lastProbeOk === true,
-        lastProbeError: String(SUPABASE_MIRROR_RUNTIME.lastProbeError || '')
+        lastProbeError: String(SUPABASE_MIRROR_RUNTIME.lastProbeError || ''),
+        canonical: {
+          enabled: supabaseCanonical.enabled === true,
+          active: supabaseCanonical.active === true,
+          profileTable: supabaseCanonical.profileTable,
+          userDataTable: supabaseCanonical.userDataTable,
+          timeoutMs: supabaseCanonical.timeoutMs,
+          batchSize: supabaseCanonical.batchSize,
+          deletedRetentionDays: supabaseCanonical.deletedRetentionDays,
+          writesAttempted: Number(SUPABASE_CANONICAL_RUNTIME.attempted || 0) || 0,
+          writesSucceeded: Number(SUPABASE_CANONICAL_RUNTIME.succeeded || 0) || 0,
+          writesFailed: Number(SUPABASE_CANONICAL_RUNTIME.failed || 0) || 0,
+          lastAttemptAtMs: Number(SUPABASE_CANONICAL_RUNTIME.lastAttemptAtMs || 0) || 0,
+          lastSuccessAtMs: Number(SUPABASE_CANONICAL_RUNTIME.lastSuccessAtMs || 0) || 0,
+          lastFailureAtMs: Number(SUPABASE_CANONICAL_RUNTIME.lastFailureAtMs || 0) || 0,
+          lastFailureStatus: Number(SUPABASE_CANONICAL_RUNTIME.lastFailureStatus || 0) || 0,
+          lastError: String(SUPABASE_CANONICAL_RUNTIME.lastError || ''),
+          purgeAttempted: Number(SUPABASE_CANONICAL_RUNTIME.purgeAttempted || 0) || 0,
+          purgeSucceeded: Number(SUPABASE_CANONICAL_RUNTIME.purgeSucceeded || 0) || 0,
+          purgeFailed: Number(SUPABASE_CANONICAL_RUNTIME.purgeFailed || 0) || 0,
+          lastPurgeAtMs: Number(SUPABASE_CANONICAL_RUNTIME.lastPurgeAtMs || 0) || 0,
+          lastPurgeCutoffMs: Number(SUPABASE_CANONICAL_RUNTIME.lastPurgeCutoffMs || 0) || 0,
+          lastPurgeStatus: Number(SUPABASE_CANONICAL_RUNTIME.lastPurgeStatus || 0) || 0,
+          lastPurgeError: String(SUPABASE_CANONICAL_RUNTIME.lastPurgeError || '')
+        }
       }
     },
     endpoints: [
@@ -4993,6 +5657,11 @@ export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOri
         await purgeExpiredTombstones({ env });
       } catch (error) {
         console.error('scheduled tombstone purge failed:', error);
+      }
+      try {
+        await purgeExpiredSupabaseCanonicalRows({ env });
+      } catch (error) {
+        console.error('scheduled supabase canonical purge failed:', error);
       }
     }
   };
