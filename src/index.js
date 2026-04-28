@@ -1155,6 +1155,9 @@ function resolveSupabaseMirrorConfig(env) {
   const serviceRoleKey = String(env?.SUPABASE_SERVICE_ROLE_KEY || env?.SUPABASE_SERVICE_KEY || '').trim();
   const table = String(env?.SUPABASE_MIRROR_TABLE || 'cloudflare_mirror_events').trim().toLowerCase();
   const timeoutMs = parseEnvInt(env, 'SUPABASE_MIRROR_TIMEOUT_MS', 10_000, { min: 1000, max: 60_000 });
+  const maxRetries = parseEnvInt(env, 'SUPABASE_MIRROR_MAX_RETRIES', 2, { min: 0, max: 6 });
+  const retryBaseMs = parseEnvInt(env, 'SUPABASE_MIRROR_RETRY_BASE_MS', 250, { min: 25, max: 5000 });
+  const retryJitterMs = parseEnvInt(env, 'SUPABASE_MIRROR_RETRY_JITTER_MS', 100, { min: 0, max: 1500 });
   const validTable = /^[a-z0-9_.-]{1,128}$/i.test(table);
   return {
     enabled,
@@ -1162,7 +1165,10 @@ function resolveSupabaseMirrorConfig(env) {
     projectUrl,
     serviceRoleKey,
     table: validTable ? table : 'cloudflare_mirror_events',
-    timeoutMs
+    timeoutMs,
+    maxRetries,
+    retryBaseMs,
+    retryJitterMs
   };
 }
 
@@ -1221,6 +1227,40 @@ function shouldMirrorToSupabase(pathname = '', method = 'GET', status = 0) {
   if (normalizedPath.startsWith('/sync/sectors/')) return true;
   if (normalizedPath.startsWith('/links/')) return true;
   return false;
+}
+
+function shouldRetrySupabaseMirrorStatus(status = 0) {
+  const normalizedStatus = Number(status || 0) || 0;
+  if (normalizedStatus === 408) return true;
+  if (normalizedStatus === 409) return true;
+  if (normalizedStatus === 425) return true;
+  if (normalizedStatus === 429) return true;
+  if (normalizedStatus >= 500) return true;
+  return false;
+}
+
+function computeSupabaseMirrorRetryDelayMs({
+  attempt = 0,
+  baseMs = 250,
+  jitterMs = 0
+} = {}) {
+  const safeAttempt = Math.max(0, Number(attempt) || 0);
+  const boundedAttempt = Math.min(safeAttempt, 6);
+  const exponential = (Math.max(0, Number(baseMs) || 0)) * (2 ** boundedAttempt);
+  const jitter = Math.max(0, Math.floor(Math.random() * (Math.max(0, Number(jitterMs) || 0))));
+  return exponential + jitter;
+}
+
+async function waitForSupabaseMirrorRetry(delayMs = 0) {
+  const safeDelayMs = Math.max(0, Number(delayMs) || 0);
+  if (safeDelayMs <= 0) return;
+  if (globalThis.scheduler && typeof globalThis.scheduler.wait === 'function') {
+    try {
+      await globalThis.scheduler.wait(safeDelayMs);
+      return;
+    } catch {}
+  }
+  await new Promise((resolve) => setTimeout(resolve, safeDelayMs));
 }
 
 async function upsertAccountCapabilityFromAuthPayload({
@@ -1292,48 +1332,83 @@ async function mirrorWriteEventToSupabase({
     response_body_bytes: responseSummary.bytes,
     retry_count: 0
   };
+  const totalAttempts = Math.max(1, (Number(config.maxRetries || 0) || 0) + 1);
+  let lastFailureStatus = 0;
+  let lastFailureMessage = 'supabase mirror write failed';
 
-  const abortController = new AbortController();
-  const timeoutId = setTimeout(() => abortController.abort(), config.timeoutMs);
-  try {
-    const response = await fetch(buildSupabaseMirrorUrl(config), {
-      method: 'POST',
-      headers: {
-        apikey: config.serviceRoleKey,
-        authorization: `Bearer ${config.serviceRoleKey}`,
-        'content-type': 'application/json',
-        prefer: 'resolution=merge-duplicates,return=minimal'
-      },
-      body: JSON.stringify([event]),
-      signal: abortController.signal
-    });
-    if (!response.ok) {
+  for (let attempt = 0; attempt < totalAttempts; attempt += 1) {
+    const attemptNumber = attempt + 1;
+    event.retry_count = attempt;
+    const abortController = new AbortController();
+    const timeoutId = setTimeout(() => abortController.abort(), config.timeoutMs);
+    try {
+      const response = await fetch(buildSupabaseMirrorUrl(config), {
+        method: 'POST',
+        headers: {
+          apikey: config.serviceRoleKey,
+          authorization: `Bearer ${config.serviceRoleKey}`,
+          'content-type': 'application/json',
+          prefer: 'resolution=merge-duplicates,return=minimal'
+        },
+        body: JSON.stringify([event]),
+        signal: abortController.signal
+      });
+
+      if (response.ok) {
+        SUPABASE_MIRROR_RUNTIME.succeeded += 1;
+        SUPABASE_MIRROR_RUNTIME.lastSuccessAtMs = Date.now();
+        SUPABASE_MIRROR_RUNTIME.lastFailureStatus = 0;
+        SUPABASE_MIRROR_RUNTIME.lastError = '';
+        return true;
+      }
+
       const responseText = await response.text().catch(() => '');
-      console.warn(`[api][${requestId || 'no-request-id'}] supabase mirror write failed (${response.status}): ${responseText.slice(0, 300)}`);
-      SUPABASE_MIRROR_RUNTIME.failed += 1;
-      SUPABASE_MIRROR_RUNTIME.lastFailureAtMs = Date.now();
-      SUPABASE_MIRROR_RUNTIME.lastFailureStatus = Number(response.status || 0) || 0;
-      SUPABASE_MIRROR_RUNTIME.lastError = `HTTP ${response.status}: ${responseText.slice(0, 240)}`;
-      return false;
+      const statusCode = Number(response.status || 0) || 0;
+      lastFailureStatus = statusCode;
+      lastFailureMessage = `HTTP ${statusCode}: ${responseText.slice(0, 240)}`;
+
+      const canRetry = (attemptNumber < totalAttempts) && shouldRetrySupabaseMirrorStatus(statusCode);
+      if (!canRetry) {
+        console.warn(`[api][${requestId || 'no-request-id'}] supabase mirror write failed (${statusCode}): ${responseText.slice(0, 300)}`);
+        break;
+      }
+
+      const delayMs = computeSupabaseMirrorRetryDelayMs({
+        attempt,
+        baseMs: config.retryBaseMs,
+        jitterMs: config.retryJitterMs
+      });
+      console.warn(`[api][${requestId || 'no-request-id'}] supabase mirror write retry ${attemptNumber}/${totalAttempts - 1} after HTTP ${statusCode}`);
+      await waitForSupabaseMirrorRetry(delayMs);
+    } catch (error) {
+      lastFailureStatus = 0;
+      lastFailureMessage = error?.name === 'AbortError'
+        ? 'supabase mirror write timed out'
+        : `supabase mirror request failed: ${String(error?.message || error || 'unknown')}`;
+
+      const canRetry = attemptNumber < totalAttempts;
+      if (!canRetry) {
+        console.warn(`[api][${requestId || 'no-request-id'}] ${lastFailureMessage}`);
+        break;
+      }
+
+      const delayMs = computeSupabaseMirrorRetryDelayMs({
+        attempt,
+        baseMs: config.retryBaseMs,
+        jitterMs: config.retryJitterMs
+      });
+      console.warn(`[api][${requestId || 'no-request-id'}] supabase mirror write retry ${attemptNumber}/${totalAttempts - 1} after error`);
+      await waitForSupabaseMirrorRetry(delayMs);
+    } finally {
+      clearTimeout(timeoutId);
     }
-    SUPABASE_MIRROR_RUNTIME.succeeded += 1;
-    SUPABASE_MIRROR_RUNTIME.lastSuccessAtMs = Date.now();
-    SUPABASE_MIRROR_RUNTIME.lastFailureStatus = 0;
-    SUPABASE_MIRROR_RUNTIME.lastError = '';
-    return true;
-  } catch (error) {
-    const message = error?.name === 'AbortError'
-      ? 'supabase mirror write timed out'
-      : `supabase mirror request failed: ${String(error?.message || error || 'unknown')}`;
-    console.warn(`[api][${requestId || 'no-request-id'}] ${message}`);
-    SUPABASE_MIRROR_RUNTIME.failed += 1;
-    SUPABASE_MIRROR_RUNTIME.lastFailureAtMs = Date.now();
-    SUPABASE_MIRROR_RUNTIME.lastFailureStatus = 0;
-    SUPABASE_MIRROR_RUNTIME.lastError = message;
-    return false;
-  } finally {
-    clearTimeout(timeoutId);
   }
+
+  SUPABASE_MIRROR_RUNTIME.failed += 1;
+  SUPABASE_MIRROR_RUNTIME.lastFailureAtMs = Date.now();
+  SUPABASE_MIRROR_RUNTIME.lastFailureStatus = lastFailureStatus;
+  SUPABASE_MIRROR_RUNTIME.lastError = lastFailureMessage;
+  return false;
 }
 
 async function probeSupabaseMirrorConnection(env) {
