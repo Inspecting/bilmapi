@@ -7,7 +7,8 @@
 		"deploy": "wrangler deploy",
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
-		"test": "vitest"
+		"test": "vitest",
+		"backfill:supabase": "node scripts/backfill-supabase.mjs"
 	},
 	"devDependencies": {
 		"@cloudflare/vitest-pool-workers": "^0.14.7",

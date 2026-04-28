@@ -507,8 +507,9 @@ const DEFAULT_ALLOWED_ORIGINS = new Set([
   'https://bilm-backend.reidmhit.workers.dev'
 ]);
 const MAX_SNAPSHOT_BYTES = 1500000;
-const SUPABASE_MIRROR_MAX_JSON_BYTES = 64_000;
-const SUPABASE_MIRROR_MAX_TEXT_CHARS = 120_000;
+// Keep mirror payload limits above snapshot size so backup events are preserved in full.
+const SUPABASE_MIRROR_MAX_JSON_BYTES = MAX_SNAPSHOT_BYTES + 256_000;
+const SUPABASE_MIRROR_MAX_TEXT_CHARS = SUPABASE_MIRROR_MAX_JSON_BYTES + 128_000;
 const ACCOUNT_LINK_STATUS_PENDING = 'pending';
 const ACCOUNT_LINK_STATUS_ACTIVE = 'active';
 const ACCOUNT_LINK_STATUS_DECLINED = 'declined';
@@ -3239,7 +3240,7 @@ async function handleGetAccountLinkTargetCapabilities({ request, env, corsOrigin
   }, corsOrigin, { 'x-request-id': requestId });
 }
 
-async function handleCreateAccountLinkRequest({ request, env, corsOrigin, verifyIdToken, requestId }) {
+async function handleCreateAccountLinkRequest({ request, env, corsOrigin, verifyIdToken, requestId, executionContext = null }) {
   assertD1Configured(env, corsOrigin);
   const body = await parseJsonBody(request, corsOrigin, requestId);
   const userId = normalizeUserId(body?.userId);
@@ -3363,14 +3364,26 @@ async function handleCreateAccountLinkRequest({ request, env, corsOrigin, verify
   ).run();
 
   const saved = await readAccountLinkById({ db, linkId: link.id });
-  return jsonResponse(200, {
+  const responsePayload = {
     ok: true,
     accountFound: Boolean(resolvedTargetUserId),
     link: formatAccountLinkForActor(saved || link, authContext.userId, authContext.email)
-  }, corsOrigin, { 'x-request-id': requestId });
+  };
+  queueSupabaseMirrorWrite({
+    executionContext,
+    env,
+    path: '/links/request',
+    method: request.method,
+    userId: authContext.userId,
+    requestId,
+    requestBody: body,
+    responseBody: responsePayload,
+    status: 200
+  });
+  return jsonResponse(200, responsePayload, corsOrigin, { 'x-request-id': requestId });
 }
 
-async function handleRespondToAccountLinkRequest({ request, env, corsOrigin, verifyIdToken, requestId }) {
+async function handleRespondToAccountLinkRequest({ request, env, corsOrigin, verifyIdToken, requestId, executionContext = null }) {
   assertD1Configured(env, corsOrigin);
   const body = await parseJsonBody(request, corsOrigin, requestId);
   const userId = normalizeUserId(body?.userId);
@@ -3501,13 +3514,25 @@ async function handleRespondToAccountLinkRequest({ request, env, corsOrigin, ver
 
   await saveAccountLinkRow({ db, link: next });
   const saved = await readAccountLinkById({ db, linkId: next.id });
-  return jsonResponse(200, {
+  const responsePayload = {
     ok: true,
     link: formatAccountLinkForActor(saved || next, authContext.userId, authContext.email)
-  }, corsOrigin, { 'x-request-id': requestId });
+  };
+  queueSupabaseMirrorWrite({
+    executionContext,
+    env,
+    path: '/links/respond',
+    method: request.method,
+    userId: authContext.userId,
+    requestId,
+    requestBody: body,
+    responseBody: responsePayload,
+    status: 200
+  });
+  return jsonResponse(200, responsePayload, corsOrigin, { 'x-request-id': requestId });
 }
 
-async function handleUpdateAccountLinkScopes({ request, env, corsOrigin, verifyIdToken, requestId }) {
+async function handleUpdateAccountLinkScopes({ request, env, corsOrigin, verifyIdToken, requestId, executionContext = null }) {
   assertD1Configured(env, corsOrigin);
   const body = await parseJsonBody(request, corsOrigin, requestId);
   const userId = normalizeUserId(body?.userId);
@@ -3580,13 +3605,25 @@ async function handleUpdateAccountLinkScopes({ request, env, corsOrigin, verifyI
 
   await saveAccountLinkRow({ db, link: next });
   const saved = await readAccountLinkById({ db, linkId: next.id });
-  return jsonResponse(200, {
+  const responsePayload = {
     ok: true,
     link: formatAccountLinkForActor(saved || next, authContext.userId, authContext.email)
-  }, corsOrigin, { 'x-request-id': requestId });
+  };
+  queueSupabaseMirrorWrite({
+    executionContext,
+    env,
+    path: '/links/scopes',
+    method: request.method,
+    userId: authContext.userId,
+    requestId,
+    requestBody: body,
+    responseBody: responsePayload,
+    status: 200
+  });
+  return jsonResponse(200, responsePayload, corsOrigin, { 'x-request-id': requestId });
 }
 
-async function handleUnlinkAccountLink({ request, env, corsOrigin, verifyIdToken, requestId }) {
+async function handleUnlinkAccountLink({ request, env, corsOrigin, verifyIdToken, requestId, executionContext = null }) {
   assertD1Configured(env, corsOrigin);
   const body = await parseJsonBody(request, corsOrigin, requestId);
   const userId = normalizeUserId(body?.userId);
@@ -3643,13 +3680,25 @@ async function handleUnlinkAccountLink({ request, env, corsOrigin, verifyIdToken
     unlinkedAtMs: Date.now()
   };
   await saveAccountLinkRow({ db, link: next });
-  return jsonResponse(200, {
+  const responsePayload = {
     ok: true,
     link: formatAccountLinkForActor(next, authContext.userId, authContext.email)
-  }, corsOrigin, { 'x-request-id': requestId });
+  };
+  queueSupabaseMirrorWrite({
+    executionContext,
+    env,
+    path: '/links/unlink',
+    method: request.method,
+    userId: authContext.userId,
+    requestId,
+    requestBody: body,
+    responseBody: responsePayload,
+    status: 200
+  });
+  return jsonResponse(200, responsePayload, corsOrigin, { 'x-request-id': requestId });
 }
 
-async function handleMarkAccountChatReady({ request, env, corsOrigin, verifyIdToken, requestId }) {
+async function handleMarkAccountChatReady({ request, env, corsOrigin, verifyIdToken, requestId, executionContext = null }) {
   assertD1Configured(env, corsOrigin);
   const body = await parseJsonBody(request, corsOrigin, requestId);
   const userId = normalizeUserId(body?.userId);
@@ -3662,12 +3711,24 @@ async function handleMarkAccountChatReady({ request, env, corsOrigin, verifyIdTo
     requestId
   });
   enforceAccountLinkRateLimit({ env, authContext, corsOrigin, requestId, kind: 'mutation' });
-  return jsonResponse(200, {
+  const responsePayload = {
     ok: true,
     deprecated: true,
     userId: authContext.userId,
     chatReady: false
-  }, corsOrigin, { 'x-request-id': requestId });
+  };
+  queueSupabaseMirrorWrite({
+    executionContext,
+    env,
+    path: '/links/chat-ready',
+    method: request.method,
+    userId: authContext.userId,
+    requestId,
+    requestBody: body,
+    responseBody: responsePayload,
+    status: 200
+  });
+  return jsonResponse(200, responsePayload, corsOrigin, { 'x-request-id': requestId });
 }
 
 async function handleResetAccountData({ request, env, corsOrigin, verifyIdToken, requestId, executionContext = null }) {
@@ -4674,23 +4735,58 @@ export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOri
         }
 
         if (request.method === 'POST' && url.pathname === '/links/request') {
-          return await handleCreateAccountLinkRequest({ request, env, corsOrigin, verifyIdToken, requestId });
+          return await handleCreateAccountLinkRequest({
+            request,
+            env,
+            corsOrigin,
+            verifyIdToken,
+            requestId,
+            executionContext: ctx
+          });
         }
 
         if (request.method === 'POST' && url.pathname === '/links/respond') {
-          return await handleRespondToAccountLinkRequest({ request, env, corsOrigin, verifyIdToken, requestId });
+          return await handleRespondToAccountLinkRequest({
+            request,
+            env,
+            corsOrigin,
+            verifyIdToken,
+            requestId,
+            executionContext: ctx
+          });
         }
 
         if (request.method === 'POST' && url.pathname === '/links/scopes') {
-          return await handleUpdateAccountLinkScopes({ request, env, corsOrigin, verifyIdToken, requestId });
+          return await handleUpdateAccountLinkScopes({
+            request,
+            env,
+            corsOrigin,
+            verifyIdToken,
+            requestId,
+            executionContext: ctx
+          });
         }
 
         if (request.method === 'POST' && url.pathname === '/links/unlink') {
-          return await handleUnlinkAccountLink({ request, env, corsOrigin, verifyIdToken, requestId });
+          return await handleUnlinkAccountLink({
+            request,
+            env,
+            corsOrigin,
+            verifyIdToken,
+            requestId,
+            executionContext: ctx
+          });
         }
 
         if (request.method === 'POST' && url.pathname === '/links/chat-ready') {
-          return await handleMarkAccountChatReady({ request, env, corsOrigin, verifyIdToken, requestId });
+          return await handleMarkAccountChatReady({
+            request,
+            env,
+            corsOrigin,
+            verifyIdToken,
+            requestId,
+            executionContext: ctx
+          });
         }
 
         if (request.method === 'POST' && url.pathname === '/account/reset') {
