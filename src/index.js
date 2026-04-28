@@ -438,6 +438,9 @@ const UI_PREFS_SECTOR_KEY = 'ui_prefs';
 const SYNC_FUTURE_TIME_WINDOW_MS = 10 * 60 * 1000;
 const TOMBSTONE_RETENTION_DAYS = 30;
 const SUPABASE_CANONICAL_DELETED_RETENTION_DAYS = 7;
+const SUPABASE_SYNC_STATE_SCOPE = 'sync_state';
+const SUPABASE_SYNC_STATE_GROUP = 'sync';
+const SUPABASE_SYNC_STATE_KEY = 'state';
 const MEDIA_CACHE_R2_INLINE_THRESHOLD_BYTES = 96 * 1024;
 const MEDIA_REFRESH_LOCK_MS = 30 * 1000;
 const MEDIA_CACHE_PROFILE_MS = Object.freeze({
@@ -1116,10 +1119,14 @@ function requireAdminToken({ request, corsOrigin, env }) {
 }
 
 function assertStorageConfigured(env, corsOrigin) {
+  const canonicalConfig = resolveSupabaseCanonicalConfig(env);
+  if (isSupabaseCanonicalPrimaryActive(env, canonicalConfig)) {
+    return;
+  }
   if (!getD1Database(env) && !getKvNamespace(env)) {
     throw jsonResponse(503, {
       error: 'storage_not_configured',
-      message: 'No storage backend is configured. Bind BILM_DB (D1) and/or BILM_DATA (KV).'
+      message: 'No storage backend is configured. Bind BILM_DB (D1) and/or BILM_DATA (KV), or enable SUPABASE_CANONICAL_PRIMARY with valid Supabase credentials.'
     }, corsOrigin);
   }
 }
@@ -1223,6 +1230,12 @@ function resolveSupabaseCanonicalConfig(env) {
     batchSize,
     deletedRetentionDays
   };
+}
+
+function isSupabaseCanonicalPrimaryActive(env, canonicalConfig = null) {
+  const config = canonicalConfig || resolveSupabaseCanonicalConfig(env);
+  const enabled = parseEnvBool(env, 'SUPABASE_CANONICAL_PRIMARY', false);
+  return enabled && config.active;
 }
 
 function buildSupabaseMirrorUrl(config) {
@@ -1591,7 +1604,9 @@ async function performSupabaseCanonicalRequest({
   method = 'POST',
   requestId = '',
   body = null,
-  preferHeader = 'return=minimal'
+  preferHeader = 'return=minimal',
+  acceptHeader = 'application/json',
+  expectJson = false
 } = {}) {
   const totalAttempts = Math.max(1, (Number(config?.maxRetries || 0) || 0) + 1);
   let lastFailureStatus = 0;
@@ -1604,7 +1619,7 @@ async function performSupabaseCanonicalRequest({
       const headers = {
         apikey: String(config?.serviceRoleKey || ''),
         authorization: `Bearer ${String(config?.serviceRoleKey || '')}`,
-        accept: 'application/json',
+        accept: String(acceptHeader || 'application/json'),
         prefer: String(preferHeader || 'return=minimal')
       };
       if (body !== null && typeof body !== 'undefined') {
@@ -1617,10 +1632,24 @@ async function performSupabaseCanonicalRequest({
         signal: abortController.signal
       });
       if (response.ok) {
+        let data = null;
+        if (expectJson) {
+          const responseText = await response.text().catch(() => '');
+          if (responseText) {
+            try {
+              data = JSON.parse(responseText);
+            } catch (error) {
+              throw new Error(`supabase canonical invalid json response: ${String(error?.message || error || 'unknown')}`);
+            }
+          } else {
+            data = [];
+          }
+        }
         return {
           ok: true,
           status: Number(response.status || 0) || 0,
-          error: ''
+          error: '',
+          data
         };
       }
       const responseText = await response.text().catch(() => '');
@@ -1657,7 +1686,359 @@ async function performSupabaseCanonicalRequest({
   return {
     ok: false,
     status: lastFailureStatus,
-    error: lastFailureMessage
+    error: lastFailureMessage,
+    data: null
+  };
+}
+
+function parseCanonicalPayloadObject(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function buildSupabaseInFilter(values = []) {
+  const normalized = Array.isArray(values)
+    ? values
+      .map((value) => String(value || '').trim())
+      .filter(Boolean)
+    : [];
+  if (!normalized.length) return '';
+  const encoded = normalized
+    .map((value) => `"${value.replace(/"/g, '""')}"`)
+    .join(',');
+  return `(${encoded})`;
+}
+
+function buildCanonicalUserDataCompositeKey(scope = '', group = '', key = '') {
+  return [
+    String(scope || '').trim(),
+    String(group || '').trim(),
+    String(key || '').trim()
+  ].join('|');
+}
+
+function mapCanonicalRowsByCompositeKey(rows = []) {
+  const map = new Map();
+  rows.forEach((row) => {
+    if (!row || typeof row !== 'object') return;
+    const rowKey = buildCanonicalUserDataCompositeKey(
+      row?.data_scope,
+      row?.data_group,
+      row?.data_key
+    );
+    if (!rowKey.replace(/\|/g, '')) return;
+    const current = map.get(rowKey);
+    if (shouldReplaceCanonicalUserDataRow(current, row)) {
+      map.set(rowKey, row);
+    }
+  });
+  return map;
+}
+
+async function selectSupabaseCanonicalRows({
+  config,
+  table = '',
+  select = '*',
+  searchParams = null,
+  order = '',
+  limit = 0,
+  requestId = ''
+} = {}) {
+  const params = {
+    ...(searchParams && typeof searchParams === 'object' ? searchParams : {})
+  };
+  params.select = String(select || '*');
+  if (order) params.order = String(order);
+  if (Number(limit || 0) > 0) params.limit = Number(limit || 0);
+  const result = await performSupabaseCanonicalRequest({
+    config,
+    url: buildSupabaseTableUrl({
+      projectUrl: config.projectUrl,
+      table,
+      searchParams: params
+    }),
+    method: 'GET',
+    requestId,
+    body: null,
+    preferHeader: 'return=representation',
+    acceptHeader: 'application/json',
+    expectJson: true
+  });
+  return {
+    ok: result.ok,
+    status: result.status,
+    error: result.error,
+    rows: result.ok && Array.isArray(result.data) ? result.data : []
+  };
+}
+
+async function upsertSupabaseCanonicalProfileRow({
+  config,
+  userId = '',
+  path = '/',
+  requestId = '',
+  email = null,
+  metadata = null
+} = {}) {
+  const profileRow = createCanonicalProfileRow({
+    userId,
+    path,
+    metadata,
+    email
+  });
+  const result = await upsertSupabaseCanonicalRows({
+    config,
+    table: config.profileTable,
+    rows: [profileRow],
+    onConflict: 'user_id',
+    requestId
+  });
+  return {
+    ...result,
+    profileRow
+  };
+}
+
+async function persistSnapshotToSupabaseCanonical({
+  config,
+  userId = '',
+  snapshot = null,
+  requestId = '',
+  sourcePath = '/'
+} = {}) {
+  const nowMs = Date.now();
+  const snapshotRow = createCanonicalUserDataRow({
+    userId,
+    scope: 'snapshot',
+    group: 'snapshot',
+    key: 'snapshot',
+    payload: snapshot,
+    updatedAtMs: snapshot?.meta?.updatedAtMs || nowMs,
+    deletedAtMs: null,
+    sourcePath,
+    requestId
+  });
+  const profileMetadata = {
+    requestId: String(requestId || '').trim() || null,
+    path: sourcePath,
+    atMs: nowMs,
+    snapshotSchema: String(snapshot?.schema || '').trim() || null
+  };
+  const profileResult = await upsertSupabaseCanonicalProfileRow({
+    config,
+    userId,
+    path: sourcePath,
+    requestId,
+    metadata: profileMetadata
+  });
+  if (!profileResult.ok) return profileResult;
+  return await upsertSupabaseCanonicalRows({
+    config,
+    table: config.userDataTable,
+    rows: [snapshotRow],
+    onConflict: 'user_id,data_scope,data_group,data_key',
+    requestId
+  });
+}
+
+async function readSupabaseSnapshotRow({ config, userId = '', requestId = '' } = {}) {
+  const query = await selectSupabaseCanonicalRows({
+    config,
+    table: config.userDataTable,
+    select: 'payload_json,updated_at_ms,deleted_at_ms',
+    searchParams: {
+      user_id: `eq.${userId}`,
+      data_scope: 'eq.snapshot',
+      data_group: 'eq.snapshot',
+      data_key: 'eq.snapshot',
+      deleted_at_ms: 'is.null'
+    },
+    order: 'updated_at_ms.desc',
+    limit: 1,
+    requestId
+  });
+  if (!query.ok) {
+    return {
+      ok: false,
+      error: query.error,
+      row: null
+    };
+  }
+  return {
+    ok: true,
+    error: '',
+    row: query.rows[0] || null
+  };
+}
+
+function formatSupabaseSyncStateFromPayload(payload = null) {
+  const state = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
+  const migratedAtMs = Number(state?.migratedAtMs || 0) || null;
+  const migrationSource = String(state?.migrationSource || '').trim() || null;
+  const updatedAtMs = Number(state?.updatedAtMs || 0) || migratedAtMs || null;
+  return {
+    migratedAtMs,
+    migrationSource,
+    updatedAtMs
+  };
+}
+
+async function readSupabaseSyncState({ config, userId = '', requestId = '' } = {}) {
+  const query = await selectSupabaseCanonicalRows({
+    config,
+    table: config.userDataTable,
+    select: 'payload_json,updated_at_ms,deleted_at_ms',
+    searchParams: {
+      user_id: `eq.${userId}`,
+      data_scope: `eq.${SUPABASE_SYNC_STATE_SCOPE}`,
+      data_group: `eq.${SUPABASE_SYNC_STATE_GROUP}`,
+      data_key: `eq.${SUPABASE_SYNC_STATE_KEY}`,
+      deleted_at_ms: 'is.null'
+    },
+    order: 'updated_at_ms.desc',
+    limit: 1,
+    requestId
+  });
+  if (!query.ok) {
+    return {
+      ok: false,
+      error: query.error,
+      state: {
+        migratedAtMs: null,
+        migrationSource: null,
+        updatedAtMs: null
+      }
+    };
+  }
+  const row = query.rows[0] || null;
+  const payload = parseCanonicalPayloadObject(row?.payload_json);
+  return {
+    ok: true,
+    error: '',
+    state: formatSupabaseSyncStateFromPayload(payload)
+  };
+}
+
+async function persistSupabaseSyncState({
+  config,
+  userId = '',
+  state = null,
+  requestId = '',
+  sourcePath = '/sync/sectors/bootstrap'
+} = {}) {
+  const normalized = formatSupabaseSyncStateFromPayload(state);
+  const row = createCanonicalUserDataRow({
+    userId,
+    scope: SUPABASE_SYNC_STATE_SCOPE,
+    group: SUPABASE_SYNC_STATE_GROUP,
+    key: SUPABASE_SYNC_STATE_KEY,
+    payload: normalized,
+    updatedAtMs: normalized.updatedAtMs || normalized.migratedAtMs || Date.now(),
+    deletedAtMs: null,
+    sourcePath,
+    requestId
+  });
+  return await upsertSupabaseCanonicalRows({
+    config,
+    table: config.userDataTable,
+    rows: [row],
+    onConflict: 'user_id,data_scope,data_group,data_key',
+    requestId
+  });
+}
+
+async function loadSupabaseCanonicalRowsForScope({
+  config,
+  userId = '',
+  scope = '',
+  groups = [],
+  requestId = ''
+} = {}) {
+  const searchParams = {
+    user_id: `eq.${userId}`,
+    data_scope: `eq.${scope}`
+  };
+  const groupFilter = buildSupabaseInFilter(groups);
+  if (groupFilter) {
+    searchParams.data_group = `in.${groupFilter}`;
+  }
+  const query = await selectSupabaseCanonicalRows({
+    config,
+    table: config.userDataTable,
+    select: 'data_scope,data_group,data_key,op_id,payload_json,updated_at_ms,deleted_at_ms',
+    searchParams,
+    order: 'updated_at_ms.desc',
+    limit: 20000,
+    requestId
+  });
+  return query;
+}
+
+async function upsertSupabaseCanonicalOperations({
+  config,
+  userId = '',
+  scope = '',
+  sourcePath = '',
+  requestId = '',
+  operations = [],
+  groups = []
+} = {}) {
+  const existingQuery = await loadSupabaseCanonicalRowsForScope({
+    config,
+    userId,
+    scope,
+    groups,
+    requestId
+  });
+  if (!existingQuery.ok) return existingQuery;
+  const existingMap = mapCanonicalRowsByCompositeKey(existingQuery.rows);
+  const rowsToWrite = [];
+  operations.forEach((row) => {
+    if (!row || typeof row !== 'object') return;
+    const key = buildCanonicalUserDataCompositeKey(
+      row?.data_scope,
+      row?.data_group,
+      row?.data_key
+    );
+    if (!key.replace(/\|/g, '')) return;
+    const currentRow = existingMap.get(key);
+    if (shouldReplaceCanonicalUserDataRow(currentRow, row)) {
+      rowsToWrite.push(row);
+      existingMap.set(key, row);
+    }
+  });
+  const upsertResult = await upsertSupabaseCanonicalRows({
+    config,
+    table: config.userDataTable,
+    rows: rowsToWrite,
+    onConflict: 'user_id,data_scope,data_group,data_key',
+    requestId
+  });
+  if (!upsertResult.ok) return upsertResult;
+  await upsertSupabaseCanonicalProfileRow({
+    config,
+    userId,
+    path: sourcePath || '/',
+    requestId,
+    metadata: {
+      requestId: String(requestId || '').trim() || null,
+      path: sourcePath || '/',
+      atMs: Date.now()
+    }
+  });
+  return {
+    ok: true,
+    status: upsertResult.status,
+    error: '',
+    written: rowsToWrite.length
   };
 }
 
@@ -2114,6 +2495,8 @@ function queueSupabaseMirrorWrite({
   responseBody = null,
   status = 200
 } = {}) {
+  const canonicalConfig = resolveSupabaseCanonicalConfig(env);
+  const canonicalPrimaryActive = isSupabaseCanonicalPrimaryActive(env, canonicalConfig);
   const mirrorTask = mirrorWriteEventToSupabase({
     env,
     path,
@@ -2124,17 +2507,20 @@ function queueSupabaseMirrorWrite({
     responseBody,
     status
   });
-  const canonicalTask = mirrorCanonicalDataToSupabase({
-    env,
-    path,
-    method,
-    userId,
-    requestId,
-    requestBody,
-    responseBody,
-    status
-  });
-  const task = Promise.allSettled([mirrorTask, canonicalTask]);
+  const tasks = [mirrorTask];
+  if (!canonicalPrimaryActive) {
+    tasks.push(mirrorCanonicalDataToSupabase({
+      env,
+      path,
+      method,
+      userId,
+      requestId,
+      requestBody,
+      responseBody,
+      status
+    }));
+  }
+  const task = Promise.allSettled(tasks);
   if (executionContext && typeof executionContext.waitUntil === 'function') {
     executionContext.waitUntil(task);
     return;
@@ -3426,7 +3812,7 @@ async function writeSnapshotToKv({ env, userId, snapshotJson, metadata }) {
   return true;
 }
 
-async function persistSnapshot({ env, userId, snapshot, corsOrigin }) {
+async function persistSnapshot({ env, userId, snapshot, corsOrigin, requestId = '' }) {
   assertNoCredentialStorage(snapshot, corsOrigin);
 
   const metadata = getSnapshotMetadata(snapshot);
@@ -3440,6 +3826,28 @@ async function persistSnapshot({ env, userId, snapshot, corsOrigin }) {
       bytes: snapshotBytes
     }, corsOrigin);
   }
+  const canonicalConfig = resolveSupabaseCanonicalConfig(env);
+  const supabasePrimaryActive = isSupabaseCanonicalPrimaryActive(env, canonicalConfig);
+  if (supabasePrimaryActive) {
+    const supabaseResult = await persistSnapshotToSupabaseCanonical({
+      config: canonicalConfig,
+      userId,
+      snapshot,
+      requestId,
+      sourcePath: '/'
+    });
+    if (!supabaseResult.ok) {
+      throw jsonResponse(503, {
+        error: 'storage_unavailable',
+        message: 'Supabase canonical storage is unavailable. Please retry shortly.'
+      }, corsOrigin);
+    }
+    return {
+      bytes: snapshotBytes,
+      metadata
+    };
+  }
+
   let stored = false;
 
   if (await writeSnapshotToD1({ env, userId, snapshotJson, metadata })) {
@@ -3462,7 +3870,22 @@ async function persistSnapshot({ env, userId, snapshot, corsOrigin }) {
   };
 }
 
-async function readSnapshotValue({ env, userId }) {
+async function readSnapshotValue({ env, userId, requestId = '' }) {
+  const canonicalConfig = resolveSupabaseCanonicalConfig(env);
+  if (isSupabaseCanonicalPrimaryActive(env, canonicalConfig)) {
+    const supabaseResult = await readSupabaseSnapshotRow({
+      config: canonicalConfig,
+      userId,
+      requestId
+    });
+    if (!supabaseResult.ok) {
+      throw new Error(`supabase canonical snapshot read failed: ${supabaseResult.error || 'unknown'}`);
+    }
+    const payload = parseCanonicalPayloadObject(supabaseResult?.row?.payload_json);
+    if (!payload) return null;
+    return JSON.stringify(payload);
+  }
+
   const db = getD1Database(env);
   if (db) {
     const row = await db.prepare(SELECT_SNAPSHOT_SQL).bind(userId).first();
@@ -3479,7 +3902,28 @@ async function readSnapshotValue({ env, userId }) {
   return null;
 }
 
-async function readSnapshotMeta({ env, userId }) {
+async function readSnapshotMeta({ env, userId, requestId = '' }) {
+  const canonicalConfig = resolveSupabaseCanonicalConfig(env);
+  if (isSupabaseCanonicalPrimaryActive(env, canonicalConfig)) {
+    const supabaseResult = await readSupabaseSnapshotRow({
+      config: canonicalConfig,
+      userId,
+      requestId
+    });
+    if (!supabaseResult.ok) {
+      throw new Error(`supabase canonical snapshot metadata read failed: ${supabaseResult.error || 'unknown'}`);
+    }
+    const row = supabaseResult.row;
+    const payload = parseCanonicalPayloadObject(row?.payload_json);
+    const metadata = getSnapshotMetadata(payload || {});
+    return {
+      exists: Boolean(payload),
+      updatedAtMs: payload ? Number(row?.updated_at_ms || metadata.updatedAtMs || 0) || null : null,
+      deviceId: payload ? String(metadata.deviceId || '').trim() || null : null,
+      schema: payload ? String(metadata.schema || '').trim() || null : null
+    };
+  }
+
   const db = getD1Database(env);
   if (db) {
     const row = await db.prepare(SELECT_SNAPSHOT_META_SQL).bind(userId).first();
@@ -4446,7 +4890,11 @@ async function handleMarkAccountChatReady({ request, env, corsOrigin, verifyIdTo
 }
 
 async function handleResetAccountData({ request, env, corsOrigin, verifyIdToken, requestId, executionContext = null }) {
-  assertStorageConfigured(env, corsOrigin);
+  const canonicalConfig = resolveSupabaseCanonicalConfig(env);
+  const supabasePrimaryActive = isSupabaseCanonicalPrimaryActive(env, canonicalConfig);
+  if (!supabasePrimaryActive) {
+    assertStorageConfigured(env, corsOrigin);
+  }
   const body = await parseJsonBody(request, corsOrigin, requestId);
   const url = new URL(request.url);
   const userId = normalizeUserId(body?.userId || url.searchParams.get('userId'));
@@ -4475,7 +4923,8 @@ async function handleResetAccountData({ request, env, corsOrigin, verifyIdToken,
     syncState: 0,
     accountLinks: 0,
     accountCapabilities: 0,
-    kvSnapshots: 0
+    kvSnapshots: 0,
+    supabaseRowsMarked: 0
   };
 
   if (db) {
@@ -4683,7 +5132,11 @@ async function handlePullLinkedSharedFeed({ request, env, corsOrigin, verifyIdTo
 }
 
 async function handleListSyncPush({ request, env, corsOrigin, verifyIdToken, requestId, executionContext = null }) {
-  assertD1Configured(env, corsOrigin);
+  const canonicalConfig = resolveSupabaseCanonicalConfig(env);
+  const supabasePrimaryActive = isSupabaseCanonicalPrimaryActive(env, canonicalConfig);
+  if (!supabasePrimaryActive) {
+    assertD1Configured(env, corsOrigin);
+  }
   const body = await parseJsonBody(request, corsOrigin, requestId);
   const userId = normalizeUserId(body?.userId);
   if (!isValidUserId(userId)) {
@@ -4725,33 +5178,106 @@ async function handleListSyncPush({ request, env, corsOrigin, verifyIdToken, req
     }, corsOrigin);
   }
 
-  const db = getD1Database(env);
-  const deviceId = String(body?.deviceId || '').trim() || null;
-  const nowIso = new Date().toISOString();
   let cursorMs = parseSinceMs(body?.cursorMs);
   let processed = 0;
-
-  for (let index = 0; index < operations.length; index += 1) {
-    const operation = normalizeListSyncOperation(operations[index], corsOrigin, index);
-    const itemJson = operation.deleted ? null : JSON.stringify(operation.payload);
-    const deletedAtMs = operation.deleted ? operation.updatedAtMs : null;
-    await db
-      .prepare(UPSERT_LIST_SYNC_ITEM_SQL)
-      .bind(
+  if (supabasePrimaryActive) {
+    const nowMs = Date.now();
+    const rows = [];
+    const groups = new Set();
+    for (let index = 0; index < operations.length; index += 1) {
+      const operation = normalizeListSyncOperation(operations[index], corsOrigin, index);
+      rows.push(createCanonicalUserDataRow({
         userId,
-        operation.listKey,
-        operation.itemKey,
-        itemJson,
-        operation.updatedAtMs,
-        deletedAtMs,
-        deviceId,
-        nowIso
-      )
-      .run();
-    processed += 1;
-    if (operation.updatedAtMs > cursorMs) {
-      cursorMs = operation.updatedAtMs;
+        scope: 'list',
+        group: operation.listKey,
+        key: operation.itemKey,
+        payload: operation.payload,
+        updatedAtMs: operation.updatedAtMs || nowMs,
+        deletedAtMs: operation.deleted ? operation.updatedAtMs : null,
+        sourcePath: '/sync/lists/push',
+        requestId
+      }));
+      groups.add(operation.listKey);
+      processed += 1;
+      if (operation.updatedAtMs > cursorMs) {
+        cursorMs = operation.updatedAtMs;
+      }
     }
+    const supabaseResult = await upsertSupabaseCanonicalOperations({
+      config: canonicalConfig,
+      userId,
+      scope: 'list',
+      sourcePath: '/sync/lists/push',
+      requestId,
+      operations: rows,
+      groups: [...groups]
+    });
+    if (!supabaseResult.ok) {
+      return errorResponse(503, {
+        error: 'storage_unavailable',
+        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
+        retryable: true,
+        code: 'storage_unavailable',
+        requestId
+      }, corsOrigin);
+    }
+  } else {
+    const db = getD1Database(env);
+    const deviceId = String(body?.deviceId || '').trim() || null;
+    const nowIso = new Date().toISOString();
+    for (let index = 0; index < operations.length; index += 1) {
+      const operation = normalizeListSyncOperation(operations[index], corsOrigin, index);
+      const itemJson = operation.deleted ? null : JSON.stringify(operation.payload);
+      const deletedAtMs = operation.deleted ? operation.updatedAtMs : null;
+      await db
+        .prepare(UPSERT_LIST_SYNC_ITEM_SQL)
+        .bind(
+          userId,
+          operation.listKey,
+          operation.itemKey,
+          itemJson,
+          operation.updatedAtMs,
+          deletedAtMs,
+          deviceId,
+          nowIso
+        )
+        .run();
+      processed += 1;
+      if (operation.updatedAtMs > cursorMs) {
+        cursorMs = operation.updatedAtMs;
+      }
+    }
+  }
+
+  if (supabasePrimaryActive) {
+    const deleteMarkResult = await markSupabaseCanonicalRowsDeletedForUser({
+      config: canonicalConfig,
+      userId: authContext.userId,
+      deletedAtMs: Date.now(),
+      requestId,
+      sourcePath: '/account/reset'
+    });
+    if (!deleteMarkResult.ok) {
+      return errorResponse(503, {
+        error: 'storage_unavailable',
+        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
+        retryable: true,
+        code: 'storage_unavailable',
+        requestId
+      }, corsOrigin);
+    }
+    deleted.supabaseRowsMarked = 1;
+    await persistSupabaseSyncState({
+      config: canonicalConfig,
+      userId: authContext.userId,
+      state: {
+        migratedAtMs: null,
+        migrationSource: null,
+        updatedAtMs: Date.now()
+      },
+      requestId,
+      sourcePath: '/account/reset'
+    });
   }
 
   const responsePayload = { ok: true, processed, cursorMs };
@@ -4770,7 +5296,11 @@ async function handleListSyncPush({ request, env, corsOrigin, verifyIdToken, req
 }
 
 async function handleListSyncPull({ request, env, corsOrigin, verifyIdToken, requestId }) {
-  assertD1Configured(env, corsOrigin);
+  const canonicalConfig = resolveSupabaseCanonicalConfig(env);
+  const supabasePrimaryActive = isSupabaseCanonicalPrimaryActive(env, canonicalConfig);
+  if (!supabasePrimaryActive) {
+    assertD1Configured(env, corsOrigin);
+  }
   const url = new URL(request.url);
   const userId = normalizeUserId(url.searchParams.get('userId'));
   if (!isValidUserId(userId)) {
@@ -4788,9 +5318,36 @@ async function handleListSyncPull({ request, env, corsOrigin, verifyIdToken, req
 
   const sinceMs = parseSinceMs(url.searchParams.get('since'));
   const limit = parsePullLimit(url.searchParams.get('limit'));
-  const db = getD1Database(env);
-  const query = await db.prepare(SELECT_LIST_SYNC_CHANGES_SQL).bind(userId, sinceMs, limit).all();
-  const rows = Array.isArray(query?.results) ? query.results : [];
+  let rows = [];
+  if (supabasePrimaryActive) {
+    const supabaseQuery = await selectSupabaseCanonicalRows({
+      config: canonicalConfig,
+      table: canonicalConfig.userDataTable,
+      select: 'data_group,data_key,payload_json,updated_at_ms,deleted_at_ms',
+      searchParams: {
+        user_id: `eq.${userId}`,
+        data_scope: 'eq.list',
+        updated_at_ms: `gt.${sinceMs}`
+      },
+      order: 'updated_at_ms.asc',
+      limit,
+      requestId
+    });
+    if (!supabaseQuery.ok) {
+      return errorResponse(503, {
+        error: 'storage_unavailable',
+        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
+        retryable: true,
+        code: 'storage_unavailable',
+        requestId
+      }, corsOrigin);
+    }
+    rows = supabaseQuery.rows;
+  } else {
+    const db = getD1Database(env);
+    const query = await db.prepare(SELECT_LIST_SYNC_CHANGES_SQL).bind(userId, sinceMs, limit).all();
+    rows = Array.isArray(query?.results) ? query.results : [];
+  }
 
   let cursorMs = sinceMs;
   const operations = [];
@@ -4800,8 +5357,8 @@ async function handleListSyncPull({ request, env, corsOrigin, verifyIdToken, req
     if (updatedAtMs > cursorMs) {
       cursorMs = updatedAtMs;
     }
-    const listKey = normalizeListKey(row?.list_key);
-    const itemKey = normalizeItemKey(row?.item_key);
+    const listKey = normalizeListKey(row?.list_key ?? row?.data_group);
+    const itemKey = normalizeItemKey(row?.item_key ?? row?.data_key);
     if (!isValidListKey(listKey) || !itemKey) return;
 
     const deleted = Number(row?.deleted_at_ms || 0) > 0;
@@ -4815,12 +5372,7 @@ async function handleListSyncPull({ request, env, corsOrigin, verifyIdToken, req
       return;
     }
 
-    let payload = null;
-    try {
-      payload = JSON.parse(String(row?.item_json || 'null'));
-    } catch {
-      payload = null;
-    }
+    const payload = parseCanonicalPayloadObject(row?.item_json ?? row?.payload_json);
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return;
 
     operations.push({
@@ -4841,7 +5393,11 @@ async function handleListSyncPull({ request, env, corsOrigin, verifyIdToken, req
 }
 
 async function handleSectorSyncPush({ request, env, corsOrigin, verifyIdToken, requestId, executionContext = null }) {
-  assertD1Configured(env, corsOrigin);
+  const canonicalConfig = resolveSupabaseCanonicalConfig(env);
+  const supabasePrimaryActive = isSupabaseCanonicalPrimaryActive(env, canonicalConfig);
+  if (!supabasePrimaryActive) {
+    assertD1Configured(env, corsOrigin);
+  }
   const body = await parseJsonBody(request, corsOrigin, requestId);
   const userId = normalizeUserId(body?.userId);
   if (!isValidUserId(userId)) {
@@ -4859,7 +5415,30 @@ async function handleSectorSyncPush({ request, env, corsOrigin, verifyIdToken, r
 
   const operations = Array.isArray(body?.operations) ? body.operations : [];
   if (!operations.length) {
-    const state = await readUserSyncState({ db: getD1Database(env), userId });
+    let state = {
+      migratedAtMs: null,
+      migrationSource: null,
+      updatedAtMs: null
+    };
+    if (supabasePrimaryActive) {
+      const stateResult = await readSupabaseSyncState({
+        config: canonicalConfig,
+        userId,
+        requestId
+      });
+      if (!stateResult.ok) {
+        return errorResponse(503, {
+          error: 'storage_unavailable',
+          message: 'Supabase canonical storage is unavailable. Please retry shortly.',
+          retryable: true,
+          code: 'storage_unavailable',
+          requestId
+        }, corsOrigin);
+      }
+      state = stateResult.state;
+    } else {
+      state = await readUserSyncState({ db: getD1Database(env), userId });
+    }
     const responsePayload = {
       ok: true,
       processed: 0,
@@ -4904,37 +5483,103 @@ async function handleSectorSyncPush({ request, env, corsOrigin, verifyIdToken, r
     }, corsOrigin);
   }
 
-  const db = getD1Database(env);
-  const deviceId = String(body?.deviceId || '').trim() || null;
-  const nowIso = new Date().toISOString();
   let cursorMs = parseSinceMs(body?.cursorMs);
   let processed = 0;
-
-  for (let index = 0; index < operations.length; index += 1) {
-    const operation = normalizeSectorSyncOperation(operations[index], corsOrigin, index, requestId);
-    const itemJson = operation.deleted ? null : JSON.stringify(operation.payload);
-    const deletedAtMs = operation.deleted ? operation.updatedAtMs : null;
-    await db
-      .prepare(UPSERT_SECTOR_SYNC_ITEM_SQL)
-      .bind(
+  if (supabasePrimaryActive) {
+    const rows = [];
+    const groups = new Set();
+    for (let index = 0; index < operations.length; index += 1) {
+      const operation = normalizeSectorSyncOperation(operations[index], corsOrigin, index, requestId);
+      rows.push(createCanonicalUserDataRow({
         userId,
-        operation.sectorKey,
-        operation.itemKey,
-        itemJson,
-        operation.updatedAtMs,
-        deletedAtMs,
-        deviceId,
-        operation.opId,
-        nowIso
-      )
-      .run();
-    processed += 1;
-    if (operation.updatedAtMs > cursorMs) {
-      cursorMs = operation.updatedAtMs;
+        scope: 'sector',
+        group: operation.sectorKey,
+        key: operation.itemKey,
+        payload: operation.payload,
+        updatedAtMs: operation.updatedAtMs,
+        deletedAtMs: operation.deleted ? operation.updatedAtMs : null,
+        sourcePath: '/sync/sectors/push',
+        requestId,
+        opId: operation.opId
+      }));
+      groups.add(operation.sectorKey);
+      processed += 1;
+      if (operation.updatedAtMs > cursorMs) {
+        cursorMs = operation.updatedAtMs;
+      }
+    }
+    const supabaseResult = await upsertSupabaseCanonicalOperations({
+      config: canonicalConfig,
+      userId,
+      scope: 'sector',
+      sourcePath: '/sync/sectors/push',
+      requestId,
+      operations: rows,
+      groups: [...groups]
+    });
+    if (!supabaseResult.ok) {
+      return errorResponse(503, {
+        error: 'storage_unavailable',
+        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
+        retryable: true,
+        code: 'storage_unavailable',
+        requestId
+      }, corsOrigin);
+    }
+  } else {
+    const db = getD1Database(env);
+    const deviceId = String(body?.deviceId || '').trim() || null;
+    const nowIso = new Date().toISOString();
+    for (let index = 0; index < operations.length; index += 1) {
+      const operation = normalizeSectorSyncOperation(operations[index], corsOrigin, index, requestId);
+      const itemJson = operation.deleted ? null : JSON.stringify(operation.payload);
+      const deletedAtMs = operation.deleted ? operation.updatedAtMs : null;
+      await db
+        .prepare(UPSERT_SECTOR_SYNC_ITEM_SQL)
+        .bind(
+          userId,
+          operation.sectorKey,
+          operation.itemKey,
+          itemJson,
+          operation.updatedAtMs,
+          deletedAtMs,
+          deviceId,
+          operation.opId,
+          nowIso
+        )
+        .run();
+      processed += 1;
+      if (operation.updatedAtMs > cursorMs) {
+        cursorMs = operation.updatedAtMs;
+      }
     }
   }
 
-  const state = await readUserSyncState({ db, userId });
+  let state = {
+    migratedAtMs: null,
+    migrationSource: null,
+    updatedAtMs: null
+  };
+  if (supabasePrimaryActive) {
+    const stateResult = await readSupabaseSyncState({
+      config: canonicalConfig,
+      userId,
+      requestId
+    });
+    if (!stateResult.ok) {
+      return errorResponse(503, {
+        error: 'storage_unavailable',
+        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
+        retryable: true,
+        code: 'storage_unavailable',
+        requestId
+      }, corsOrigin);
+    }
+    state = stateResult.state;
+  } else {
+    const db = getD1Database(env);
+    state = await readUserSyncState({ db, userId });
+  }
   const responsePayload = {
     ok: true,
     processed,
@@ -4957,7 +5602,11 @@ async function handleSectorSyncPush({ request, env, corsOrigin, verifyIdToken, r
 }
 
 async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, requestId }) {
-  assertD1Configured(env, corsOrigin);
+  const canonicalConfig = resolveSupabaseCanonicalConfig(env);
+  const supabasePrimaryActive = isSupabaseCanonicalPrimaryActive(env, canonicalConfig);
+  if (!supabasePrimaryActive) {
+    assertD1Configured(env, corsOrigin);
+  }
   const url = new URL(request.url);
   const userId = normalizeUserId(url.searchParams.get('userId'));
   if (!isValidUserId(userId)) {
@@ -4987,15 +5636,47 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
     }, corsOrigin);
   }
 
-  const db = getD1Database(env);
-  const query = await buildSectorPullStatement({
-    db,
-    userId,
-    sinceMs,
-    limit,
-    sectors: requestedSectors
-  }).all();
-  const rows = Array.isArray(query?.results) ? query.results : [];
+  let rows = [];
+  if (supabasePrimaryActive) {
+    const searchParams = {
+      user_id: `eq.${userId}`,
+      data_scope: 'eq.sector',
+      updated_at_ms: `gt.${sinceMs}`
+    };
+    const sectorsFilter = buildSupabaseInFilter(requestedSectors);
+    if (sectorsFilter) {
+      searchParams.data_group = `in.${sectorsFilter}`;
+    }
+    const supabaseQuery = await selectSupabaseCanonicalRows({
+      config: canonicalConfig,
+      table: canonicalConfig.userDataTable,
+      select: 'data_group,data_key,payload_json,updated_at_ms,deleted_at_ms,op_id',
+      searchParams,
+      order: 'updated_at_ms.asc',
+      limit,
+      requestId
+    });
+    if (!supabaseQuery.ok) {
+      return errorResponse(503, {
+        error: 'storage_unavailable',
+        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
+        retryable: true,
+        code: 'storage_unavailable',
+        requestId
+      }, corsOrigin);
+    }
+    rows = supabaseQuery.rows;
+  } else {
+    const db = getD1Database(env);
+    const query = await buildSectorPullStatement({
+      db,
+      userId,
+      sinceMs,
+      limit,
+      sectors: requestedSectors
+    }).all();
+    rows = Array.isArray(query?.results) ? query.results : [];
+  }
 
   let cursorMs = sinceMs;
   const operations = [];
@@ -5003,8 +5684,8 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
   rows.forEach((row) => {
     const updatedAtMs = parseSinceMs(row?.updated_at_ms);
     if (updatedAtMs > cursorMs) cursorMs = updatedAtMs;
-    const sectorKey = normalizeSectorKey(row?.sector_key);
-    const itemKey = normalizeItemKey(row?.item_key);
+    const sectorKey = normalizeSectorKey(row?.sector_key ?? row?.data_group);
+    const itemKey = normalizeItemKey(row?.item_key ?? row?.data_key);
     if (!isValidSectorKey(sectorKey) || !itemKey) return;
 
     const deleted = Number(row?.deleted_at_ms || 0) > 0;
@@ -5019,12 +5700,7 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
       return;
     }
 
-    let payload = null;
-    try {
-      payload = JSON.parse(String(row?.item_json || 'null'));
-    } catch {
-      payload = null;
-    }
+    const payload = parseCanonicalPayloadObject(row?.item_json ?? row?.payload_json);
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return;
     operations.push({
       sectorKey,
@@ -5036,7 +5712,31 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
     });
   });
 
-  const state = await readUserSyncState({ db, userId });
+  let state = {
+    migratedAtMs: null,
+    migrationSource: null,
+    updatedAtMs: null
+  };
+  if (supabasePrimaryActive) {
+    const stateResult = await readSupabaseSyncState({
+      config: canonicalConfig,
+      userId,
+      requestId
+    });
+    if (!stateResult.ok) {
+      return errorResponse(503, {
+        error: 'storage_unavailable',
+        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
+        retryable: true,
+        code: 'storage_unavailable',
+        requestId
+      }, corsOrigin);
+    }
+    state = stateResult.state;
+  } else {
+    const db = getD1Database(env);
+    state = await readUserSyncState({ db, userId });
+  }
   return jsonResponse(200, {
     ok: true,
     sinceMs,
@@ -5047,7 +5747,11 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
 }
 
 async function handleSectorSyncBootstrap({ request, env, corsOrigin, verifyIdToken, requestId, executionContext = null }) {
-  assertD1Configured(env, corsOrigin);
+  const canonicalConfig = resolveSupabaseCanonicalConfig(env);
+  const supabasePrimaryActive = isSupabaseCanonicalPrimaryActive(env, canonicalConfig);
+  if (!supabasePrimaryActive) {
+    assertD1Configured(env, corsOrigin);
+  }
   const body = await parseJsonBody(request, corsOrigin, requestId);
   const userId = normalizeUserId(body?.userId);
   if (!isValidUserId(userId)) {
@@ -5063,8 +5767,31 @@ async function handleSectorSyncBootstrap({ request, env, corsOrigin, verifyIdTok
   await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId, requestId });
   enforcePrivateEndpointRateLimit({ env, userId, corsOrigin, requestId, kind: 'syncWrite' });
 
-  const db = getD1Database(env);
-  const currentState = await readUserSyncState({ db, userId });
+  let currentState = {
+    migratedAtMs: null,
+    migrationSource: null,
+    updatedAtMs: null
+  };
+  if (supabasePrimaryActive) {
+    const stateResult = await readSupabaseSyncState({
+      config: canonicalConfig,
+      userId,
+      requestId
+    });
+    if (!stateResult.ok) {
+      return errorResponse(503, {
+        error: 'storage_unavailable',
+        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
+        retryable: true,
+        code: 'storage_unavailable',
+        requestId
+      }, corsOrigin);
+    }
+    currentState = stateResult.state;
+  } else {
+    const db = getD1Database(env);
+    currentState = await readUserSyncState({ db, userId });
+  }
   if (currentState.migratedAtMs) {
     const responsePayload = {
       ok: true,
@@ -5098,45 +5825,126 @@ async function handleSectorSyncBootstrap({ request, env, corsOrigin, verifyIdTok
     }, corsOrigin);
   }
 
-  const deviceId = String(body?.deviceId || '').trim() || null;
-  const nowIso = new Date().toISOString();
   const migratedAtMs = Date.now();
   const migrationSource = String(body?.migrationSource || '').trim() || 'unknown';
   let cursorMs = parseSinceMs(body?.cursorMs);
   let processed = 0;
-
-  for (let index = 0; index < operations.length; index += 1) {
-    const operation = normalizeSectorSyncOperation(operations[index], corsOrigin, index, requestId);
-    const itemJson = operation.deleted ? null : JSON.stringify(operation.payload);
-    const deletedAtMs = operation.deleted ? operation.updatedAtMs : null;
-    await db
-      .prepare(UPSERT_SECTOR_SYNC_ITEM_SQL)
-      .bind(
+  if (supabasePrimaryActive) {
+    const rows = [];
+    const groups = new Set();
+    for (let index = 0; index < operations.length; index += 1) {
+      const operation = normalizeSectorSyncOperation(operations[index], corsOrigin, index, requestId);
+      rows.push(createCanonicalUserDataRow({
         userId,
-        operation.sectorKey,
-        operation.itemKey,
-        itemJson,
-        operation.updatedAtMs,
-        deletedAtMs,
-        deviceId,
-        operation.opId,
-        nowIso
-      )
-      .run();
-    processed += 1;
-    if (operation.updatedAtMs > cursorMs) {
-      cursorMs = operation.updatedAtMs;
+        scope: 'sector',
+        group: operation.sectorKey,
+        key: operation.itemKey,
+        payload: operation.payload,
+        updatedAtMs: operation.updatedAtMs,
+        deletedAtMs: operation.deleted ? operation.updatedAtMs : null,
+        sourcePath: '/sync/sectors/bootstrap',
+        requestId,
+        opId: operation.opId
+      }));
+      groups.add(operation.sectorKey);
+      processed += 1;
+      if (operation.updatedAtMs > cursorMs) {
+        cursorMs = operation.updatedAtMs;
+      }
     }
+    const writeResult = await upsertSupabaseCanonicalOperations({
+      config: canonicalConfig,
+      userId,
+      scope: 'sector',
+      sourcePath: '/sync/sectors/bootstrap',
+      requestId,
+      operations: rows,
+      groups: [...groups]
+    });
+    if (!writeResult.ok) {
+      return errorResponse(503, {
+        error: 'storage_unavailable',
+        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
+        retryable: true,
+        code: 'storage_unavailable',
+        requestId
+      }, corsOrigin);
+    }
+    const stateWriteResult = await persistSupabaseSyncState({
+      config: canonicalConfig,
+      userId,
+      state: {
+        migratedAtMs,
+        migrationSource,
+        updatedAtMs: migratedAtMs
+      },
+      requestId,
+      sourcePath: '/sync/sectors/bootstrap'
+    });
+    if (!stateWriteResult.ok) {
+      return errorResponse(503, {
+        error: 'storage_unavailable',
+        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
+        retryable: true,
+        code: 'storage_unavailable',
+        requestId
+      }, corsOrigin);
+    }
+  } else {
+    const db = getD1Database(env);
+    const deviceId = String(body?.deviceId || '').trim() || null;
+    const nowIso = new Date().toISOString();
+    for (let index = 0; index < operations.length; index += 1) {
+      const operation = normalizeSectorSyncOperation(operations[index], corsOrigin, index, requestId);
+      const itemJson = operation.deleted ? null : JSON.stringify(operation.payload);
+      const deletedAtMs = operation.deleted ? operation.updatedAtMs : null;
+      await db
+        .prepare(UPSERT_SECTOR_SYNC_ITEM_SQL)
+        .bind(
+          userId,
+          operation.sectorKey,
+          operation.itemKey,
+          itemJson,
+          operation.updatedAtMs,
+          deletedAtMs,
+          deviceId,
+          operation.opId,
+          nowIso
+        )
+        .run();
+      processed += 1;
+      if (operation.updatedAtMs > cursorMs) {
+        cursorMs = operation.updatedAtMs;
+      }
+    }
+
+    await persistUserSyncState({
+      db,
+      userId,
+      migratedAtMs,
+      migrationSource,
+      updatedAtMs: migratedAtMs
+    });
   }
 
-  await persistUserSyncState({
-    db,
-    userId,
+  let state = {
     migratedAtMs,
     migrationSource,
     updatedAtMs: migratedAtMs
-  });
-  const state = await readUserSyncState({ db, userId });
+  };
+  if (supabasePrimaryActive) {
+    const stateResult = await readSupabaseSyncState({
+      config: canonicalConfig,
+      userId,
+      requestId
+    });
+    if (stateResult.ok) {
+      state = stateResult.state;
+    }
+  } else {
+    const db = getD1Database(env);
+    state = await readUserSyncState({ db, userId });
+  }
   const responsePayload = {
     ok: true,
     skipped: false,
@@ -5205,7 +6013,13 @@ async function handleImportRequest({ request, env, corsOrigin }) {
       if (!isValidUserId(userId)) {
         throw jsonResponse(400, { error: 'invalid_user_id', message: `Invalid userId: ${docId}` }, corsOrigin);
       }
-      writes.push(persistSnapshot({ env, userId, snapshot: docData || {}, corsOrigin }));
+      writes.push(persistSnapshot({
+        env,
+        userId,
+        snapshot: docData || {},
+        corsOrigin,
+        requestId: 'import'
+      }));
       count += 1;
       if (writes.length >= 25) {
         await Promise.all(writes);
@@ -5228,7 +6042,13 @@ async function handleBulkImportRequest({ request, env, corsOrigin }) {
   for (const [docId, docData] of Object.entries(data || {})) {
     const userId = normalizeUserId(docId);
     if (!isValidUserId(userId)) continue;
-    writes.push(persistSnapshot({ env, userId, snapshot: docData || {}, corsOrigin }));
+    writes.push(persistSnapshot({
+      env,
+      userId,
+      snapshot: docData || {},
+      corsOrigin,
+      requestId: 'bulk-import'
+    }));
     count += 1;
     if (writes.length >= 25) {
       await Promise.all(writes);
@@ -5260,10 +6080,10 @@ async function handleGetSnapshot({ request, env, corsOrigin, verifyIdToken, requ
   const wantsMeta = url.searchParams.get('meta') === 'true';
 
   if (wantsMeta) {
-    return jsonResponse(200, await readSnapshotMeta({ env, userId }), corsOrigin, { 'x-request-id': requestId });
+    return jsonResponse(200, await readSnapshotMeta({ env, userId, requestId }), corsOrigin, { 'x-request-id': requestId });
   }
 
-  const value = await readSnapshotValue({ env, userId });
+  const value = await readSnapshotValue({ env, userId, requestId });
   if (value === null) {
     return errorResponse(404, {
       error: 'not_found',
@@ -5305,7 +6125,7 @@ async function handleSaveSnapshot({ request, env, corsOrigin, verifyIdToken, req
     }, corsOrigin);
   }
 
-  const result = await persistSnapshot({ env, userId, snapshot: payload, corsOrigin });
+  const result = await persistSnapshot({ env, userId, snapshot: payload, corsOrigin, requestId });
 
   const responsePayload = {
     ok: true,
@@ -5332,6 +6152,7 @@ function buildHealthPayload(env) {
   const hasR2 = Boolean(getR2Bucket(env));
   const supabaseMirror = resolveSupabaseMirrorConfig(env);
   const supabaseCanonical = resolveSupabaseCanonicalConfig(env);
+  const supabaseCanonicalPrimaryActive = isSupabaseCanonicalPrimaryActive(env, supabaseCanonical);
   return {
     ok: true,
     service: 'data-api',
@@ -5340,8 +6161,8 @@ function buildHealthPayload(env) {
       d1: hasD1,
       kv: hasKv,
       r2: hasR2,
-      snapshotStorageReady: hasD1 || hasKv,
-      syncStorageReady: hasD1
+      snapshotStorageReady: supabaseCanonicalPrimaryActive || hasD1 || hasKv,
+      syncStorageReady: supabaseCanonicalPrimaryActive || hasD1
     },
     mirrors: {
       supabase: {
@@ -5366,6 +6187,7 @@ function buildHealthPayload(env) {
         canonical: {
           enabled: supabaseCanonical.enabled === true,
           active: supabaseCanonical.active === true,
+          primaryMode: supabaseCanonicalPrimaryActive === true,
           profileTable: supabaseCanonical.profileTable,
           userDataTable: supabaseCanonical.userDataTable,
           timeoutMs: supabaseCanonical.timeoutMs,
