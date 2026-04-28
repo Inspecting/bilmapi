@@ -1,0 +1,36 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "data-api-staging",
+  "main": "src/index.js",
+  "workers_dev": true,
+  "preview_urls": true,
+  "compatibility_date": "2026-03-01",
+  "observability": {
+    "enabled": true
+  },
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "vars": {
+    "FIREBASE_PROJECT_ID": "bilm-7bfe1",
+    "BILM_DISABLE_AUTH": "false",
+    "BILM_AUTH_BYPASS_TOKEN": ""
+  },
+  "kv_namespaces": [
+    {
+      "binding": "BILM_DATA",
+      "id": "0c8fab5c859d4905b2e09938bcf07834"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "BILM_DB",
+      "database_name": "bilm-data-staging",
+      "database_id": "596364e7-4619-4a1a-ae7b-939100d449ce",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "triggers": {
+    "crons": ["0 */6 * * *"]
+  }
+}
