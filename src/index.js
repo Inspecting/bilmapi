@@ -493,11 +493,14 @@ const PRIVATE_ENDPOINT_RATE_LIMIT_STORE = new Map();
 let nextPrivateEndpointRateLimitSweepAtMs = 0;
 const PRIVATE_ENDPOINT_RATE_LIMIT_STORE_SOFT_CAP = 8000;
 const DEFAULT_PRIVATE_ENDPOINT_RATE_LIMITS = Object.freeze({
-  snapshotRead: Object.freeze({ limit: 180, windowMs: 60_000 }),
-  snapshotWrite: Object.freeze({ limit: 60, windowMs: 60_000 }),
-  syncRead: Object.freeze({ limit: 240, windowMs: 60_000 }),
-  syncWrite: Object.freeze({ limit: 90, windowMs: 60_000 })
+  snapshotRead: Object.freeze({ limit: 120, windowMs: 60_000 }),
+  snapshotWrite: Object.freeze({ limit: 50, windowMs: 60_000 }),
+  syncRead: Object.freeze({ limit: 120, windowMs: 60_000 }),
+  syncWrite: Object.freeze({ limit: 70, windowMs: 60_000 })
 });
+const SUPABASE_CANONICAL_READ_COOLDOWN_STORE = new Map();
+let nextSupabaseCanonicalReadCooldownSweepAtMs = 0;
+const SUPABASE_CANONICAL_READ_COOLDOWN_SOFT_CAP = 8000;
 const DISALLOWED_CREDENTIAL_KEYS = new Set([
   'password',
   'passwordhash',
@@ -1204,7 +1207,7 @@ function resolveSupabaseCanonicalConfig(env) {
   const profileTable = String(env?.SUPABASE_CANONICAL_PROFILE_TABLE || env?.SUPABASE_PROFILE_TABLE || 'bilm_profiles').trim().toLowerCase();
   const userDataTable = String(env?.SUPABASE_CANONICAL_USER_DATA_TABLE || env?.SUPABASE_USER_DATA_TABLE || 'bilm_user_data').trim().toLowerCase();
   const timeoutMs = parseEnvInt(env, 'SUPABASE_CANONICAL_TIMEOUT_MS', 10_000, { min: 1000, max: 60_000 });
-  const maxRetries = parseEnvInt(env, 'SUPABASE_CANONICAL_MAX_RETRIES', 2, { min: 0, max: 6 });
+  const maxRetries = parseEnvInt(env, 'SUPABASE_CANONICAL_MAX_RETRIES', 1, { min: 0, max: 6 });
   const retryBaseMs = parseEnvInt(env, 'SUPABASE_CANONICAL_RETRY_BASE_MS', 250, { min: 25, max: 5000 });
   const retryJitterMs = parseEnvInt(env, 'SUPABASE_CANONICAL_RETRY_JITTER_MS', 100, { min: 0, max: 1500 });
   const batchSize = parseEnvInt(env, 'SUPABASE_CANONICAL_BATCH_SIZE', 250, { min: 1, max: 1000 });
@@ -2658,6 +2661,83 @@ function enforcePrivateEndpointRateLimit({ env, userId, corsOrigin, requestId, k
   }, corsOrigin, {
     'retry-after': String(state.retryAfterSeconds)
   });
+}
+
+function getSupabaseCanonicalReadCooldownMs(env) {
+  return parseEnvInt(env, 'SUPABASE_CANONICAL_READ_FAIL_COOLDOWN_MS', 20_000, { min: 0, max: 10 * 60 * 1000 });
+}
+
+function sweepSupabaseCanonicalReadCooldownStore(nowMs) {
+  if (
+    nowMs < nextSupabaseCanonicalReadCooldownSweepAtMs
+    && SUPABASE_CANONICAL_READ_COOLDOWN_STORE.size < SUPABASE_CANONICAL_READ_COOLDOWN_SOFT_CAP
+  ) {
+    return;
+  }
+  for (const [key, entry] of SUPABASE_CANONICAL_READ_COOLDOWN_STORE.entries()) {
+    if (!entry || Number(entry.untilMs || 0) <= nowMs) {
+      SUPABASE_CANONICAL_READ_COOLDOWN_STORE.delete(key);
+    }
+  }
+  nextSupabaseCanonicalReadCooldownSweepAtMs = nowMs + 60_000;
+}
+
+function getSupabaseCanonicalReadCooldownState(userId = '') {
+  const normalizedUserId = normalizeUserId(userId);
+  if (!isValidUserId(normalizedUserId)) {
+    return { blocked: false, retryAfterSeconds: 0 };
+  }
+  const nowMs = Date.now();
+  sweepSupabaseCanonicalReadCooldownStore(nowMs);
+  const key = `supabase-read:${normalizedUserId}`;
+  const entry = SUPABASE_CANONICAL_READ_COOLDOWN_STORE.get(key);
+  const untilMs = Number(entry?.untilMs || 0) || 0;
+  if (untilMs <= nowMs) {
+    SUPABASE_CANONICAL_READ_COOLDOWN_STORE.delete(key);
+    return { blocked: false, retryAfterSeconds: 0 };
+  }
+  return {
+    blocked: true,
+    retryAfterSeconds: Math.max(1, Math.ceil((untilMs - nowMs) / 1000))
+  };
+}
+
+function enforceSupabaseCanonicalReadCooldown({ env, userId, corsOrigin, requestId }) {
+  const state = getSupabaseCanonicalReadCooldownState(userId);
+  if (!state.blocked) return;
+  throw errorResponse(503, {
+    error: 'storage_unavailable',
+    message: 'Supabase canonical storage is temporarily cooling down for this user. Please retry shortly.',
+    retryable: true,
+    code: 'storage_unavailable',
+    requestId
+  }, corsOrigin, {
+    'retry-after': String(state.retryAfterSeconds)
+  });
+}
+
+function clearSupabaseCanonicalReadCooldown(userId = '') {
+  const normalizedUserId = normalizeUserId(userId);
+  if (!isValidUserId(normalizedUserId)) return;
+  SUPABASE_CANONICAL_READ_COOLDOWN_STORE.delete(`supabase-read:${normalizedUserId}`);
+}
+
+function recordSupabaseCanonicalReadCooldown({ env, userId, status = 0 } = {}) {
+  const normalizedUserId = normalizeUserId(userId);
+  if (!isValidUserId(normalizedUserId)) return 0;
+  const numericStatus = Number(status || 0) || 0;
+  const shouldCooldown = numericStatus === 429 || numericStatus >= 500 || numericStatus === 0;
+  if (!shouldCooldown) return 0;
+  const cooldownMs = getSupabaseCanonicalReadCooldownMs(env);
+  if (cooldownMs <= 0) return 0;
+  const nowMs = Date.now();
+  const key = `supabase-read:${normalizedUserId}`;
+  const untilMs = nowMs + cooldownMs;
+  SUPABASE_CANONICAL_READ_COOLDOWN_STORE.set(key, {
+    untilMs,
+    status: numericStatus
+  });
+  return Math.max(1, Math.ceil(cooldownMs / 1000));
 }
 
 function enforceAccountLinkRateLimit({ env, authContext, corsOrigin, requestId, kind = 'read' }) {
@@ -5435,6 +5515,9 @@ async function handleListSyncPull({ request, env, corsOrigin, verifyIdToken, req
 
   await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId, requestId });
   enforcePrivateEndpointRateLimit({ env, userId, corsOrigin, requestId, kind: 'syncRead' });
+  if (supabasePrimaryActive) {
+    enforceSupabaseCanonicalReadCooldown({ env, userId, corsOrigin, requestId });
+  }
 
   const sinceMs = parseSinceMs(url.searchParams.get('since'));
   const limit = parsePullLimit(url.searchParams.get('limit'));
@@ -5454,14 +5537,20 @@ async function handleListSyncPull({ request, env, corsOrigin, verifyIdToken, req
       requestId
     });
     if (!supabaseQuery.ok) {
+      const retryAfterSeconds = recordSupabaseCanonicalReadCooldown({
+        env,
+        userId,
+        status: supabaseQuery.status
+      });
       return errorResponse(503, {
         error: 'storage_unavailable',
         message: 'Supabase canonical storage is unavailable. Please retry shortly.',
         retryable: true,
         code: 'storage_unavailable',
         requestId
-      }, corsOrigin);
+      }, corsOrigin, retryAfterSeconds > 0 ? { 'retry-after': String(retryAfterSeconds) } : undefined);
     }
+    clearSupabaseCanonicalReadCooldown(userId);
     rows = supabaseQuery.rows;
   } else {
     const db = getD1Database(env);
@@ -5754,6 +5843,9 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
 
   await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId, requestId });
   enforcePrivateEndpointRateLimit({ env, userId, corsOrigin, requestId, kind: 'syncRead' });
+  if (supabasePrimaryActive) {
+    enforceSupabaseCanonicalReadCooldown({ env, userId, corsOrigin, requestId });
+  }
 
   const sinceMs = parseSinceMs(url.searchParams.get('since'));
   const limit = parsePullLimit(url.searchParams.get('limit'));
@@ -5790,14 +5882,20 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
       requestId
     });
     if (!supabaseQuery.ok) {
+      const retryAfterSeconds = recordSupabaseCanonicalReadCooldown({
+        env,
+        userId,
+        status: supabaseQuery.status
+      });
       return errorResponse(503, {
         error: 'storage_unavailable',
         message: 'Supabase canonical storage is unavailable. Please retry shortly.',
         retryable: true,
         code: 'storage_unavailable',
         requestId
-      }, corsOrigin);
+      }, corsOrigin, retryAfterSeconds > 0 ? { 'retry-after': String(retryAfterSeconds) } : undefined);
     }
+    clearSupabaseCanonicalReadCooldown(userId);
     rows = supabaseQuery.rows;
   } else {
     const db = getD1Database(env);
