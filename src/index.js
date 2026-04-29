@@ -1827,7 +1827,8 @@ async function persistSnapshotToSupabaseCanonical({
   userId = '',
   snapshot = null,
   requestId = '',
-  sourcePath = '/'
+  sourcePath = '/',
+  email = null
 } = {}) {
   const nowMs = Date.now();
   const snapshotRow = createCanonicalUserDataRow({
@@ -1852,7 +1853,8 @@ async function persistSnapshotToSupabaseCanonical({
     userId,
     path: sourcePath,
     requestId,
-    metadata: profileMetadata
+    metadata: profileMetadata,
+    email
   });
   if (!profileResult.ok) return profileResult;
   return await upsertSupabaseCanonicalRows({
@@ -2004,7 +2006,8 @@ async function upsertSupabaseCanonicalOperations({
   sourcePath = '',
   requestId = '',
   operations = [],
-  groups = []
+  groups = [],
+  email = null
 } = {}) {
   const existingQuery = await loadSupabaseCanonicalRowsForScope({
     config,
@@ -2043,6 +2046,7 @@ async function upsertSupabaseCanonicalOperations({
     userId,
     path: sourcePath || '/',
     requestId,
+    email,
     metadata: {
       requestId: String(requestId || '').trim() || null,
       path: sourcePath || '/',
@@ -3827,7 +3831,74 @@ async function writeSnapshotToKv({ env, userId, snapshotJson, metadata }) {
   return true;
 }
 
-async function persistSnapshot({ env, userId, snapshot, corsOrigin, requestId = '' }) {
+async function writeListSyncOperationsToD1Backup({
+  env,
+  userId = '',
+  deviceId = null,
+  operations = []
+} = {}) {
+  const db = getD1Database(env);
+  if (!db) return false;
+  const nowIso = new Date().toISOString();
+  const normalizedDeviceId = String(deviceId || '').trim() || null;
+  const rows = Array.isArray(operations) ? operations : [];
+  for (let index = 0; index < rows.length; index += 1) {
+    const operation = rows[index];
+    if (!operation || typeof operation !== 'object') continue;
+    const itemJson = operation.deleted ? null : JSON.stringify(operation.payload);
+    const deletedAtMs = operation.deleted ? operation.updatedAtMs : null;
+    await db
+      .prepare(UPSERT_LIST_SYNC_ITEM_SQL)
+      .bind(
+        userId,
+        operation.listKey,
+        operation.itemKey,
+        itemJson,
+        operation.updatedAtMs,
+        deletedAtMs,
+        normalizedDeviceId,
+        nowIso
+      )
+      .run();
+  }
+  return true;
+}
+
+async function writeSectorSyncOperationsToD1Backup({
+  env,
+  userId = '',
+  deviceId = null,
+  operations = []
+} = {}) {
+  const db = getD1Database(env);
+  if (!db) return false;
+  const nowIso = new Date().toISOString();
+  const normalizedDeviceId = String(deviceId || '').trim() || null;
+  const rows = Array.isArray(operations) ? operations : [];
+  for (let index = 0; index < rows.length; index += 1) {
+    const operation = rows[index];
+    if (!operation || typeof operation !== 'object') continue;
+    const itemJson = operation.deleted ? null : JSON.stringify(operation.payload);
+    const deletedAtMs = operation.deleted ? operation.updatedAtMs : null;
+    await db
+      .prepare(UPSERT_SECTOR_SYNC_ITEM_SQL)
+      .bind(
+        userId,
+        operation.sectorKey,
+        operation.itemKey,
+        itemJson,
+        operation.updatedAtMs,
+        deletedAtMs,
+        normalizedDeviceId,
+        operation.opId,
+        nowIso
+      )
+      .run();
+  }
+  return true;
+}
+
+async function persistSnapshot({ env, userId, snapshot, corsOrigin, requestId = '', email = null }) {
   assertNoCredentialStorage(snapshot, corsOrigin);
 
   const metadata = getSnapshotMetadata(snapshot);
@@ -3849,13 +3920,24 @@ async function persistSnapshot({ env, userId, snapshot, corsOrigin, requestId = 
       userId,
       snapshot,
       requestId,
-      sourcePath: '/'
+      sourcePath: '/',
+      email
     });
     if (!supabaseResult.ok) {
       throw jsonResponse(503, {
         error: 'storage_unavailable',
         message: 'Supabase canonical storage is unavailable. Please retry shortly.'
       }, corsOrigin);
+    }
+    try {
+      await writeSnapshotToD1({ env, userId, snapshotJson, metadata });
+    } catch (error) {
+      console.warn(`[api][${requestId || 'no-request-id'}] cloudflare d1 snapshot backup write failed: ${String(error?.message || error || 'unknown')}`);
+    }
+    try {
+      await writeSnapshotToKv({ env, userId, snapshotJson, metadata });
+    } catch (error) {
+      console.warn(`[api][${requestId || 'no-request-id'}] cloudflare kv snapshot backup write failed: ${String(error?.message || error || 'unknown')}`);
     }
     return {
       bytes: snapshotBytes,
@@ -4979,6 +5061,46 @@ async function handleResetAccountData({ request, env, corsOrigin, verifyIdToken,
     }
   }
 
+  if (supabasePrimaryActive) {
+    const deleteMarkResult = await markSupabaseCanonicalRowsDeletedForUser({
+      config: canonicalConfig,
+      userId: authContext.userId,
+      deletedAtMs: Date.now(),
+      requestId,
+      sourcePath: '/account/reset'
+    });
+    if (!deleteMarkResult.ok) {
+      return errorResponse(503, {
+        error: 'storage_unavailable',
+        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
+        retryable: true,
+        code: 'storage_unavailable',
+        requestId
+      }, corsOrigin);
+    }
+    deleted.supabaseRowsMarked = 1;
+    const stateWriteResult = await persistSupabaseSyncState({
+      config: canonicalConfig,
+      userId: authContext.userId,
+      state: {
+        migratedAtMs: null,
+        migrationSource: null,
+        updatedAtMs: Date.now()
+      },
+      requestId,
+      sourcePath: '/account/reset'
+    });
+    if (!stateWriteResult.ok) {
+      return errorResponse(503, {
+        error: 'storage_unavailable',
+        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
+        retryable: true,
+        code: 'storage_unavailable',
+        requestId
+      }, corsOrigin);
+    }
+  }
+
   const responsePayload = {
     ok: true,
     userId: authContext.userId,
@@ -5164,7 +5286,8 @@ async function handleListSyncPush({ request, env, corsOrigin, verifyIdToken, req
     }, corsOrigin);
   }
 
-  await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId, requestId });
+  const authPayload = await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId, requestId });
+  const authEmail = canonicalizeEmailForMatching(authPayload?.email || '');
   enforcePrivateEndpointRateLimit({ env, userId, corsOrigin, requestId, kind: 'syncWrite' });
 
   const operations = Array.isArray(body?.operations) ? body.operations : [];
@@ -5198,6 +5321,7 @@ async function handleListSyncPush({ request, env, corsOrigin, verifyIdToken, req
   if (supabasePrimaryActive) {
     const nowMs = Date.now();
     const rows = [];
+    const backupOperations = [];
     const groups = new Set();
     for (let index = 0; index < operations.length; index += 1) {
       const operation = normalizeListSyncOperation(operations[index], corsOrigin, index);
@@ -5212,6 +5336,7 @@ async function handleListSyncPush({ request, env, corsOrigin, verifyIdToken, req
         sourcePath: '/sync/lists/push',
         requestId
       }));
+      backupOperations.push(operation);
       groups.add(operation.listKey);
       processed += 1;
       if (operation.updatedAtMs > cursorMs) {
@@ -5225,7 +5350,8 @@ async function handleListSyncPush({ request, env, corsOrigin, verifyIdToken, req
       sourcePath: '/sync/lists/push',
       requestId,
       operations: rows,
-      groups: [...groups]
+      groups: [...groups],
+      email: isValidEmail(authEmail) ? authEmail : null
     });
     if (!supabaseResult.ok) {
       return errorResponse(503, {
@@ -5235,6 +5361,16 @@ async function handleListSyncPush({ request, env, corsOrigin, verifyIdToken, req
         code: 'storage_unavailable',
         requestId
       }, corsOrigin);
+    }
+    try {
+      await writeListSyncOperationsToD1Backup({
+        env,
+        userId,
+        deviceId: body?.deviceId,
+        operations: backupOperations
+      });
+    } catch (error) {
+      console.warn(`[api][${requestId || 'no-request-id'}] cloudflare d1 list sync backup write failed: ${String(error?.message || error || 'unknown')}`);
     }
   } else {
     const db = getD1Database(env);
@@ -5262,37 +5398,6 @@ async function handleListSyncPush({ request, env, corsOrigin, verifyIdToken, req
         cursorMs = operation.updatedAtMs;
       }
     }
-  }
-
-  if (supabasePrimaryActive) {
-    const deleteMarkResult = await markSupabaseCanonicalRowsDeletedForUser({
-      config: canonicalConfig,
-      userId: authContext.userId,
-      deletedAtMs: Date.now(),
-      requestId,
-      sourcePath: '/account/reset'
-    });
-    if (!deleteMarkResult.ok) {
-      return errorResponse(503, {
-        error: 'storage_unavailable',
-        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
-        retryable: true,
-        code: 'storage_unavailable',
-        requestId
-      }, corsOrigin);
-    }
-    deleted.supabaseRowsMarked = 1;
-    await persistSupabaseSyncState({
-      config: canonicalConfig,
-      userId: authContext.userId,
-      state: {
-        migratedAtMs: null,
-        migrationSource: null,
-        updatedAtMs: Date.now()
-      },
-      requestId,
-      sourcePath: '/account/reset'
-    });
   }
 
   const responsePayload = { ok: true, processed, cursorMs };
@@ -5502,6 +5607,7 @@ async function handleSectorSyncPush({ request, env, corsOrigin, verifyIdToken, r
   let processed = 0;
   if (supabasePrimaryActive) {
     const rows = [];
+    const backupOperations = [];
     const groups = new Set();
     for (let index = 0; index < operations.length; index += 1) {
       const operation = normalizeSectorSyncOperation(operations[index], corsOrigin, index, requestId);
@@ -5517,6 +5623,7 @@ async function handleSectorSyncPush({ request, env, corsOrigin, verifyIdToken, r
         requestId,
         opId: operation.opId
       }));
+      backupOperations.push(operation);
       groups.add(operation.sectorKey);
       processed += 1;
       if (operation.updatedAtMs > cursorMs) {
@@ -5530,7 +5637,8 @@ async function handleSectorSyncPush({ request, env, corsOrigin, verifyIdToken, r
       sourcePath: '/sync/sectors/push',
       requestId,
       operations: rows,
-      groups: [...groups]
+      groups: [...groups],
+      email: isValidEmail(authEmail) ? authEmail : null
     });
     if (!supabaseResult.ok) {
       return errorResponse(503, {
@@ -5540,6 +5648,16 @@ async function handleSectorSyncPush({ request, env, corsOrigin, verifyIdToken, r
         code: 'storage_unavailable',
         requestId
       }, corsOrigin);
+    }
+    try {
+      await writeSectorSyncOperationsToD1Backup({
+        env,
+        userId,
+        deviceId: body?.deviceId,
+        operations: backupOperations
+      });
+    } catch (error) {
+      console.warn(`[api][${requestId || 'no-request-id'}] cloudflare d1 sector sync backup write failed: ${String(error?.message || error || 'unknown')}`);
     }
   } else {
     const db = getD1Database(env);
@@ -5779,7 +5897,8 @@ async function handleSectorSyncBootstrap({ request, env, corsOrigin, verifyIdTok
     }, corsOrigin);
   }
 
-  await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId, requestId });
+  const authPayload = await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId, requestId });
+  const authEmail = canonicalizeEmailForMatching(authPayload?.email || '');
   enforcePrivateEndpointRateLimit({ env, userId, corsOrigin, requestId, kind: 'syncWrite' });
 
   let currentState = {
@@ -5846,6 +5965,7 @@ async function handleSectorSyncBootstrap({ request, env, corsOrigin, verifyIdTok
   let processed = 0;
   if (supabasePrimaryActive) {
     const rows = [];
+    const backupOperations = [];
     const groups = new Set();
     for (let index = 0; index < operations.length; index += 1) {
       const operation = normalizeSectorSyncOperation(operations[index], corsOrigin, index, requestId);
@@ -5861,6 +5981,7 @@ async function handleSectorSyncBootstrap({ request, env, corsOrigin, verifyIdTok
         requestId,
         opId: operation.opId
       }));
+      backupOperations.push(operation);
       groups.add(operation.sectorKey);
       processed += 1;
       if (operation.updatedAtMs > cursorMs) {
@@ -5874,7 +5995,8 @@ async function handleSectorSyncBootstrap({ request, env, corsOrigin, verifyIdTok
       sourcePath: '/sync/sectors/bootstrap',
       requestId,
       operations: rows,
-      groups: [...groups]
+      groups: [...groups],
+      email: isValidEmail(authEmail) ? authEmail : null
     });
     if (!writeResult.ok) {
       return errorResponse(503, {
@@ -5904,6 +6026,26 @@ async function handleSectorSyncBootstrap({ request, env, corsOrigin, verifyIdTok
         code: 'storage_unavailable',
         requestId
       }, corsOrigin);
+    }
+    try {
+      await writeSectorSyncOperationsToD1Backup({
+        env,
+        userId,
+        deviceId: body?.deviceId,
+        operations: backupOperations
+      });
+      const backupDb = getD1Database(env);
+      if (backupDb) {
+        await persistUserSyncState({
+          db: backupDb,
+          userId,
+          migratedAtMs,
+          migrationSource,
+          updatedAtMs: migratedAtMs
+        });
+      }
+    } catch (error) {
+      console.warn(`[api][${requestId || 'no-request-id'}] cloudflare d1 sector bootstrap backup write failed: ${String(error?.message || error || 'unknown')}`);
     }
   } else {
     const db = getD1Database(env);
@@ -6126,7 +6268,8 @@ async function handleSaveSnapshot({ request, env, corsOrigin, verifyIdToken, req
     }, corsOrigin);
   }
 
-  await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId, requestId });
+  const authPayload = await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId, requestId });
+  const authEmail = canonicalizeEmailForMatching(authPayload?.email || '');
   enforcePrivateEndpointRateLimit({ env, userId, corsOrigin, requestId, kind: 'snapshotWrite' });
 
   const payload = extractSnapshotFromSaveBody(body);
@@ -6140,7 +6283,14 @@ async function handleSaveSnapshot({ request, env, corsOrigin, verifyIdToken, req
     }, corsOrigin);
   }
 
-  const result = await persistSnapshot({ env, userId, snapshot: payload, corsOrigin, requestId });
+  const result = await persistSnapshot({
+    env,
+    userId,
+    snapshot: payload,
+    corsOrigin,
+    requestId,
+    email: isValidEmail(authEmail) ? authEmail : null
+  });
 
   const responsePayload = {
     ok: true,
