@@ -9,6 +9,7 @@ const USER_ID = String(process.env.VERIFY_USER_ID || '').trim();
 const D1_DB_NAME = String(process.env.VERIFY_D1_DB_NAME || 'bilm-data-staging').trim();
 const SUPABASE_URL = String(process.env.SUPABASE_URL || process.env.SUPABASE_PROJECT_URL || '').trim().replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+const INCLUDE_LEGACY_MIRROR = String(process.env.VERIFY_INCLUDE_LEGACY_MIRROR || '').trim() === '1';
 
 if (!USER_ID) {
   throw new Error('Missing VERIFY_USER_ID. Example: VERIFY_USER_ID=abc123 npm run verify:staging-user');
@@ -38,10 +39,6 @@ const d1SectorRows = readD1Scalar(`
   WHERE user_id = '${escapeSqlLiteral(USER_ID)}';
 `);
 
-const mirrorEvents = await fetchSupabaseCount({
-  table: 'cloudflare_mirror_events',
-  filters: [`user_id=eq.${encodeURIComponent(USER_ID)}`]
-});
 const profileRows = await fetchSupabaseCount({
   table: 'bilm_profiles',
   filters: [`user_id=eq.${encodeURIComponent(USER_ID)}`]
@@ -54,6 +51,12 @@ const userDataDeletedRows = await fetchSupabaseCount({
   table: 'bilm_user_data',
   filters: [`user_id=eq.${encodeURIComponent(USER_ID)}`, 'deleted_at_ms=not.is.null']
 });
+const legacyMirror = INCLUDE_LEGACY_MIRROR
+  ? await fetchSupabaseCountSafe({
+    table: 'cloudflare_mirror_events',
+    filters: [`user_id=eq.${encodeURIComponent(USER_ID)}`]
+  })
+  : null;
 
 console.log(JSON.stringify({
   ok: true,
@@ -67,10 +70,10 @@ console.log(JSON.stringify({
   },
   supabase: {
     projectUrl: SUPABASE_URL,
-    mirrorEvents,
     profiles: profileRows,
     userData: userDataRows,
-    userDataDeleted: userDataDeletedRows
+    userDataDeleted: userDataDeletedRows,
+    legacyMirror
   }
 }, null, 2));
 
@@ -124,6 +127,22 @@ async function fetchSupabaseCount({ table, filters = [] }) {
   const match = /\/(\d+)\s*$/.exec(rangeHeader);
   if (!match) return 0;
   return Number(match[1] || 0) || 0;
+}
+
+async function fetchSupabaseCountSafe({ table, filters = [] }) {
+  try {
+    return {
+      enabled: true,
+      count: await fetchSupabaseCount({ table, filters }),
+      error: null
+    };
+  } catch (error) {
+    return {
+      enabled: true,
+      count: null,
+      error: String(error?.message || error || 'unknown_error')
+    };
+  }
 }
 
 function resolveWranglerBin() {

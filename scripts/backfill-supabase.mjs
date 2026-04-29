@@ -9,12 +9,15 @@ import process from 'node:process';
 const D1_DB_NAME = process.env.BACKFILL_D1_DB_NAME || 'bilm-data';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || process.env.SUPABASE_PROJECT_URL || '').trim().replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
-const SUPABASE_TABLE = String(process.env.SUPABASE_MIRROR_TABLE || 'cloudflare_mirror_events').trim();
+const PROFILE_TABLE = String(process.env.SUPABASE_CANONICAL_PROFILE_TABLE || 'bilm_profiles').trim();
+const USER_DATA_TABLE = String(process.env.SUPABASE_CANONICAL_USER_DATA_TABLE || 'bilm_user_data').trim();
 const PAGE_SIZE = clampInt(process.env.BACKFILL_PAGE_SIZE, 200, 25, 1000);
-const POST_BATCH_SIZE = clampInt(process.env.BACKFILL_POST_BATCH_SIZE, 20, 1, 200);
+const POST_BATCH_SIZE = clampInt(process.env.BACKFILL_POST_BATCH_SIZE, 100, 1, 500);
 const MAX_ROWS_PER_TABLE = clampInt(process.env.BACKFILL_MAX_ROWS_PER_TABLE, 0, 0, 5_000_000);
 const DRY_RUN = String(process.env.BACKFILL_DRY_RUN || '').trim() === '1';
 const WRANGLER_BIN = resolveWranglerBin();
+const BACKFILLED_AT_MS = Date.now();
+const BACKFILLED_AT_ISO = new Date(BACKFILLED_AT_MS).toISOString();
 
 if (!SUPABASE_URL) {
   throw new Error('Missing SUPABASE_URL (or SUPABASE_PROJECT_URL).');
@@ -22,6 +25,9 @@ if (!SUPABASE_URL) {
 if (!SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error('Missing SUPABASE_SERVICE_ROLE_KEY.');
 }
+
+const profileRowsByUserId = new Map();
+const userDataRowsByKey = new Map();
 
 const tableSpecs = [
   {
@@ -35,32 +41,36 @@ const tableSpecs = [
       'schema',
       'saved_at'
     ],
-    mapRow: (row) => {
-      const snapshot = safeJsonParse(row.snapshot_json, row.snapshot_json);
-      const requestBody = {
-        userId: row.user_id,
-        data: snapshot,
-        backfill: true,
+    handleRow: (row) => {
+      const userId = normalizeUserId(row.user_id);
+      if (!userId) return;
+      const payload = normalizePayloadObject(safeJsonParse(row.snapshot_json, null), {
+        fallbackText: row.snapshot_json
+      });
+      const updatedAtMs = normalizeMs(row.updated_at_ms) || Date.now();
+      const occurredAtIso = normalizeIso(row.saved_at) || isoFromMs(updatedAtMs);
+      upsertProfileRow(userId, {
+        lastPath: '/',
+        lastSeenAtIso: occurredAtIso,
         sourceTable: 'user_snapshots',
-        meta: {
-          updatedAtMs: normalizeMs(row.updated_at_ms),
-          deviceId: row.device_id || null,
-          schema: row.schema || null,
-          savedAt: normalizeIso(row.saved_at)
-        }
-      };
-      return buildMirrorEvent({
-        stableKey: `user_snapshots:${row.user_id}`,
-        path: '/',
-        userId: row.user_id,
-        occurredAtIso: normalizeIso(row.saved_at) || isoFromMs(row.updated_at_ms),
-        requestBody,
-        responseBody: {
-          ok: true,
-          saved: true,
-          source: 'd1-backfill'
+        metadataPatch: {
+          snapshotSchema: String(row.schema || '').trim() || null,
+          snapshotDeviceId: String(row.device_id || '').trim() || null
         }
       });
+      upsertCanonicalUserDataRow(createCanonicalUserDataRow({
+        stableKey: `snapshot:${userId}`,
+        userId,
+        scope: 'snapshot',
+        group: 'snapshot',
+        key: 'snapshot',
+        payload,
+        updatedAtMs,
+        deletedAtMs: null,
+        sourcePath: '/',
+        requestId: `backfill-snapshot-${userId}`,
+        occurredAtIso
+      }));
     }
   },
   {
@@ -77,119 +87,84 @@ const tableSpecs = [
       'op_id',
       'saved_at'
     ],
-    mapRow: (row) => {
-      const itemPayload = safeJsonParse(row.item_json, row.item_json);
-      const requestBody = {
-        userId: row.user_id,
-        operations: [
-          {
-            sectorKey: row.sector_key,
-            itemKey: row.item_key,
-            item: itemPayload,
-            updatedAtMs: normalizeMs(row.updated_at_ms),
-            deletedAtMs: normalizeMs(row.deleted_at_ms),
-            deviceId: row.device_id || null,
-            opId: row.op_id || null
-          }
-        ],
-        backfill: true,
-        sourceTable: 'sync_items'
-      };
-      return buildMirrorEvent({
-        stableKey: `sync_items:${row.user_id}:${row.sector_key}:${row.item_key}`,
-        path: '/sync/sectors/push',
-        userId: row.user_id,
-        occurredAtIso: normalizeIso(row.saved_at) || isoFromMs(row.updated_at_ms),
-        requestBody,
-        responseBody: {
-          ok: true,
-          pushed: 1,
-          source: 'd1-backfill'
+    handleRow: (row) => {
+      const userId = normalizeUserId(row.user_id);
+      const sectorKey = String(row.sector_key || '').trim();
+      const itemKey = String(row.item_key || '').trim();
+      if (!userId || !sectorKey || !itemKey) return;
+      const updatedAtMs = normalizeMs(row.updated_at_ms) || Date.now();
+      const deletedAtMs = normalizeMs(row.deleted_at_ms);
+      const occurredAtIso = normalizeIso(row.saved_at) || isoFromMs(updatedAtMs, deletedAtMs);
+      upsertProfileRow(userId, {
+        lastPath: '/sync/sectors/push',
+        lastSeenAtIso: occurredAtIso,
+        sourceTable: 'sync_items',
+        metadataPatch: {
+          lastSectorDeviceId: String(row.device_id || '').trim() || null
         }
       });
+      upsertCanonicalUserDataRow(createCanonicalUserDataRow({
+        stableKey: `sector:${userId}:${sectorKey}:${itemKey}`,
+        userId,
+        scope: 'sector',
+        group: sectorKey,
+        key: itemKey,
+        payload: deletedAtMs ? null : normalizePayloadObject(safeJsonParse(row.item_json, null), {
+          fallbackText: row.item_json
+        }),
+        updatedAtMs,
+        deletedAtMs,
+        sourcePath: '/sync/sectors/push',
+        requestId: `backfill-sector-${userId}`,
+        occurredAtIso,
+        opId: String(row.op_id || '').trim() || null
+      }));
     }
   },
   {
-    table: 'account_links',
-    orderBy: 'id',
-    select: [
-      'id',
-      'status',
-      'requester_user_id',
-      'requester_email',
-      'target_user_id',
-      'target_email',
-      'requester_share_scopes_json',
-      'target_share_scopes_json',
-      'requester_approved_at_ms',
-      'target_approved_at_ms',
-      'created_at_ms',
-      'updated_at_ms',
-      'activated_at_ms',
-      'declined_at_ms',
-      'unlinked_at_ms'
-    ],
-    mapRow: (row) => {
-      const requestBody = {
-        userId: row.requester_user_id,
-        link: {
-          ...row,
-          requester_share_scopes_json: safeJsonParse(row.requester_share_scopes_json, row.requester_share_scopes_json),
-          target_share_scopes_json: safeJsonParse(row.target_share_scopes_json, row.target_share_scopes_json)
-        },
-        backfill: true,
-        sourceTable: 'account_links'
-      };
-      return buildMirrorEvent({
-        stableKey: `account_links:${row.id}`,
-        path: '/links/request',
-        userId: row.requester_user_id,
-        occurredAtIso: isoFromMs(row.updated_at_ms, row.created_at_ms),
-        requestBody,
-        responseBody: {
-          ok: true,
-          accountFound: Boolean(row.target_user_id),
-          backfill: true
-        }
-      });
-    }
-  },
-  {
-    table: 'account_user_capabilities',
-    orderBy: 'user_id',
+    table: 'list_sync_items',
+    orderBy: 'user_id, list_key, item_key',
     select: [
       'user_id',
-      'email',
-      'chat_ready',
-      'last_chat_seen_at_ms',
-      'updated_at_ms'
+      'list_key',
+      'item_key',
+      'item_json',
+      'updated_at_ms',
+      'deleted_at_ms',
+      'device_id',
+      'saved_at'
     ],
-    mapRow: (row) => {
-      const requestBody = {
-        userId: row.user_id,
-        capability: {
-          email: row.email,
-          chatReady: toBool(row.chat_ready),
-          lastChatSeenAtMs: normalizeMs(row.last_chat_seen_at_ms),
-          updatedAtMs: normalizeMs(row.updated_at_ms)
-        },
-        backfill: true,
-        sourceTable: 'account_user_capabilities'
-      };
-      return buildMirrorEvent({
-        stableKey: `account_user_capabilities:${row.user_id}`,
-        path: '/links/chat-ready',
-        userId: row.user_id,
-        occurredAtIso: isoFromMs(row.updated_at_ms),
-        requestBody,
-        responseBody: {
-          ok: true,
-          deprecated: true,
-          userId: row.user_id,
-          chatReady: toBool(row.chat_ready),
-          backfill: true
+    handleRow: (row) => {
+      const userId = normalizeUserId(row.user_id);
+      const listKey = String(row.list_key || '').trim();
+      const itemKey = String(row.item_key || '').trim();
+      if (!userId || !listKey || !itemKey) return;
+      const updatedAtMs = normalizeMs(row.updated_at_ms) || Date.now();
+      const deletedAtMs = normalizeMs(row.deleted_at_ms);
+      const occurredAtIso = normalizeIso(row.saved_at) || isoFromMs(updatedAtMs, deletedAtMs);
+      upsertProfileRow(userId, {
+        lastPath: '/sync/lists/push',
+        lastSeenAtIso: occurredAtIso,
+        sourceTable: 'list_sync_items',
+        metadataPatch: {
+          lastListDeviceId: String(row.device_id || '').trim() || null
         }
       });
+      upsertCanonicalUserDataRow(createCanonicalUserDataRow({
+        stableKey: `list:${userId}:${listKey}:${itemKey}`,
+        userId,
+        scope: 'list',
+        group: listKey,
+        key: itemKey,
+        payload: deletedAtMs ? null : normalizePayloadObject(safeJsonParse(row.item_json, null), {
+          fallbackText: row.item_json
+        }),
+        updatedAtMs,
+        deletedAtMs,
+        sourcePath: '/sync/lists/push',
+        requestId: `backfill-list-${userId}`,
+        occurredAtIso
+      }));
     }
   },
   {
@@ -202,97 +177,69 @@ const tableSpecs = [
       'updated_at_ms',
       'saved_at'
     ],
-    mapRow: (row) => {
-      const requestBody = {
-        userId: row.user_id,
-        state: {
-          migratedAtMs: normalizeMs(row.migrated_at_ms),
-          migrationSource: row.migration_source || null,
-          updatedAtMs: normalizeMs(row.updated_at_ms),
+    handleRow: (row) => {
+      const userId = normalizeUserId(row.user_id);
+      if (!userId) return;
+      const migratedAtMs = normalizeMs(row.migrated_at_ms);
+      const updatedAtMs = normalizeMs(row.updated_at_ms) || migratedAtMs || Date.now();
+      const occurredAtIso = normalizeIso(row.saved_at) || isoFromMs(updatedAtMs, migratedAtMs);
+      upsertProfileRow(userId, {
+        lastPath: '/sync/sectors/push',
+        lastSeenAtIso: occurredAtIso,
+        sourceTable: 'user_sync_state'
+      });
+      upsertCanonicalUserDataRow(createCanonicalUserDataRow({
+        stableKey: `sync-state:${userId}`,
+        userId,
+        scope: 'sync_state',
+        group: 'sync',
+        key: 'state',
+        payload: {
+          migratedAtMs,
+          migrationSource: String(row.migration_source || '').trim() || null,
+          updatedAtMs,
           savedAt: normalizeIso(row.saved_at)
         },
-        backfill: true,
-        sourceTable: 'user_sync_state'
-      };
-      return buildMirrorEvent({
-        stableKey: `user_sync_state:${row.user_id}`,
-        path: '/sync/sectors/push',
-        userId: row.user_id,
-        occurredAtIso: normalizeIso(row.saved_at) || isoFromMs(row.updated_at_ms),
-        requestBody,
-        responseBody: {
-          ok: true,
-          pushed: 1,
-          source: 'd1-backfill'
-        }
-      });
+        updatedAtMs,
+        deletedAtMs: null,
+        sourcePath: '/sync/sectors/push',
+        requestId: `backfill-sync-state-${userId}`,
+        occurredAtIso
+      }));
     }
   }
 ];
 
-const allEvents = [];
 for (const spec of tableSpecs) {
   const rows = fetchAllRows(spec);
-  const mapped = rows.map(spec.mapRow);
-  allEvents.push(...mapped);
-  console.log(`BACKFILL_TABLE ${spec.table} rows=${rows.length} events=${mapped.length}`);
+  rows.forEach(spec.handleRow);
+  console.log(`BACKFILL_TABLE ${spec.table} rows=${rows.length}`);
 }
 
-console.log(`BACKFILL_EVENTS_PREPARED=${allEvents.length}`);
-if (!allEvents.length) {
-  process.exit(0);
-}
+const profileRows = [...profileRowsByUserId.values()];
+const userDataRows = [...userDataRowsByKey.values()];
+
+console.log(`BACKFILL_PROFILE_ROWS=${profileRows.length}`);
+console.log(`BACKFILL_USER_DATA_ROWS=${userDataRows.length}`);
+console.log('BACKFILL_SKIPPED_TABLES=account_links,account_user_capabilities');
 
 if (DRY_RUN) {
   console.log('BACKFILL_DRY_RUN=1 (no writes sent)');
   process.exit(0);
 }
 
-const mirrorUrl = `${SUPABASE_URL}/rest/v1/${encodeURIComponent(SUPABASE_TABLE)}?on_conflict=event_id`;
-let postedEvents = 0;
-for (let idx = 0; idx < allEvents.length; idx += POST_BATCH_SIZE) {
-  const batch = allEvents.slice(idx, idx + POST_BATCH_SIZE);
-  await postToSupabase(mirrorUrl, batch);
-  postedEvents += batch.length;
-  console.log(`BACKFILL_POSTED ${postedEvents}/${allEvents.length}`);
-}
+await postRows({
+  table: PROFILE_TABLE,
+  rows: profileRows,
+  onConflict: 'user_id'
+});
+await postRows({
+  table: USER_DATA_TABLE,
+  rows: userDataRows,
+  onConflict: 'user_id,data_scope,data_group,data_key'
+});
 
-console.log(`BACKFILL_DONE total=${allEvents.length}`);
-
-function buildMirrorEvent({
-  stableKey,
-  path,
-  userId,
-  occurredAtIso,
-  requestBody,
-  responseBody
-}) {
-  const eventId = deterministicUuidFrom(stableKey);
-  return {
-    event_id: eventId,
-    idempotency_key: eventId,
-    source: 'd1-backfill',
-    occurred_at: occurredAtIso || new Date().toISOString(),
-    mirrored_at: new Date().toISOString(),
-    user_id: String(userId || '').trim() || null,
-    method: 'POST',
-    path: String(path || '').trim() || '/backfill',
-    query_params: {},
-    request_headers: {
-      'x-request-id': `backfill-${eventId}`
-    },
-    request_content_type: 'application/json',
-    request_body_json: requestBody,
-    request_body_text: null,
-    request_body_bytes: jsonByteLength(requestBody),
-    response_status: 200,
-    response_content_type: 'application/json',
-    response_body_json: responseBody,
-    response_body_text: null,
-    response_body_bytes: jsonByteLength(responseBody),
-    retry_count: 0
-  };
-}
+console.log('BACKFILL_DONE');
 
 function fetchAllRows(spec) {
   const rows = [];
@@ -310,6 +257,137 @@ function fetchAllRows(spec) {
     if (page.length < pageLimit) break;
   }
   return rows;
+}
+
+function upsertProfileRow(userId, {
+  lastPath = '/backfill',
+  lastSeenAtIso = BACKFILLED_AT_ISO,
+  sourceTable = '',
+  metadataPatch = {},
+  email = ''
+} = {}) {
+  const normalizedUserId = normalizeUserId(userId);
+  if (!normalizedUserId) return;
+  const normalizedSeenAtIso = normalizeIso(lastSeenAtIso) || BACKFILLED_AT_ISO;
+  const existing = profileRowsByUserId.get(normalizedUserId);
+  const existingSeenAtMs = existing ? Date.parse(String(existing.last_seen_at || '')) || 0 : 0;
+  const nextSeenAtMs = Date.parse(normalizedSeenAtIso) || BACKFILLED_AT_MS;
+  const sourceTables = new Set(Array.isArray(existing?.metadata_json?.sourceTables) ? existing.metadata_json.sourceTables : []);
+  if (sourceTable) sourceTables.add(sourceTable);
+  const mergedMetadata = {
+    ...(existing?.metadata_json || {}),
+    ...(metadataPatch && typeof metadataPatch === 'object' ? metadataPatch : {}),
+    sourceTables: [...sourceTables].sort(),
+    backfilledAtMs: BACKFILLED_AT_MS
+  };
+
+  const nextRow = {
+    user_id: normalizedUserId,
+    source: 'data-api-backfill',
+    last_path: nextSeenAtMs >= existingSeenAtMs
+      ? (String(lastPath || '').trim() || '/backfill')
+      : (String(existing?.last_path || '').trim() || '/backfill'),
+    last_seen_at: nextSeenAtMs >= existingSeenAtMs
+      ? normalizedSeenAtIso
+      : (existing?.last_seen_at || normalizedSeenAtIso),
+    updated_at: BACKFILLED_AT_ISO,
+    metadata_json: mergedMetadata
+  };
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  if (normalizedEmail) {
+    nextRow.email = normalizedEmail;
+  } else if (existing?.email) {
+    nextRow.email = existing.email;
+  }
+  profileRowsByUserId.set(normalizedUserId, nextRow);
+}
+
+function upsertCanonicalUserDataRow(row) {
+  if (!row || typeof row !== 'object') return;
+  const compositeKey = [
+    String(row.user_id || '').trim(),
+    String(row.data_scope || '').trim(),
+    String(row.data_group || '').trim(),
+    String(row.data_key || '').trim()
+  ].join('|');
+  if (!compositeKey.replace(/\|/g, '')) return;
+  const current = userDataRowsByKey.get(compositeKey);
+  if (!current || shouldReplaceCanonicalUserDataRow(current, row)) {
+    userDataRowsByKey.set(compositeKey, row);
+  }
+}
+
+function createCanonicalUserDataRow({
+  stableKey = '',
+  userId = '',
+  scope = '',
+  group = '',
+  key = '',
+  payload = null,
+  updatedAtMs = 0,
+  deletedAtMs = null,
+  sourcePath = '/backfill',
+  requestId = '',
+  occurredAtIso = '',
+  opId = null
+} = {}) {
+  const normalizedUpdatedAtMs = normalizeMs(updatedAtMs) || Date.now();
+  const normalizedDeletedAtMs = deletedAtMs === null || typeof deletedAtMs === 'undefined'
+    ? null
+    : (normalizeMs(deletedAtMs) || normalizedUpdatedAtMs);
+  const normalizedOccurredAtIso = normalizeIso(occurredAtIso) || isoFromMs(normalizedUpdatedAtMs, normalizedDeletedAtMs);
+  const normalizedPayload = normalizePayloadObject(payload);
+  const normalizedGroup = String(group || '').trim() || 'unknown';
+  const normalizedKey = String(key || '').trim() || 'unknown';
+
+  return {
+    user_id: String(userId || '').trim(),
+    sector_key: normalizedGroup,
+    item_key: normalizedKey,
+    item_json: normalizedPayload,
+    source_event_id: deterministicUuidFrom(String(stableKey || `${userId}:${scope}:${group}:${key}`)),
+    occurred_at: normalizedOccurredAtIso,
+    data_scope: String(scope || '').trim() || 'unknown',
+    data_group: normalizedGroup,
+    data_key: normalizedKey,
+    op_id: opId ? String(opId).slice(0, 120) : null,
+    payload_json: normalizedPayload,
+    updated_at_ms: normalizedUpdatedAtMs,
+    deleted_at_ms: normalizedDeletedAtMs,
+    source_path: String(sourcePath || '').trim() || '/backfill',
+    request_id: String(requestId || '').trim() || null,
+    source: 'data-api-backfill',
+    updated_at: BACKFILLED_AT_ISO
+  };
+}
+
+function shouldReplaceCanonicalUserDataRow(currentRow, nextRow) {
+  const currentUpdatedAtMs = Number(currentRow?.updated_at_ms || 0) || 0;
+  const nextUpdatedAtMs = Number(nextRow?.updated_at_ms || 0) || 0;
+  if (nextUpdatedAtMs > currentUpdatedAtMs) return true;
+  if (nextUpdatedAtMs < currentUpdatedAtMs) return false;
+  const currentDeletedAtMs = Number(currentRow?.deleted_at_ms || 0) || 0;
+  const nextDeletedAtMs = Number(nextRow?.deleted_at_ms || 0) || 0;
+  if (nextDeletedAtMs > currentDeletedAtMs) return true;
+  if (nextDeletedAtMs < currentDeletedAtMs) return false;
+  const currentOpId = String(currentRow?.op_id || '');
+  const nextOpId = String(nextRow?.op_id || '');
+  return nextOpId >= currentOpId;
+}
+
+async function postRows({ table, rows, onConflict }) {
+  if (!Array.isArray(rows) || !rows.length) {
+    console.log(`BACKFILL_POST_SKIPPED ${table} rows=0`);
+    return;
+  }
+  const url = `${SUPABASE_URL}/rest/v1/${encodeURIComponent(table)}?on_conflict=${encodeURIComponent(onConflict)}`;
+  let postedRows = 0;
+  for (let idx = 0; idx < rows.length; idx += POST_BATCH_SIZE) {
+    const batch = rows.slice(idx, idx + POST_BATCH_SIZE);
+    await postToSupabase(url, batch);
+    postedRows += batch.length;
+    console.log(`BACKFILL_POSTED ${table} ${postedRows}/${rows.length}`);
+  }
 }
 
 function runWranglerD1Query(sql) {
@@ -351,7 +429,7 @@ function runWranglerD1Query(sql) {
   throw lastError;
 }
 
-async function postToSupabase(url, events) {
+async function postToSupabase(url, rows) {
   let lastError = null;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
@@ -361,9 +439,9 @@ async function postToSupabase(url, events) {
           apikey: SUPABASE_SERVICE_ROLE_KEY,
           authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
           'content-type': 'application/json',
-          prefer: 'resolution=merge-duplicates,return=minimal'
+          prefer: 'resolution=merge-duplicates,return=minimal,missing=default'
         },
-        body: JSON.stringify(events)
+        body: JSON.stringify(rows)
       });
       if (!response.ok) {
         const text = await response.text().catch(() => '');
@@ -379,13 +457,19 @@ async function postToSupabase(url, events) {
   throw lastError;
 }
 
-function deterministicUuidFrom(input) {
-  const hash = createHash('sha1').update(String(input || '')).digest();
-  const bytes = Uint8Array.from(hash.subarray(0, 16));
-  bytes[6] = (bytes[6] & 0x0f) | 0x50;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+function normalizeUserId(value) {
+  return String(value || '').trim();
+}
+
+function normalizePayloadObject(value, { fallbackText = '' } = {}) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value;
+  }
+  const text = String(fallbackText || '').trim();
+  if (!text) return null;
+  return {
+    rawText: text
+  };
 }
 
 function safeJsonParse(input, fallback = null) {
@@ -394,11 +478,6 @@ function safeJsonParse(input, fallback = null) {
   } catch {
     return fallback;
   }
-}
-
-function jsonByteLength(value) {
-  const text = JSON.stringify(value ?? null);
-  return Buffer.byteLength(text, 'utf8');
 }
 
 function clampInt(value, fallback, min, max) {
@@ -426,13 +505,16 @@ function isoFromMs(...values) {
     const ms = normalizeMs(value);
     if (ms) return new Date(ms).toISOString();
   }
-  return new Date().toISOString();
+  return BACKFILLED_AT_ISO;
 }
 
-function toBool(value) {
-  if (typeof value === 'boolean') return value;
-  const num = Number(value);
-  return Number.isFinite(num) ? num > 0 : Boolean(value);
+function deterministicUuidFrom(input) {
+  const hash = createHash('sha1').update(String(input || '')).digest();
+  const bytes = Uint8Array.from(hash.subarray(0, 16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
 function resolveWranglerBin() {

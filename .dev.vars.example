@@ -7,16 +7,17 @@ BILM_DISABLE_AUTH=false
 # Auth bypass is disabled unless BOTH BILM_DISABLE_AUTH=true and this token is set.
 BILM_AUTH_BYPASS_TOKEN=replace-with-local-bypass-token
 
-# Supabase mirror config (data-api backend)
+# Supabase config (data-api backend)
 # Either SUPABASE_PROJECT_URL or SUPABASE_URL works in this codebase.
 SUPABASE_PROJECT_URL=https://veoydbjuggetxwfgryzc.supabase.co
 SUPABASE_URL=https://veoydbjuggetxwfgryzc.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=sb_secret_********************
-SUPABASE_MIRROR_ENABLED=true
+# Legacy raw mirror path. Leave this off unless you intentionally need the old event log table.
+SUPABASE_MIRROR_ENABLED=false
 SUPABASE_MIRROR_TABLE=cloudflare_mirror_events
 SUPABASE_MIRROR_TIMEOUT_MS=10000
 
-# Direct canonical mirror (organized user storage)
+# Direct canonical storage (organized user/profile data)
 SUPABASE_CANONICAL_ENABLED=true
 SUPABASE_CANONICAL_PRIMARY=true
 SUPABASE_CANONICAL_PROFILE_TABLE=bilm_profiles
