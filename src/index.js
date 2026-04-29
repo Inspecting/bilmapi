@@ -1435,13 +1435,28 @@ function createCanonicalUserDataRow({
   requestId = '',
   opId = null
 } = {}) {
+  const requestEventId = String(requestId || '').trim();
+  const sourceEventId = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestEventId)
+    ? requestEventId
+    : createUuidV4();
+  const normalizedScope = String(scope || '').trim() || 'unknown';
+  const normalizedGroup = String(group || '').trim() || 'unknown';
+  const normalizedKey = String(key || '').trim() || 'unknown';
+  const normalizedPayload = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : null;
+  const nowIso = new Date().toISOString();
   return {
     user_id: userId,
-    data_scope: String(scope || '').trim() || 'unknown',
-    data_group: String(group || '').trim() || 'unknown',
-    data_key: String(key || '').trim() || 'unknown',
+    // Keep legacy columns populated for backward-compatible Supabase schemas.
+    sector_key: normalizedGroup,
+    item_key: normalizedKey,
+    item_json: normalizedPayload,
+    source_event_id: sourceEventId,
+    occurred_at: nowIso,
+    data_scope: normalizedScope,
+    data_group: normalizedGroup,
+    data_key: normalizedKey,
     op_id: opId ? String(opId).slice(0, 120) : null,
-    payload_json: payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : null,
+    payload_json: normalizedPayload,
     updated_at_ms: normalizeUpdatedAtMs(updatedAtMs || Date.now()),
     deleted_at_ms: deletedAtMs === null || typeof deletedAtMs === 'undefined'
       ? null
@@ -1449,7 +1464,7 @@ function createCanonicalUserDataRow({
     source_path: String(sourcePath || '').trim() || '/',
     request_id: String(requestId || '').trim() || null,
     source: 'data-api-worker',
-    updated_at: new Date().toISOString()
+    updated_at: nowIso
   };
 }
 
