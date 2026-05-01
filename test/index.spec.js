@@ -718,6 +718,15 @@ function createVerifier() {
   };
 }
 
+function enableSupabasePrimary(env) {
+  env.SUPABASE_PROJECT_URL = 'https://example.supabase.co';
+  env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-role-key';
+  env.SUPABASE_CANONICAL_ENABLED = 'true';
+  env.SUPABASE_CANONICAL_PRIMARY = 'true';
+  env.SUPABASE_CANONICAL_PROFILE_TABLE = 'bilm_profiles';
+  env.SUPABASE_CANONICAL_USER_DATA_TABLE = 'bilm_user_data';
+}
+
 describe('data api', () => {
   let kv;
   let d1;
@@ -2270,13 +2279,9 @@ describe('data api', () => {
   });
 
   it('mirrors snapshot saves to supabase canonical profile and user-data tables', async () => {
-    env.SUPABASE_PROJECT_URL = 'https://example.supabase.co';
-    env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-role-key';
+    enableSupabasePrimary(env);
     env.SUPABASE_MIRROR_ENABLED = 'true';
-    env.SUPABASE_CANONICAL_ENABLED = 'true';
     env.SUPABASE_MIRROR_TABLE = 'cloudflare_mirror_events';
-    env.SUPABASE_CANONICAL_PROFILE_TABLE = 'bilm_profiles';
-    env.SUPABASE_CANONICAL_USER_DATA_TABLE = 'bilm_user_data';
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('', { status: 201 }));
     const waiters = [];
 
@@ -2320,6 +2325,139 @@ describe('data api', () => {
     expect(canonicalBody[0]?.data_scope).toBe('snapshot');
     expect(canonicalBody[0]?.data_group).toBe('snapshot');
     expect(canonicalBody[0]?.data_key).toBe('snapshot');
+  });
+
+  it('falls back to Cloudflare snapshot storage when Supabase primary writes fail', async () => {
+    enableSupabasePrimary(env);
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('supabase unavailable', { status: 503 }));
+
+    const payload = {
+      schema: 'bilm-backup-v1',
+      meta: {
+        updatedAtMs: 1710000000000,
+        deviceId: 'device-fallback'
+      },
+      localStorage: {
+        'bilm-favorites': '[]'
+      }
+    };
+    const response = await worker.fetch(new Request(`https://data-api.watchbilm.org/?userId=${USER_ID}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({ userId: USER_ID, data: payload })
+    }), env);
+
+    expect(response.status).toBe(200);
+    expect(d1.rows.has(USER_ID)).toBe(true);
+    expect(await kv.get(`user-${USER_ID}`)).toBe(JSON.stringify(payload));
+  });
+
+  it('falls back to Cloudflare snapshot storage when Supabase primary reads fail', async () => {
+    enableSupabasePrimary(env);
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('supabase unavailable', { status: 503 }));
+    const payload = {
+      schema: 'bilm-backup-v1',
+      meta: {
+        updatedAtMs: 1711111111111,
+        deviceId: 'd1-fallback'
+      }
+    };
+    d1.rows.set(USER_ID, {
+      user_id: USER_ID,
+      snapshot_json: JSON.stringify(payload),
+      updated_at_ms: 1711111111111,
+      device_id: 'd1-fallback',
+      schema: 'bilm-backup-v1',
+      saved_at: new Date().toISOString()
+    });
+
+    const response = await worker.fetch(new Request(`https://data-api.watchbilm.org/?userId=${USER_ID}`, {
+      headers: { authorization: 'Bearer valid-token' }
+    }), env);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(payload);
+  });
+
+  it('uses D1 as list sync backup when Supabase primary is unavailable', async () => {
+    enableSupabasePrimary(env);
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('supabase unavailable', { status: 503 }));
+
+    const pushResponse = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/lists/push', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        operations: [{
+          listKey: 'bilm-favorites',
+          itemKey: 'movie:77',
+          updatedAtMs: 1722000000000,
+          deleted: false,
+          payload: { key: 'movie-77', type: 'movie', id: 77, updatedAt: 1722000000000 }
+        }]
+      })
+    }), env);
+
+    expect(pushResponse.status).toBe(200);
+    expect(d1.listRows.has(`${USER_ID}|bilm-favorites|movie:77`)).toBe(true);
+
+    const pullResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/sync/lists/pull?userId=${USER_ID}&since=0`, {
+      headers: { authorization: 'Bearer valid-token' }
+    }), env);
+    expect(pullResponse.status).toBe(200);
+    const pullBody = await pullResponse.json();
+    expect(pullBody.operations).toHaveLength(1);
+    expect(pullBody.operations[0]).toMatchObject({
+      listKey: 'bilm-favorites',
+      itemKey: 'movie:77',
+      deleted: false
+    });
+  });
+
+  it('uses D1 as sector sync backup when Supabase primary is unavailable', async () => {
+    enableSupabasePrimary(env);
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('supabase unavailable', { status: 503 }));
+
+    const pushResponse = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        operations: [{
+          sectorKey: 'watch_history',
+          itemKey: 'movie:88',
+          updatedAtMs: 1722000000100,
+          opId: 'op-sector-fallback',
+          deleted: false,
+          payload: { key: 'movie-88', type: 'movie', id: 88, updatedAt: 1722000000100 }
+        }]
+      })
+    }), env);
+
+    expect(pushResponse.status).toBe(200);
+    expect(d1.syncRows.has(`${USER_ID}|watch_history|movie:88`)).toBe(true);
+
+    const pullResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/sync/sectors/pull?userId=${USER_ID}&since=0&sectors=watch_history`, {
+      headers: { authorization: 'Bearer valid-token' }
+    }), env);
+    expect(pullResponse.status).toBe(200);
+    const pullBody = await pullResponse.json();
+    expect(pullBody.operations).toHaveLength(1);
+    expect(pullBody.operations[0]).toMatchObject({
+      sectorKey: 'watch_history',
+      itemKey: 'movie:88',
+      opId: 'op-sector-fallback',
+      deleted: false
+    });
   });
 
   it('purges deleted supabase canonical rows on scheduled run', async () => {

@@ -1888,12 +1888,14 @@ async function readSupabaseSnapshotRow({ config, userId = '', requestId = '' } =
   if (!query.ok) {
     return {
       ok: false,
+      status: query.status,
       error: query.error,
       row: null
     };
   }
   return {
     ok: true,
+    status: query.status,
     error: '',
     row: query.rows[0] || null
   };
@@ -1930,6 +1932,7 @@ async function readSupabaseSyncState({ config, userId = '', requestId = '' } = {
   if (!query.ok) {
     return {
       ok: false,
+      status: query.status,
       error: query.error,
       state: {
         migratedAtMs: null,
@@ -1942,6 +1945,7 @@ async function readSupabaseSyncState({ config, userId = '', requestId = '' } = {
   const payload = parseCanonicalPayloadObject(row?.payload_json);
   return {
     ok: true,
+    status: query.status,
     error: '',
     state: formatSupabaseSyncStateFromPayload(payload)
   };
@@ -3911,6 +3915,77 @@ async function writeSnapshotToKv({ env, userId, snapshotJson, metadata }) {
   return true;
 }
 
+async function writeSnapshotToCloudflareBackup({ env, userId, snapshotJson, metadata, requestId = '' }) {
+  let stored = false;
+  try {
+    if (await writeSnapshotToD1({ env, userId, snapshotJson, metadata })) {
+      stored = true;
+    }
+  } catch (error) {
+    console.warn(`[api][${requestId || 'no-request-id'}] cloudflare d1 snapshot backup write failed: ${String(error?.message || error || 'unknown')}`);
+  }
+
+  try {
+    if (await writeSnapshotToKv({ env, userId, snapshotJson, metadata })) {
+      stored = true;
+    }
+  } catch (error) {
+    console.warn(`[api][${requestId || 'no-request-id'}] cloudflare kv snapshot backup write failed: ${String(error?.message || error || 'unknown')}`);
+  }
+
+  return stored;
+}
+
+async function readSnapshotValueFromCloudflareBackup({ env, userId }) {
+  const db = getD1Database(env);
+  if (db) {
+    const row = await db.prepare(SELECT_SNAPSHOT_SQL).bind(userId).first();
+    if (row && typeof row.snapshot_json === 'string') {
+      return row.snapshot_json;
+    }
+  }
+
+  const kv = getKvNamespace(env);
+  if (kv) {
+    return await kv.get(`user-${userId}`);
+  }
+
+  return null;
+}
+
+async function readSnapshotMetaFromCloudflareBackup({ env, userId }) {
+  const db = getD1Database(env);
+  if (db) {
+    const row = await db.prepare(SELECT_SNAPSHOT_META_SQL).bind(userId).first();
+    if (row) {
+      return {
+        exists: true,
+        updatedAtMs: Number(row.updated_at_ms || 0) || null,
+        deviceId: String(row.device_id || '').trim() || null,
+        schema: String(row.schema || '').trim() || null
+      };
+    }
+  }
+
+  const kv = getKvNamespace(env);
+  if (kv) {
+    const { value, metadata } = await kv.getWithMetadata(`user-${userId}`, 'text');
+    return {
+      exists: value !== null,
+      updatedAtMs: Number(metadata?.updatedAtMs || 0) || null,
+      deviceId: String(metadata?.deviceId || '').trim() || null,
+      schema: String(metadata?.schema || '').trim() || null
+    };
+  }
+
+  return {
+    exists: false,
+    updatedAtMs: null,
+    deviceId: null,
+    schema: null
+  };
+}
+
 async function writeListSyncOperationsToD1Backup({
   env,
   userId = '',
@@ -3942,6 +4017,15 @@ async function writeListSyncOperationsToD1Backup({
       .run();
   }
   return true;
+}
+
+async function tryWriteListSyncOperationsToD1Backup(args = {}, requestId = '') {
+  try {
+    return await writeListSyncOperationsToD1Backup(args);
+  } catch (error) {
+    console.warn(`[api][${requestId || 'no-request-id'}] cloudflare d1 list sync backup write failed: ${String(error?.message || error || 'unknown')}`);
+    return false;
+  }
 }
 
 async function writeSectorSyncOperationsToD1Backup({
@@ -3978,6 +4062,45 @@ async function writeSectorSyncOperationsToD1Backup({
   return true;
 }
 
+async function tryWriteSectorSyncOperationsToD1Backup(args = {}, requestId = '') {
+  try {
+    return await writeSectorSyncOperationsToD1Backup(args);
+  } catch (error) {
+    console.warn(`[api][${requestId || 'no-request-id'}] cloudflare d1 sector sync backup write failed: ${String(error?.message || error || 'unknown')}`);
+    return false;
+  }
+}
+
+async function readListSyncRowsFromD1Backup({ env, userId, sinceMs, limit }) {
+  const db = getD1Database(env);
+  if (!db) return null;
+  const query = await db.prepare(SELECT_LIST_SYNC_CHANGES_SQL).bind(userId, sinceMs, limit).all();
+  return Array.isArray(query?.results) ? query.results : [];
+}
+
+async function readSectorSyncRowsFromD1Backup({ env, userId, sinceMs, limit, sectors = [] }) {
+  const db = getD1Database(env);
+  if (!db) return null;
+  const query = await buildSectorPullStatement({
+    db,
+    userId,
+    sinceMs,
+    limit,
+    sectors
+  }).all();
+  return Array.isArray(query?.results) ? query.results : [];
+}
+
+async function readUserSyncStateFromD1Backup({ env, userId }) {
+  const db = getD1Database(env);
+  if (!db) return null;
+  return await readUserSyncState({ db, userId });
+}
+
+function logSupabaseFallback(requestId = '', action = '', detail = '') {
+  console.warn(`[api][${requestId || 'no-request-id'}] supabase canonical ${action || 'request'} unavailable; using cloudflare backup${detail ? ` (${detail})` : ''}`);
+}
+
 async function persistSnapshot({ env, userId, snapshot, corsOrigin, requestId = '', email = null }) {
   assertNoCredentialStorage(snapshot, corsOrigin);
 
@@ -4004,37 +4127,45 @@ async function persistSnapshot({ env, userId, snapshot, corsOrigin, requestId = 
       email
     });
     if (!supabaseResult.ok) {
-      throw jsonResponse(503, {
-        error: 'storage_unavailable',
-        message: 'Supabase canonical storage is unavailable. Please retry shortly.'
-      }, corsOrigin);
+      logSupabaseFallback(requestId, 'snapshot write', supabaseResult.error || `http_${supabaseResult.status || 0}`);
+      const fallbackStored = await writeSnapshotToCloudflareBackup({
+        env,
+        userId,
+        snapshotJson,
+        metadata,
+        requestId
+      });
+      if (!fallbackStored) {
+        throw jsonResponse(503, {
+          error: 'storage_unavailable',
+          message: 'Supabase canonical storage is unavailable and no Cloudflare backup storage accepted the snapshot.'
+        }, corsOrigin);
+      }
+      return {
+        bytes: snapshotBytes,
+        metadata
+      };
     }
-    try {
-      await writeSnapshotToD1({ env, userId, snapshotJson, metadata });
-    } catch (error) {
-      console.warn(`[api][${requestId || 'no-request-id'}] cloudflare d1 snapshot backup write failed: ${String(error?.message || error || 'unknown')}`);
-    }
-    try {
-      await writeSnapshotToKv({ env, userId, snapshotJson, metadata });
-    } catch (error) {
-      console.warn(`[api][${requestId || 'no-request-id'}] cloudflare kv snapshot backup write failed: ${String(error?.message || error || 'unknown')}`);
-    }
+    await writeSnapshotToCloudflareBackup({
+      env,
+      userId,
+      snapshotJson,
+      metadata,
+      requestId
+    });
     return {
       bytes: snapshotBytes,
       metadata
     };
   }
 
-  let stored = false;
-
-  if (await writeSnapshotToD1({ env, userId, snapshotJson, metadata })) {
-    stored = true;
-  }
-
-  if (await writeSnapshotToKv({ env, userId, snapshotJson, metadata })) {
-    stored = true;
-  }
-
+  const stored = await writeSnapshotToCloudflareBackup({
+    env,
+    userId,
+    snapshotJson,
+    metadata,
+    requestId
+  });
   if (!stored) {
     throw jsonResponse(503, {
       error: 'storage_not_configured',
@@ -4056,27 +4187,26 @@ async function readSnapshotValue({ env, userId, requestId = '' }) {
       requestId
     });
     if (!supabaseResult.ok) {
+      const fallbackValue = await readSnapshotValueFromCloudflareBackup({ env, userId });
+      if (fallbackValue !== null) {
+        logSupabaseFallback(requestId, 'snapshot read', supabaseResult.error || `http_${supabaseResult.status || 0}`);
+        return fallbackValue;
+      }
       throw new Error(`supabase canonical snapshot read failed: ${supabaseResult.error || 'unknown'}`);
     }
     const payload = parseCanonicalPayloadObject(supabaseResult?.row?.payload_json);
-    if (!payload) return null;
+    if (!payload) {
+      const fallbackValue = await readSnapshotValueFromCloudflareBackup({ env, userId });
+      if (fallbackValue !== null) {
+        logSupabaseFallback(requestId, 'snapshot read', 'empty_supabase_row');
+        return fallbackValue;
+      }
+      return null;
+    }
     return JSON.stringify(payload);
   }
 
-  const db = getD1Database(env);
-  if (db) {
-    const row = await db.prepare(SELECT_SNAPSHOT_SQL).bind(userId).first();
-    if (row && typeof row.snapshot_json === 'string') {
-      return row.snapshot_json;
-    }
-  }
-
-  const kv = getKvNamespace(env);
-  if (kv) {
-    return await kv.get(`user-${userId}`);
-  }
-
-  return null;
+  return await readSnapshotValueFromCloudflareBackup({ env, userId });
 }
 
 async function readSnapshotMeta({ env, userId, requestId = '' }) {
@@ -4088,10 +4218,22 @@ async function readSnapshotMeta({ env, userId, requestId = '' }) {
       requestId
     });
     if (!supabaseResult.ok) {
+      const fallbackMeta = await readSnapshotMetaFromCloudflareBackup({ env, userId });
+      if (fallbackMeta.exists) {
+        logSupabaseFallback(requestId, 'snapshot metadata read', supabaseResult.error || `http_${supabaseResult.status || 0}`);
+        return fallbackMeta;
+      }
       throw new Error(`supabase canonical snapshot metadata read failed: ${supabaseResult.error || 'unknown'}`);
     }
     const row = supabaseResult.row;
     const payload = parseCanonicalPayloadObject(row?.payload_json);
+    if (!payload) {
+      const fallbackMeta = await readSnapshotMetaFromCloudflareBackup({ env, userId });
+      if (fallbackMeta.exists) {
+        logSupabaseFallback(requestId, 'snapshot metadata read', 'empty_supabase_row');
+      }
+      return fallbackMeta;
+    }
     const metadata = getSnapshotMetadata(payload || {});
     return {
       exists: Boolean(payload),
@@ -4101,36 +4243,7 @@ async function readSnapshotMeta({ env, userId, requestId = '' }) {
     };
   }
 
-  const db = getD1Database(env);
-  if (db) {
-    const row = await db.prepare(SELECT_SNAPSHOT_META_SQL).bind(userId).first();
-    if (row) {
-      return {
-        exists: true,
-        updatedAtMs: Number(row.updated_at_ms || 0) || null,
-        deviceId: String(row.device_id || '').trim() || null,
-        schema: String(row.schema || '').trim() || null
-      };
-    }
-  }
-
-  const kv = getKvNamespace(env);
-  if (kv) {
-    const { value, metadata } = await kv.getWithMetadata(`user-${userId}`, 'text');
-    return {
-      exists: value !== null,
-      updatedAtMs: Number(metadata?.updatedAtMs || 0) || null,
-      deviceId: String(metadata?.deviceId || '').trim() || null,
-      schema: String(metadata?.schema || '').trim() || null
-    };
-  }
-
-  return {
-    exists: false,
-    updatedAtMs: null,
-    deviceId: null,
-    schema: null
-  };
+  return await readSnapshotMetaFromCloudflareBackup({ env, userId });
 }
 
 function normalizeUpdatedAtMs(value) {
@@ -5434,23 +5547,29 @@ async function handleListSyncPush({ request, env, corsOrigin, verifyIdToken, req
       email: isValidEmail(authEmail) ? authEmail : null
     });
     if (!supabaseResult.ok) {
-      return errorResponse(503, {
-        error: 'storage_unavailable',
-        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
-        retryable: true,
-        code: 'storage_unavailable',
-        requestId
-      }, corsOrigin);
-    }
-    try {
-      await writeListSyncOperationsToD1Backup({
+      logSupabaseFallback(requestId, 'list sync write', supabaseResult.error || `http_${supabaseResult.status || 0}`);
+      const backupStored = await tryWriteListSyncOperationsToD1Backup({
         env,
         userId,
         deviceId: body?.deviceId,
         operations: backupOperations
-      });
-    } catch (error) {
-      console.warn(`[api][${requestId || 'no-request-id'}] cloudflare d1 list sync backup write failed: ${String(error?.message || error || 'unknown')}`);
+      }, requestId);
+      if (!backupStored) {
+        return errorResponse(503, {
+          error: 'storage_unavailable',
+          message: 'Supabase canonical storage is unavailable and Cloudflare D1 backup storage is not configured.',
+          retryable: true,
+          code: 'storage_unavailable',
+          requestId
+        }, corsOrigin);
+      }
+    } else {
+      await tryWriteListSyncOperationsToD1Backup({
+        env,
+        userId,
+        deviceId: body?.deviceId,
+        operations: backupOperations
+      }, requestId);
     }
   } else {
     const db = getD1Database(env);
@@ -5515,47 +5634,57 @@ async function handleListSyncPull({ request, env, corsOrigin, verifyIdToken, req
 
   await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId, requestId });
   enforcePrivateEndpointRateLimit({ env, userId, corsOrigin, requestId, kind: 'syncRead' });
-  if (supabasePrimaryActive) {
-    enforceSupabaseCanonicalReadCooldown({ env, userId, corsOrigin, requestId });
-  }
 
   const sinceMs = parseSinceMs(url.searchParams.get('since'));
   const limit = parsePullLimit(url.searchParams.get('limit'));
   let rows = [];
   if (supabasePrimaryActive) {
-    const supabaseQuery = await selectSupabaseCanonicalRows({
-      config: canonicalConfig,
-      table: canonicalConfig.userDataTable,
-      select: 'data_group,data_key,payload_json,updated_at_ms,deleted_at_ms',
-      searchParams: {
-        user_id: `eq.${userId}`,
-        data_scope: 'eq.list',
-        updated_at_ms: `gt.${sinceMs}`
-      },
-      order: 'updated_at_ms.asc',
-      limit,
-      requestId
-    });
-    if (!supabaseQuery.ok) {
-      const retryAfterSeconds = recordSupabaseCanonicalReadCooldown({
-        env,
-        userId,
-        status: supabaseQuery.status
-      });
-      return errorResponse(503, {
-        error: 'storage_unavailable',
-        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
-        retryable: true,
-        code: 'storage_unavailable',
+    const cooldownState = getSupabaseCanonicalReadCooldownState(userId);
+    let supabaseQuery = null;
+    if (!cooldownState.blocked) {
+      supabaseQuery = await selectSupabaseCanonicalRows({
+        config: canonicalConfig,
+        table: canonicalConfig.userDataTable,
+        select: 'data_group,data_key,payload_json,updated_at_ms,deleted_at_ms',
+        searchParams: {
+          user_id: `eq.${userId}`,
+          data_scope: 'eq.list',
+          updated_at_ms: `gt.${sinceMs}`
+        },
+        order: 'updated_at_ms.asc',
+        limit,
         requestId
-      }, corsOrigin, retryAfterSeconds > 0 ? { 'retry-after': String(retryAfterSeconds) } : undefined);
+      });
     }
-    clearSupabaseCanonicalReadCooldown(userId);
-    rows = supabaseQuery.rows;
+    if (supabaseQuery?.ok) {
+      clearSupabaseCanonicalReadCooldown(userId);
+      rows = supabaseQuery.rows;
+    } else {
+      const retryAfterSeconds = supabaseQuery
+        ? recordSupabaseCanonicalReadCooldown({ env, userId, status: supabaseQuery.status })
+        : cooldownState.retryAfterSeconds;
+      const backupRows = await readListSyncRowsFromD1Backup({ env, userId, sinceMs, limit });
+      if (backupRows) {
+        logSupabaseFallback(
+          requestId,
+          'list sync read',
+          supabaseQuery ? (supabaseQuery.error || `http_${supabaseQuery.status || 0}`) : 'read_cooldown'
+        );
+        rows = backupRows;
+      } else {
+        enforceSupabaseCanonicalReadCooldown({ env, userId, corsOrigin, requestId });
+        const retryHeaders = retryAfterSeconds > 0 ? { 'retry-after': String(retryAfterSeconds) } : undefined;
+        return errorResponse(503, {
+          error: 'storage_unavailable',
+          message: 'Supabase canonical storage is unavailable and Cloudflare D1 backup storage is not configured.',
+          retryable: true,
+          code: 'storage_unavailable',
+          requestId
+        }, corsOrigin, retryHeaders);
+      }
+    }
   } else {
-    const db = getD1Database(env);
-    const query = await db.prepare(SELECT_LIST_SYNC_CHANGES_SQL).bind(userId, sinceMs, limit).all();
-    rows = Array.isArray(query?.results) ? query.results : [];
+    rows = await readListSyncRowsFromD1Backup({ env, userId, sinceMs, limit }) || [];
   }
 
   let cursorMs = sinceMs;
@@ -5619,7 +5748,8 @@ async function handleSectorSyncPush({ request, env, corsOrigin, verifyIdToken, r
     }, corsOrigin);
   }
 
-  await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId, requestId });
+  const authPayload = await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId, requestId });
+  const authEmail = canonicalizeEmailForMatching(authPayload?.email || '');
   enforcePrivateEndpointRateLimit({ env, userId, corsOrigin, requestId, kind: 'syncWrite' });
 
   const operations = Array.isArray(body?.operations) ? body.operations : [];
@@ -5636,15 +5766,21 @@ async function handleSectorSyncPush({ request, env, corsOrigin, verifyIdToken, r
         requestId
       });
       if (!stateResult.ok) {
-        return errorResponse(503, {
-          error: 'storage_unavailable',
-          message: 'Supabase canonical storage is unavailable. Please retry shortly.',
-          retryable: true,
-          code: 'storage_unavailable',
-          requestId
-        }, corsOrigin);
+        const backupState = await readUserSyncStateFromD1Backup({ env, userId });
+        if (!backupState) {
+          return errorResponse(503, {
+            error: 'storage_unavailable',
+            message: 'Supabase canonical storage is unavailable and Cloudflare D1 backup storage is not configured.',
+            retryable: true,
+            code: 'storage_unavailable',
+            requestId
+          }, corsOrigin);
+        }
+        logSupabaseFallback(requestId, 'sector sync state read', stateResult.error || `http_${stateResult.status || 0}`);
+        state = backupState;
+      } else {
+        state = stateResult.state;
       }
-      state = stateResult.state;
     } else {
       state = await readUserSyncState({ db: getD1Database(env), userId });
     }
@@ -5730,23 +5866,29 @@ async function handleSectorSyncPush({ request, env, corsOrigin, verifyIdToken, r
       email: isValidEmail(authEmail) ? authEmail : null
     });
     if (!supabaseResult.ok) {
-      return errorResponse(503, {
-        error: 'storage_unavailable',
-        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
-        retryable: true,
-        code: 'storage_unavailable',
-        requestId
-      }, corsOrigin);
-    }
-    try {
-      await writeSectorSyncOperationsToD1Backup({
+      logSupabaseFallback(requestId, 'sector sync write', supabaseResult.error || `http_${supabaseResult.status || 0}`);
+      const backupStored = await tryWriteSectorSyncOperationsToD1Backup({
         env,
         userId,
         deviceId: body?.deviceId,
         operations: backupOperations
-      });
-    } catch (error) {
-      console.warn(`[api][${requestId || 'no-request-id'}] cloudflare d1 sector sync backup write failed: ${String(error?.message || error || 'unknown')}`);
+      }, requestId);
+      if (!backupStored) {
+        return errorResponse(503, {
+          error: 'storage_unavailable',
+          message: 'Supabase canonical storage is unavailable and Cloudflare D1 backup storage is not configured.',
+          retryable: true,
+          code: 'storage_unavailable',
+          requestId
+        }, corsOrigin);
+      }
+    } else {
+      await tryWriteSectorSyncOperationsToD1Backup({
+        env,
+        userId,
+        deviceId: body?.deviceId,
+        operations: backupOperations
+      }, requestId);
     }
   } else {
     const db = getD1Database(env);
@@ -5789,15 +5931,21 @@ async function handleSectorSyncPush({ request, env, corsOrigin, verifyIdToken, r
       requestId
     });
     if (!stateResult.ok) {
-      return errorResponse(503, {
-        error: 'storage_unavailable',
-        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
-        retryable: true,
-        code: 'storage_unavailable',
-        requestId
-      }, corsOrigin);
+      const backupState = await readUserSyncStateFromD1Backup({ env, userId });
+      if (!backupState) {
+        return errorResponse(503, {
+          error: 'storage_unavailable',
+          message: 'Supabase canonical storage is unavailable and Cloudflare D1 backup storage is not configured.',
+          retryable: true,
+          code: 'storage_unavailable',
+          requestId
+        }, corsOrigin);
+      }
+      logSupabaseFallback(requestId, 'sector sync state read', stateResult.error || `http_${stateResult.status || 0}`);
+      state = backupState;
+    } else {
+      state = stateResult.state;
     }
-    state = stateResult.state;
   } else {
     const db = getD1Database(env);
     state = await readUserSyncState({ db, userId });
@@ -5843,9 +5991,6 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
 
   await requireSnapshotAuth({ request, corsOrigin, env, verifyIdToken, userId, requestId });
   enforcePrivateEndpointRateLimit({ env, userId, corsOrigin, requestId, kind: 'syncRead' });
-  if (supabasePrimaryActive) {
-    enforceSupabaseCanonicalReadCooldown({ env, userId, corsOrigin, requestId });
-  }
 
   const sinceMs = parseSinceMs(url.searchParams.get('since'));
   const limit = parsePullLimit(url.searchParams.get('limit'));
@@ -5863,50 +6008,69 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
 
   let rows = [];
   if (supabasePrimaryActive) {
-    const searchParams = {
-      user_id: `eq.${userId}`,
-      data_scope: 'eq.sector',
-      updated_at_ms: `gt.${sinceMs}`
-    };
-    const sectorsFilter = buildSupabaseInFilter(requestedSectors);
-    if (sectorsFilter) {
-      searchParams.data_group = `in.${sectorsFilter}`;
+    const cooldownState = getSupabaseCanonicalReadCooldownState(userId);
+    let supabaseQuery = null;
+    if (!cooldownState.blocked) {
+      const searchParams = {
+        user_id: `eq.${userId}`,
+        data_scope: 'eq.sector',
+        updated_at_ms: `gt.${sinceMs}`
+      };
+      const sectorsFilter = buildSupabaseInFilter(requestedSectors);
+      if (sectorsFilter) {
+        searchParams.data_group = `in.${sectorsFilter}`;
+      }
+      supabaseQuery = await selectSupabaseCanonicalRows({
+        config: canonicalConfig,
+        table: canonicalConfig.userDataTable,
+        select: 'data_group,data_key,payload_json,updated_at_ms,deleted_at_ms,op_id',
+        searchParams,
+        order: 'updated_at_ms.asc',
+        limit,
+        requestId
+      });
     }
-    const supabaseQuery = await selectSupabaseCanonicalRows({
-      config: canonicalConfig,
-      table: canonicalConfig.userDataTable,
-      select: 'data_group,data_key,payload_json,updated_at_ms,deleted_at_ms,op_id',
-      searchParams,
-      order: 'updated_at_ms.asc',
-      limit,
-      requestId
-    });
-    if (!supabaseQuery.ok) {
-      const retryAfterSeconds = recordSupabaseCanonicalReadCooldown({
+    if (supabaseQuery?.ok) {
+      clearSupabaseCanonicalReadCooldown(userId);
+      rows = supabaseQuery.rows;
+    } else {
+      const retryAfterSeconds = supabaseQuery
+        ? recordSupabaseCanonicalReadCooldown({ env, userId, status: supabaseQuery.status })
+        : cooldownState.retryAfterSeconds;
+      const backupRows = await readSectorSyncRowsFromD1Backup({
         env,
         userId,
-        status: supabaseQuery.status
+        sinceMs,
+        limit,
+        sectors: requestedSectors
       });
-      return errorResponse(503, {
-        error: 'storage_unavailable',
-        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
-        retryable: true,
-        code: 'storage_unavailable',
-        requestId
-      }, corsOrigin, retryAfterSeconds > 0 ? { 'retry-after': String(retryAfterSeconds) } : undefined);
+      if (backupRows) {
+        logSupabaseFallback(
+          requestId,
+          'sector sync read',
+          supabaseQuery ? (supabaseQuery.error || `http_${supabaseQuery.status || 0}`) : 'read_cooldown'
+        );
+        rows = backupRows;
+      } else {
+        enforceSupabaseCanonicalReadCooldown({ env, userId, corsOrigin, requestId });
+        const retryHeaders = retryAfterSeconds > 0 ? { 'retry-after': String(retryAfterSeconds) } : undefined;
+        return errorResponse(503, {
+          error: 'storage_unavailable',
+          message: 'Supabase canonical storage is unavailable and Cloudflare D1 backup storage is not configured.',
+          retryable: true,
+          code: 'storage_unavailable',
+          requestId
+        }, corsOrigin, retryHeaders);
+      }
     }
-    clearSupabaseCanonicalReadCooldown(userId);
-    rows = supabaseQuery.rows;
   } else {
-    const db = getD1Database(env);
-    const query = await buildSectorPullStatement({
-      db,
+    rows = await readSectorSyncRowsFromD1Backup({
+      env,
       userId,
       sinceMs,
       limit,
       sectors: requestedSectors
-    }).all();
-    rows = Array.isArray(query?.results) ? query.results : [];
+    }) || [];
   }
 
   let cursorMs = sinceMs;
@@ -5955,15 +6119,21 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
       requestId
     });
     if (!stateResult.ok) {
-      return errorResponse(503, {
-        error: 'storage_unavailable',
-        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
-        retryable: true,
-        code: 'storage_unavailable',
-        requestId
-      }, corsOrigin);
+      const backupState = await readUserSyncStateFromD1Backup({ env, userId });
+      if (!backupState) {
+        return errorResponse(503, {
+          error: 'storage_unavailable',
+          message: 'Supabase canonical storage is unavailable and Cloudflare D1 backup storage is not configured.',
+          retryable: true,
+          code: 'storage_unavailable',
+          requestId
+        }, corsOrigin);
+      }
+      logSupabaseFallback(requestId, 'sector sync state read', stateResult.error || `http_${stateResult.status || 0}`);
+      state = backupState;
+    } else {
+      state = stateResult.state;
     }
-    state = stateResult.state;
   } else {
     const db = getD1Database(env);
     state = await readUserSyncState({ db, userId });
@@ -6011,15 +6181,21 @@ async function handleSectorSyncBootstrap({ request, env, corsOrigin, verifyIdTok
       requestId
     });
     if (!stateResult.ok) {
-      return errorResponse(503, {
-        error: 'storage_unavailable',
-        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
-        retryable: true,
-        code: 'storage_unavailable',
-        requestId
-      }, corsOrigin);
+      const backupState = await readUserSyncStateFromD1Backup({ env, userId });
+      if (!backupState) {
+        return errorResponse(503, {
+          error: 'storage_unavailable',
+          message: 'Supabase canonical storage is unavailable and Cloudflare D1 backup storage is not configured.',
+          retryable: true,
+          code: 'storage_unavailable',
+          requestId
+        }, corsOrigin);
+      }
+      logSupabaseFallback(requestId, 'sector bootstrap state read', stateResult.error || `http_${stateResult.status || 0}`);
+      currentState = backupState;
+    } else {
+      currentState = stateResult.state;
     }
-    currentState = stateResult.state;
   } else {
     const db = getD1Database(env);
     currentState = await readUserSyncState({ db, userId });
@@ -6097,53 +6273,71 @@ async function handleSectorSyncBootstrap({ request, env, corsOrigin, verifyIdTok
       email: isValidEmail(authEmail) ? authEmail : null
     });
     if (!writeResult.ok) {
-      return errorResponse(503, {
-        error: 'storage_unavailable',
-        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
-        retryable: true,
-        code: 'storage_unavailable',
-        requestId
-      }, corsOrigin);
-    }
-    const stateWriteResult = await persistSupabaseSyncState({
-      config: canonicalConfig,
-      userId,
-      state: {
-        migratedAtMs,
-        migrationSource,
-        updatedAtMs: migratedAtMs
-      },
-      requestId,
-      sourcePath: '/sync/sectors/bootstrap'
-    });
-    if (!stateWriteResult.ok) {
-      return errorResponse(503, {
-        error: 'storage_unavailable',
-        message: 'Supabase canonical storage is unavailable. Please retry shortly.',
-        retryable: true,
-        code: 'storage_unavailable',
-        requestId
-      }, corsOrigin);
-    }
-    try {
-      await writeSectorSyncOperationsToD1Backup({
+      logSupabaseFallback(requestId, 'sector bootstrap write', writeResult.error || `http_${writeResult.status || 0}`);
+      const backupStored = await tryWriteSectorSyncOperationsToD1Backup({
         env,
         userId,
         deviceId: body?.deviceId,
         operations: backupOperations
-      });
+      }, requestId);
       const backupDb = getD1Database(env);
-      if (backupDb) {
-        await persistUserSyncState({
-          db: backupDb,
-          userId,
+      if (backupStored && backupDb) {
+        try {
+          await persistUserSyncState({
+            db: backupDb,
+            userId,
+            migratedAtMs,
+            migrationSource,
+            updatedAtMs: migratedAtMs
+          });
+        } catch (error) {
+          console.warn(`[api][${requestId || 'no-request-id'}] cloudflare d1 sector bootstrap state backup write failed: ${String(error?.message || error || 'unknown')}`);
+        }
+      }
+      if (!backupStored) {
+        return errorResponse(503, {
+          error: 'storage_unavailable',
+          message: 'Supabase canonical storage is unavailable and Cloudflare D1 backup storage is not configured.',
+          retryable: true,
+          code: 'storage_unavailable',
+          requestId
+        }, corsOrigin);
+      }
+    } else {
+      const stateWriteResult = await persistSupabaseSyncState({
+        config: canonicalConfig,
+        userId,
+        state: {
           migratedAtMs,
           migrationSource,
           updatedAtMs: migratedAtMs
-        });
+        },
+        requestId,
+        sourcePath: '/sync/sectors/bootstrap'
+      });
+      if (!stateWriteResult.ok) {
+        logSupabaseFallback(requestId, 'sector bootstrap state write', stateWriteResult.error || `http_${stateWriteResult.status || 0}`);
       }
-    } catch (error) {
-      console.warn(`[api][${requestId || 'no-request-id'}] cloudflare d1 sector bootstrap backup write failed: ${String(error?.message || error || 'unknown')}`);
+      await tryWriteSectorSyncOperationsToD1Backup({
+        env,
+        userId,
+        deviceId: body?.deviceId,
+        operations: backupOperations
+      }, requestId);
+      const backupDb = getD1Database(env);
+      if (backupDb) {
+        try {
+          await persistUserSyncState({
+            db: backupDb,
+            userId,
+            migratedAtMs,
+            migrationSource,
+            updatedAtMs: migratedAtMs
+          });
+        } catch (error) {
+          console.warn(`[api][${requestId || 'no-request-id'}] cloudflare d1 sector bootstrap state backup write failed: ${String(error?.message || error || 'unknown')}`);
+        }
+      }
     }
   } else {
     const db = getD1Database(env);
