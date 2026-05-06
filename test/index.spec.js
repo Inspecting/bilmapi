@@ -875,6 +875,28 @@ describe('data api', () => {
     expect(body.message).toContain('Cloud Export');
   });
 
+  it('rejects oversized direct JSON bodies before auth and storage work', async () => {
+    const response = await worker.fetch(new Request(`https://data-api.watchbilm.org/?userId=${USER_ID}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        origin: ALLOWED_ORIGIN
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        data: {
+          schema: 'bilm-backup-v1',
+          blob: 'x'.repeat((2 * 1024 * 1024) + 1)
+        }
+      })
+    }), env);
+
+    expect(response.status).toBe(413);
+    expect(response.headers.get('access-control-allow-origin')).toBe(ALLOWED_ORIGIN);
+    const body = await response.json();
+    expect(body.code).toBe('payload_too_large');
+  });
+
   it('rate limits private snapshot writes per user', async () => {
     env.BILM_RATE_LIMIT_SNAPSHOT_WRITE = '1';
     env.BILM_RATE_LIMIT_SNAPSHOT_WRITE_WINDOW_MS = '60000';
@@ -1015,6 +1037,7 @@ describe('data api', () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get('access-control-allow-origin')).toBe(ALLOWED_ORIGIN);
+    expect(response.headers.get('x-content-type-options')).toBe('nosniff');
     const body = await response.json();
     expect(body.ok).toBe(true);
     expect(body.userId).toBe(USER_ID);

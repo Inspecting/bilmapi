@@ -531,6 +531,12 @@ const DEFAULT_ALLOWED_ORIGINS = new Set([
   'https://bilm-backend.reidmhit.workers.dev'
 ]);
 const MAX_SNAPSHOT_BYTES = 1500000;
+const MAX_JSON_BODY_BYTES = 2 * 1024 * 1024;
+const API_SECURITY_HEADERS = Object.freeze({
+  'x-content-type-options': 'nosniff',
+  'referrer-policy': 'no-referrer',
+  'x-permitted-cross-domain-policies': 'none'
+});
 // Keep mirror payload limits above snapshot size so backup events are preserved in full.
 const SUPABASE_MIRROR_MAX_JSON_BYTES = MAX_SNAPSHOT_BYTES + 256_000;
 const SUPABASE_MIRROR_MAX_TEXT_CHARS = SUPABASE_MIRROR_MAX_JSON_BYTES + 128_000;
@@ -784,6 +790,7 @@ function jsonResponse(status, payload, corsOrigin = '', extraHeaders = {}) {
     headers: {
       'content-type': 'application/json; charset=utf-8',
       'cache-control': 'no-store',
+      ...API_SECURITY_HEADERS,
       ...createCorsHeaders(corsOrigin),
       ...extraHeaders
     }
@@ -796,6 +803,7 @@ function textResponse(status, text, corsOrigin = '', extraHeaders = {}) {
     headers: {
       'content-type': 'application/json; charset=utf-8',
       'cache-control': 'no-store',
+      ...API_SECURITY_HEADERS,
       ...createCorsHeaders(corsOrigin),
       ...extraHeaders
     }
@@ -863,10 +871,88 @@ function errorResponse(status, {
   });
 }
 
+function parseContentLengthHeader(request) {
+  const rawValue = String(request?.headers?.get?.('content-length') || '').trim();
+  if (!rawValue) return null;
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return Math.floor(parsed);
+}
+
+async function readRequestTextWithLimit(request, corsOrigin, requestId = null, maxBytes = MAX_JSON_BODY_BYTES) {
+  const normalizedMaxBytes = Math.max(1, Number(maxBytes || MAX_JSON_BODY_BYTES) || MAX_JSON_BODY_BYTES);
+  const declaredLength = parseContentLengthHeader(request);
+  if (declaredLength !== null && declaredLength > normalizedMaxBytes) {
+    throw errorResponse(413, {
+      error: 'payload_too_large',
+      message: `Request body exceeds maximum size of ${normalizedMaxBytes.toLocaleString()} bytes.`,
+      retryable: false,
+      code: 'payload_too_large',
+      requestId
+    }, corsOrigin, {
+      'x-max-body-bytes': String(normalizedMaxBytes)
+    });
+  }
+
+  if (!request?.body?.getReader) {
+    const fallbackText = await request.text();
+    const fallbackBytes = calculateJsonBytes(fallbackText);
+    if (fallbackBytes > normalizedMaxBytes) {
+      throw errorResponse(413, {
+        error: 'payload_too_large',
+        message: `Request body exceeds maximum size of ${normalizedMaxBytes.toLocaleString()} bytes.`,
+        retryable: false,
+        code: 'payload_too_large',
+        requestId
+      }, corsOrigin, {
+        'x-max-body-bytes': String(normalizedMaxBytes)
+      });
+    }
+    return fallbackText;
+  }
+
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder();
+  let totalBytes = 0;
+  let text = '';
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += Number(value?.byteLength || 0);
+      if (totalBytes > normalizedMaxBytes) {
+        throw errorResponse(413, {
+          error: 'payload_too_large',
+          message: `Request body exceeds maximum size of ${normalizedMaxBytes.toLocaleString()} bytes.`,
+          retryable: false,
+          code: 'payload_too_large',
+          requestId
+        }, corsOrigin, {
+          'x-max-body-bytes': String(normalizedMaxBytes)
+        });
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return text;
+  } catch (error) {
+    if (error instanceof Response) throw error;
+    throw errorResponse(400, {
+      error: 'invalid_body',
+      message: 'Request body could not be read.',
+      retryable: false,
+      code: 'invalid_body',
+      requestId
+    }, corsOrigin);
+  }
+}
+
 async function parseJsonBody(request, corsOrigin, requestId = null) {
   try {
-    return await request.json();
-  } catch {
+    const bodyText = await readRequestTextWithLimit(request, corsOrigin, requestId);
+    return JSON.parse(bodyText);
+  } catch (error) {
+    if (error instanceof Response) throw error;
     throw errorResponse(400, {
       error: 'invalid_json',
       message: 'Request body must be valid JSON.',
@@ -3319,6 +3405,7 @@ function createMediaResponse({
     headers: {
       'content-type': String(contentType || 'application/json; charset=utf-8'),
       'cache-control': 'public, max-age=60, stale-while-revalidate=300',
+      ...API_SECURITY_HEADERS,
       ...createCorsHeaders(corsOrigin),
       'x-bilm-cache': String(cacheStatus || 'miss'),
       'x-bilm-stale': stale ? '1' : '0',
@@ -6718,6 +6805,7 @@ export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOri
         return new Response(null, {
           status: 204,
           headers: {
+            ...API_SECURITY_HEADERS,
             ...createCorsHeaders(corsOrigin),
             allow: 'GET, POST, OPTIONS',
             'x-request-id': requestId
