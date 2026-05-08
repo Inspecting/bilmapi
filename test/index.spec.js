@@ -616,7 +616,7 @@ class MemoryD1Statement {
       const [userId, sinceMsOrCursorMs] = this.params;
       const max = Number(this.params[this.params.length - 1] || 250) || 250;
       const normalizedUserId = String(userId || '');
-      const useTupleCursor = this.sql.includes("coalesce(op_id, '') > ?3");
+      const useTupleCursor = this.sql.toLowerCase().includes("coalesce(op_id, '') > ?3");
       const since = Number(sinceMsOrCursorMs || 0) || 0;
       const cursorOpId = useTupleCursor ? String(this.params[2] || '') : '';
       const cursorSectorKey = useTupleCursor ? String(this.params[3] || '') : '';
@@ -1324,6 +1324,81 @@ describe('data api', () => {
     const body = await pull.json();
     expect(body.operations.length).toBe(1);
     expect(body.operations[0].itemKey).toBe('movie:181');
+  });
+
+  it('pages sector sync rows with a stable cursor when timestamps tie', async () => {
+    const tiedUpdatedAtMs = 1721900000000;
+    const pushResponse = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        operations: [
+          {
+            sectorKey: 'watch_history',
+            itemKey: 'movie:cursor-a',
+            opId: 'op-a',
+            updatedAtMs: tiedUpdatedAtMs,
+            deleted: false,
+            payload: { key: 'movie-cursor-a', type: 'movie', id: 191, updatedAt: tiedUpdatedAtMs }
+          },
+          {
+            sectorKey: 'watch_history',
+            itemKey: 'movie:cursor-b',
+            opId: 'op-b',
+            updatedAtMs: tiedUpdatedAtMs,
+            deleted: false,
+            payload: { key: 'movie-cursor-b', type: 'movie', id: 192, updatedAt: tiedUpdatedAtMs }
+          },
+          {
+            sectorKey: 'watch_history',
+            itemKey: 'movie:cursor-c',
+            opId: 'op-c',
+            updatedAtMs: tiedUpdatedAtMs,
+            deleted: false,
+            payload: { key: 'movie-cursor-c', type: 'movie', id: 193, updatedAt: tiedUpdatedAtMs }
+          }
+        ]
+      })
+    }), env);
+    expect(pushResponse.status).toBe(200);
+
+    const firstPull = await worker.fetch(new Request(
+      `https://data-api.watchbilm.org/sync/sectors/pull?userId=${USER_ID}&since=0&sectors=watch_history&limit=2`,
+      {
+        method: 'GET',
+        headers: { authorization: 'Bearer valid-token' }
+      }
+    ), env);
+    expect(firstPull.status).toBe(200);
+    const firstBody = await firstPull.json();
+    expect(firstBody.operations.map((operation) => operation.itemKey)).toEqual([
+      'movie:cursor-a',
+      'movie:cursor-b'
+    ]);
+    expect(firstBody.cursorUpdatedAtMs).toBe(tiedUpdatedAtMs);
+    expect(firstBody.cursorOpId).toBe('op-b');
+
+    const nextQuery = new URL('https://data-api.watchbilm.org/sync/sectors/pull');
+    nextQuery.searchParams.set('userId', USER_ID);
+    nextQuery.searchParams.set('since', String(firstBody.cursorMs));
+    nextQuery.searchParams.set('sectors', 'watch_history');
+    nextQuery.searchParams.set('limit', '2');
+    nextQuery.searchParams.set('cursorUpdatedAtMs', String(firstBody.cursorUpdatedAtMs));
+    nextQuery.searchParams.set('cursorOpId', firstBody.cursorOpId);
+    nextQuery.searchParams.set('cursorSectorKey', firstBody.cursorSectorKey);
+    nextQuery.searchParams.set('cursorItemKey', firstBody.cursorItemKey);
+    const secondPull = await worker.fetch(new Request(nextQuery.toString(), {
+      method: 'GET',
+      headers: { authorization: 'Bearer valid-token' }
+    }), env);
+    expect(secondPull.status).toBe(200);
+    const secondBody = await secondPull.json();
+    expect(secondBody.operations.map((operation) => operation.itemKey)).toEqual(['movie:cursor-c']);
+    expect(secondBody.cursorOpId).toBe('op-c');
   });
 
   it('clamps future updatedAtMs and still accepts newer normal-time updates', async () => {

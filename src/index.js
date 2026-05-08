@@ -113,7 +113,6 @@ const SELECT_SECTOR_SYNC_CHANGES_BASE_SQL = `
   SELECT sector_key, item_key, item_json, updated_at_ms, deleted_at_ms, op_id
   FROM sync_items
   WHERE user_id = ?1
-    AND updated_at_ms > ?2
 `;
 const UPSERT_USER_SYNC_STATE_SQL = `
   INSERT INTO user_sync_state (
@@ -4165,7 +4164,7 @@ async function readListSyncRowsFromD1Backup({ env, userId, sinceMs, limit }) {
   return Array.isArray(query?.results) ? query.results : [];
 }
 
-async function readSectorSyncRowsFromD1Backup({ env, userId, sinceMs, limit, sectors = [] }) {
+async function readSectorSyncRowsFromD1Backup({ env, userId, sinceMs, limit, sectors = [], cursor = null }) {
   const db = getD1Database(env);
   if (!db) return null;
   const query = await buildSectorPullStatement({
@@ -4173,7 +4172,8 @@ async function readSectorSyncRowsFromD1Backup({ env, userId, sinceMs, limit, sec
     userId,
     sinceMs,
     limit,
-    sectors
+    sectors,
+    cursor
   }).all();
   return Array.isArray(query?.results) ? query.results : [];
 }
@@ -4508,18 +4508,101 @@ function parseSectorFilters(rawValue) {
   return [...new Set(tokens)];
 }
 
-function buildSectorPullStatement({ db, userId, sinceMs, limit, sectors }) {
+function buildSectorPullStatement({ db, userId, sinceMs, limit, sectors, cursor = null }) {
   const validSectors = Array.isArray(sectors) ? sectors.filter((sector) => isValidSectorKey(sector)) : [];
-  const bindings = [userId, sinceMs];
+  const normalizedCursor = cursor ? normalizeSharedFeedCursor(cursor) : null;
+  const bindings = [userId];
   let sql = `${SELECT_SECTOR_SYNC_CHANGES_BASE_SQL}`;
+  if (normalizedCursor) {
+    bindings.push(
+      parseSinceMs(normalizedCursor.updatedAtMs),
+      normalizeOperationId(normalizedCursor.opId),
+      normalizeSectorKey(normalizedCursor.sectorKey),
+      normalizeItemKey(normalizedCursor.itemKey)
+    );
+    sql += `
+    AND (
+      updated_at_ms > ?2
+      OR (
+        updated_at_ms = ?2
+        AND (
+          COALESCE(op_id, '') > ?3
+          OR (
+            COALESCE(op_id, '') = ?3
+            AND (
+              sector_key > ?4
+              OR (sector_key = ?4 AND item_key > ?5)
+            )
+          )
+        )
+      )
+    )`;
+  } else {
+    bindings.push(sinceMs);
+    sql += ` AND updated_at_ms > ?2`;
+  }
   if (validSectors.length) {
-    const placeholders = validSectors.map((_, index) => `?${index + 3}`).join(', ');
+    const sectorPlaceholderStart = bindings.length + 1;
+    const placeholders = validSectors.map((_, index) => `?${sectorPlaceholderStart + index}`).join(', ');
     sql += ` AND sector_key IN (${placeholders})`;
     bindings.push(...validSectors);
   }
-  sql += ` ORDER BY updated_at_ms ASC LIMIT ?${bindings.length + 1}`;
+  sql += ` ORDER BY updated_at_ms ASC, COALESCE(op_id, '') ASC, sector_key ASC, item_key ASC`;
+  sql += ` LIMIT ?${bindings.length + 1}`;
   bindings.push(limit);
   return db.prepare(sql).bind(...bindings);
+}
+
+function quotePostgrestFilterValue(value = '') {
+  const raw = String(value || '');
+  const escaped = raw
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"');
+  return `"${escaped}"`;
+}
+
+function buildSupabaseSyncCursorFilter(cursor = null) {
+  const normalized = cursor ? normalizeSharedFeedCursor(cursor) : null;
+  if (!normalized) return null;
+  const updatedAtMs = parseSinceMs(normalized.updatedAtMs);
+  const opId = normalizeOperationId(normalized.opId);
+  const sectorKey = normalizeSectorKey(normalized.sectorKey);
+  const itemKey = normalizeItemKey(normalized.itemKey);
+  const encodedOpId = quotePostgrestFilterValue(opId);
+  const encodedSectorKey = quotePostgrestFilterValue(sectorKey);
+  const encodedItemKey = quotePostgrestFilterValue(itemKey);
+  const sameOpClauses = opId
+    ? [
+        `and(updated_at_ms.eq.${updatedAtMs},op_id.gt.${encodedOpId})`,
+        `and(updated_at_ms.eq.${updatedAtMs},op_id.eq.${encodedOpId},data_group.gt.${encodedSectorKey})`,
+        `and(updated_at_ms.eq.${updatedAtMs},op_id.eq.${encodedOpId},data_group.eq.${encodedSectorKey},data_key.gt.${encodedItemKey})`
+      ]
+    : [
+        `and(updated_at_ms.eq.${updatedAtMs},op_id.is.null,data_group.gt.${encodedSectorKey})`,
+        `and(updated_at_ms.eq.${updatedAtMs},op_id.is.null,data_group.eq.${encodedSectorKey},data_key.gt.${encodedItemKey})`,
+        `and(updated_at_ms.eq.${updatedAtMs},op_id.gt.${encodedOpId})`
+      ];
+  return [
+    `updated_at_ms.gt.${updatedAtMs}`,
+    ...sameOpClauses
+  ].join(',');
+}
+
+function buildSectorPullCursorFromRow(row = {}) {
+  return normalizeSharedFeedCursor({
+    updatedAtMs: row?.updated_at_ms,
+    opId: row?.op_id,
+    sectorKey: row?.sector_key ?? row?.data_group,
+    itemKey: row?.item_key ?? row?.data_key
+  });
+}
+
+function chooseLaterSyncCursor(left = null, right = null) {
+  const normalizedLeft = left ? normalizeSharedFeedCursor(left) : null;
+  const normalizedRight = right ? normalizeSharedFeedCursor(right) : null;
+  if (!normalizedLeft) return normalizedRight;
+  if (!normalizedRight) return normalizedLeft;
+  return compareSharedFeedTuple(normalizedRight, normalizedLeft) > 0 ? normalizedRight : normalizedLeft;
 }
 
 function formatSyncState(row) {
@@ -6081,6 +6164,12 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
 
   const sinceMs = parseSinceMs(url.searchParams.get('since'));
   const limit = parsePullLimit(url.searchParams.get('limit'));
+  const cursor = normalizeSharedFeedCursor({
+    updatedAtMs: url.searchParams.get('cursorUpdatedAtMs'),
+    opId: url.searchParams.get('cursorOpId'),
+    sectorKey: url.searchParams.get('cursorSectorKey'),
+    itemKey: url.searchParams.get('cursorItemKey')
+  });
   const requestedSectors = parseSectorFilters(url.searchParams.get('sectors'));
   const invalidSector = requestedSectors.find((sector) => !isValidSectorKey(sector));
   if (invalidSector) {
@@ -6100,9 +6189,14 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
     if (!cooldownState.blocked) {
       const searchParams = {
         user_id: `eq.${userId}`,
-        data_scope: 'eq.sector',
-        updated_at_ms: `gt.${sinceMs}`
+        data_scope: 'eq.sector'
       };
+      const cursorFilter = buildSupabaseSyncCursorFilter(cursor);
+      if (cursorFilter) {
+        searchParams.or = `(${cursorFilter})`;
+      } else {
+        searchParams.updated_at_ms = `gt.${sinceMs}`;
+      }
       const sectorsFilter = buildSupabaseInFilter(requestedSectors);
       if (sectorsFilter) {
         searchParams.data_group = `in.${sectorsFilter}`;
@@ -6112,7 +6206,7 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
         table: canonicalConfig.userDataTable,
         select: 'data_group,data_key,payload_json,updated_at_ms,deleted_at_ms,op_id',
         searchParams,
-        order: 'updated_at_ms.asc',
+        order: 'updated_at_ms.asc,op_id.asc.nullsfirst,data_group.asc,data_key.asc',
         limit,
         requestId
       });
@@ -6129,7 +6223,8 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
         userId,
         sinceMs,
         limit,
-        sectors: requestedSectors
+        sectors: requestedSectors,
+        cursor
       });
       if (backupRows) {
         logSupabaseFallback(
@@ -6156,16 +6251,17 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
       userId,
       sinceMs,
       limit,
-      sectors: requestedSectors
+      sectors: requestedSectors,
+      cursor
     }) || [];
   }
 
-  let cursorMs = sinceMs;
+  let cursorTuple = cursor || normalizeSharedFeedCursor({ updatedAtMs: sinceMs });
   const operations = [];
 
   rows.forEach((row) => {
     const updatedAtMs = parseSinceMs(row?.updated_at_ms);
-    if (updatedAtMs > cursorMs) cursorMs = updatedAtMs;
+    cursorTuple = chooseLaterSyncCursor(cursorTuple, buildSectorPullCursorFromRow(row));
     const sectorKey = normalizeSectorKey(row?.sector_key ?? row?.data_group);
     const itemKey = normalizeItemKey(row?.item_key ?? row?.data_key);
     if (!isValidSectorKey(sectorKey) || !itemKey) return;
@@ -6228,7 +6324,11 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
   return jsonResponse(200, {
     ok: true,
     sinceMs,
-    cursorMs,
+    cursorMs: parseSinceMs(cursorTuple?.updatedAtMs || sinceMs),
+    cursorUpdatedAtMs: parseSinceMs(cursorTuple?.updatedAtMs || sinceMs),
+    cursorOpId: normalizeOperationId(cursorTuple?.opId),
+    cursorSectorKey: normalizeSectorKey(cursorTuple?.sectorKey),
+    cursorItemKey: normalizeItemKey(cursorTuple?.itemKey),
     operations,
     state
   }, corsOrigin, { 'x-request-id': requestId });
