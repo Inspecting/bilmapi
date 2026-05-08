@@ -2558,6 +2558,80 @@ describe('data api', () => {
     });
   });
 
+  it('uses D1 list backup when Supabase primary returns an empty initial read', async () => {
+    enableSupabasePrimary(env);
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('[]', {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    }));
+    d1.listRows.set(`${THIRD_USER_ID}|bilm-continue-watching|tmdb:tv:101`, {
+      user_id: THIRD_USER_ID,
+      list_key: 'bilm-continue-watching',
+      item_key: 'tmdb:tv:101',
+      item_json: JSON.stringify({
+        key: 'tmdb:tv:101',
+        type: 'tv',
+        id: 101,
+        season: 3,
+        episode: 5,
+        updatedAt: 1722000000200
+      }),
+      updated_at_ms: 1722000000200,
+      deleted_at_ms: null
+    });
+
+    const pullResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/sync/lists/pull?userId=${THIRD_USER_ID}&since=0`, {
+      headers: { authorization: 'Bearer third-token' }
+    }), env);
+
+    expect(pullResponse.status).toBe(200);
+    const pullBody = await pullResponse.json();
+    expect(pullBody.backendSource).toBe('supabase+d1-backup');
+    expect(pullBody.diagnostics.backupRows).toBe(1);
+    expect(pullBody.operations).toHaveLength(1);
+    expect(pullBody.operations[0]).toMatchObject({
+      listKey: 'bilm-continue-watching',
+      itemKey: 'tmdb:tv:101',
+      deleted: false
+    });
+  });
+
+  it('uses D1 sector backup when Supabase primary returns an empty initial read', async () => {
+    enableSupabasePrimary(env);
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('[]', {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    }));
+    d1.syncRows.set(`${THIRD_USER_ID}|tv_progress|bilm-tv-progress-tmdb-101`, {
+      user_id: THIRD_USER_ID,
+      sector_key: 'tv_progress',
+      item_key: 'bilm-tv-progress-tmdb-101',
+      item_json: JSON.stringify({
+        storageKey: 'bilm-tv-progress-tmdb-101',
+        value: JSON.stringify({ season: 3, episode: 5, updatedAtMs: 1722000000300 })
+      }),
+      updated_at_ms: 1722000000300,
+      deleted_at_ms: null,
+      op_id: 'op-empty-supabase'
+    });
+
+    const pullResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/sync/sectors/pull?userId=${THIRD_USER_ID}&since=0&sectors=tv_progress`, {
+      headers: { authorization: 'Bearer third-token' }
+    }), env);
+
+    expect(pullResponse.status).toBe(200);
+    const pullBody = await pullResponse.json();
+    expect(pullBody.backendSource).toBe('supabase+d1-backup');
+    expect(pullBody.diagnostics.backupRows).toBe(1);
+    expect(pullBody.operations).toHaveLength(1);
+    expect(pullBody.operations[0]).toMatchObject({
+      sectorKey: 'tv_progress',
+      itemKey: 'bilm-tv-progress-tmdb-101',
+      opId: 'op-empty-supabase',
+      deleted: false
+    });
+  });
+
   it('purges deleted supabase canonical rows on scheduled run', async () => {
     env.SUPABASE_PROJECT_URL = 'https://example.supabase.co';
     env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-role-key';

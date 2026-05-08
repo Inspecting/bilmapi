@@ -4188,6 +4188,64 @@ function logSupabaseFallback(requestId = '', action = '', detail = '') {
   console.warn(`[api][${requestId || 'no-request-id'}] supabase canonical ${action || 'request'} unavailable; using cloudflare backup${detail ? ` (${detail})` : ''}`);
 }
 
+function getPullRowIdentity(row = {}, kind = 'sector') {
+  const group = kind === 'list'
+    ? String(row?.list_key ?? row?.data_group ?? '').trim()
+    : String(row?.sector_key ?? row?.data_group ?? '').trim();
+  const key = kind === 'list'
+    ? String(row?.item_key ?? row?.data_key ?? '').trim()
+    : String(row?.item_key ?? row?.data_key ?? '').trim();
+  return group && key ? `${group}|${key}` : '';
+}
+
+function shouldReplacePullRow(current = null, incoming = null) {
+  if (!current) return true;
+  if (!incoming) return false;
+  const currentUpdatedAt = parseSinceMs(current?.updated_at_ms);
+  const incomingUpdatedAt = parseSinceMs(incoming?.updated_at_ms);
+  if (incomingUpdatedAt !== currentUpdatedAt) {
+    return incomingUpdatedAt > currentUpdatedAt;
+  }
+  const currentDeleted = Number(current?.deleted_at_ms || 0) > 0;
+  const incomingDeleted = Number(incoming?.deleted_at_ms || 0) > 0;
+  if (incomingDeleted !== currentDeleted) return incomingDeleted;
+  const currentOpId = String(current?.op_id || '').trim();
+  const incomingOpId = String(incoming?.op_id || '').trim();
+  return incomingOpId >= currentOpId;
+}
+
+function sortPullRows(left = {}, right = {}, kind = 'sector') {
+  const timeDiff = parseSinceMs(left?.updated_at_ms) - parseSinceMs(right?.updated_at_ms);
+  if (timeDiff !== 0) return timeDiff;
+  const opDiff = String(left?.op_id || '').trim().localeCompare(String(right?.op_id || '').trim());
+  if (opDiff !== 0) return opDiff;
+  const leftGroup = kind === 'list'
+    ? String(left?.list_key ?? left?.data_group ?? '').trim()
+    : String(left?.sector_key ?? left?.data_group ?? '').trim();
+  const rightGroup = kind === 'list'
+    ? String(right?.list_key ?? right?.data_group ?? '').trim()
+    : String(right?.sector_key ?? right?.data_group ?? '').trim();
+  const groupDiff = leftGroup.localeCompare(rightGroup);
+  if (groupDiff !== 0) return groupDiff;
+  return String(left?.item_key ?? left?.data_key ?? '').trim().localeCompare(String(right?.item_key ?? right?.data_key ?? '').trim());
+}
+
+function mergePullRowsWithBackup(primaryRows = [], backupRows = [], { kind = 'sector', limit = 250 } = {}) {
+  const max = Math.max(1, Number(limit || 250) || 250);
+  const map = new Map();
+  [...(Array.isArray(primaryRows) ? primaryRows : []), ...(Array.isArray(backupRows) ? backupRows : [])].forEach((row) => {
+    const identity = getPullRowIdentity(row, kind);
+    if (!identity) return;
+    const current = map.get(identity);
+    if (shouldReplacePullRow(current, row)) {
+      map.set(identity, row);
+    }
+  });
+  return [...map.values()]
+    .sort((left, right) => sortPullRows(left, right, kind))
+    .slice(0, max);
+}
+
 async function persistSnapshot({ env, userId, snapshot, corsOrigin, requestId = '', email = null }) {
   assertNoCredentialStorage(snapshot, corsOrigin);
 
@@ -5808,7 +5866,11 @@ async function handleListSyncPull({ request, env, corsOrigin, verifyIdToken, req
   const sinceMs = parseSinceMs(url.searchParams.get('since'));
   const limit = parsePullLimit(url.searchParams.get('limit'));
   let rows = [];
+  let backendSource = 'cloudflare-d1';
+  let backupRowCount = 0;
+  let supabaseRowCount = 0;
   if (supabasePrimaryActive) {
+    backendSource = 'supabase';
     const cooldownState = getSupabaseCanonicalReadCooldownState(userId);
     let supabaseQuery = null;
     if (!cooldownState.blocked) {
@@ -5829,12 +5891,24 @@ async function handleListSyncPull({ request, env, corsOrigin, verifyIdToken, req
     if (supabaseQuery?.ok) {
       clearSupabaseCanonicalReadCooldown(userId);
       rows = supabaseQuery.rows;
+      supabaseRowCount = rows.length;
+      if (sinceMs <= 0) {
+        const backupRows = await readListSyncRowsFromD1Backup({ env, userId, sinceMs, limit });
+        backupRowCount = Array.isArray(backupRows) ? backupRows.length : 0;
+        if (backupRowCount > rows.length) {
+          rows = mergePullRowsWithBackup(rows, backupRows, { kind: 'list', limit });
+          backendSource = 'supabase+d1-backup';
+          logSupabaseFallback(requestId, 'list sync read', `supabase_rows_${supabaseRowCount}_d1_rows_${backupRowCount}`);
+        }
+      }
     } else {
       const retryAfterSeconds = supabaseQuery
         ? recordSupabaseCanonicalReadCooldown({ env, userId, status: supabaseQuery.status })
         : cooldownState.retryAfterSeconds;
       const backupRows = await readListSyncRowsFromD1Backup({ env, userId, sinceMs, limit });
       if (backupRows) {
+        backendSource = 'cloudflare-d1-fallback';
+        backupRowCount = backupRows.length;
         logSupabaseFallback(
           requestId,
           'list sync read',
@@ -5855,6 +5929,8 @@ async function handleListSyncPull({ request, env, corsOrigin, verifyIdToken, req
     }
   } else {
     rows = await readListSyncRowsFromD1Backup({ env, userId, sinceMs, limit }) || [];
+    backendSource = 'cloudflare-d1';
+    backupRowCount = rows.length;
   }
 
   let cursorMs = sinceMs;
@@ -5896,6 +5972,15 @@ async function handleListSyncPull({ request, env, corsOrigin, verifyIdToken, req
     ok: true,
     sinceMs,
     cursorMs,
+    hasMore: operations.length >= limit,
+    backendSource,
+    diagnostics: {
+      requestId,
+      backendSource,
+      supabaseRows: supabaseRowCount,
+      backupRows: backupRowCount,
+      rowCount: rows.length
+    },
     operations
   }, corsOrigin, { 'x-request-id': requestId });
 }
@@ -6183,7 +6268,11 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
   }
 
   let rows = [];
+  let backendSource = 'cloudflare-d1';
+  let backupRowCount = 0;
+  let supabaseRowCount = 0;
   if (supabasePrimaryActive) {
+    backendSource = 'supabase';
     const cooldownState = getSupabaseCanonicalReadCooldownState(userId);
     let supabaseQuery = null;
     if (!cooldownState.blocked) {
@@ -6214,6 +6303,23 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
     if (supabaseQuery?.ok) {
       clearSupabaseCanonicalReadCooldown(userId);
       rows = supabaseQuery.rows;
+      supabaseRowCount = rows.length;
+      if (!cursor && sinceMs <= 0) {
+        const backupRows = await readSectorSyncRowsFromD1Backup({
+          env,
+          userId,
+          sinceMs,
+          limit,
+          sectors: requestedSectors,
+          cursor
+        });
+        backupRowCount = Array.isArray(backupRows) ? backupRows.length : 0;
+        if (backupRowCount > rows.length) {
+          rows = mergePullRowsWithBackup(rows, backupRows, { kind: 'sector', limit });
+          backendSource = 'supabase+d1-backup';
+          logSupabaseFallback(requestId, 'sector sync read', `supabase_rows_${supabaseRowCount}_d1_rows_${backupRowCount}`);
+        }
+      }
     } else {
       const retryAfterSeconds = supabaseQuery
         ? recordSupabaseCanonicalReadCooldown({ env, userId, status: supabaseQuery.status })
@@ -6227,6 +6333,8 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
         cursor
       });
       if (backupRows) {
+        backendSource = 'cloudflare-d1-fallback';
+        backupRowCount = backupRows.length;
         logSupabaseFallback(
           requestId,
           'sector sync read',
@@ -6254,6 +6362,8 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
       sectors: requestedSectors,
       cursor
     }) || [];
+    backendSource = 'cloudflare-d1';
+    backupRowCount = rows.length;
   }
 
   let cursorTuple = cursor || normalizeSharedFeedCursor({ updatedAtMs: sinceMs });
@@ -6329,6 +6439,15 @@ async function handleSectorSyncPull({ request, env, corsOrigin, verifyIdToken, r
     cursorOpId: normalizeOperationId(cursorTuple?.opId),
     cursorSectorKey: normalizeSectorKey(cursorTuple?.sectorKey),
     cursorItemKey: normalizeItemKey(cursorTuple?.itemKey),
+    hasMore: operations.length >= limit,
+    backendSource,
+    diagnostics: {
+      requestId,
+      backendSource,
+      supabaseRows: supabaseRowCount,
+      backupRows: backupRowCount,
+      rowCount: rows.length
+    },
     operations,
     state
   }, corsOrigin, { 'x-request-id': requestId });
