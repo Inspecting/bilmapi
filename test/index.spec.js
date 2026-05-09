@@ -2221,6 +2221,88 @@ describe('data api', () => {
     expect(feed.operations.some((operation) => operation.sectorKey === 'chat_messages')).toBe(false);
   });
 
+  it('reads linked shared-feed from Supabase canonical primary before D1 backup', async () => {
+    enableSupabasePrimary(env);
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init = {}) => {
+      const requestUrl = String(input || '');
+      const method = String(init?.method || 'GET').toUpperCase();
+      if (method === 'GET' && requestUrl.includes('/rest/v1/bilm_user_data')) {
+        expect(requestUrl).toContain(`user_id=eq.${USER_ID}`);
+        expect(requestUrl).toContain('data_scope=eq.sector');
+        expect(requestUrl).toContain('data_group=in.');
+        return new Response(JSON.stringify([{
+          data_group: 'favorites',
+          data_key: 'movie:501',
+          payload_json: {
+            key: 'tmdb:movie:501',
+            title: 'Canonical Shared Favorite',
+            updatedAt: 1728000000000
+          },
+          updated_at_ms: 1728000000000,
+          deleted_at_ms: null,
+          op_id: 'op-canonical-shared'
+        }]), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        });
+      }
+      return new Response('', { status: 201 });
+    });
+
+    const registerTarget = await worker.fetch(new Request(`https://data-api.watchbilm.org/links?userId=${OTHER_USER_ID}`, {
+      headers: { authorization: 'Bearer other-token' }
+    }), env);
+    expect(registerTarget.status).toBe(200);
+
+    const createResponse = await worker.fetch(new Request('https://data-api.watchbilm.org/links/request', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        targetEmail: 'bob@example.com',
+        shareScopes: { favorites: true }
+      })
+    }), env);
+    expect(createResponse.status).toBe(200);
+    const created = await createResponse.json();
+
+    const approveResponse = await worker.fetch(new Request('https://data-api.watchbilm.org/links/respond', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer other-token'
+      },
+      body: JSON.stringify({
+        userId: OTHER_USER_ID,
+        linkId: created.link.id,
+        action: 'approve',
+        shareScopes: { favorites: true }
+      })
+    }), env);
+    expect(approveResponse.status).toBe(200);
+
+    const feedResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/links/shared-feed?userId=${OTHER_USER_ID}&since=0`, {
+      headers: { authorization: 'Bearer other-token' }
+    }), env);
+    expect(feedResponse.status).toBe(200);
+    const feed = await feedResponse.json();
+    expect(feed.backendSource).toBe('supabase');
+    expect(feed.diagnostics.links[0].supabaseRows).toBe(1);
+    expect(feed.operations).toHaveLength(1);
+    expect(feed.operations[0]).toMatchObject({
+      sectorKey: 'favorites',
+      itemKey: 'movie:501',
+      opId: 'op-canonical-shared',
+      sourceUserId: USER_ID,
+      deleted: false
+    });
+    expect(feed.operations[0].payload.title).toBe('Canonical Shared Favorite');
+    expect(fetchSpy.mock.calls.some(([url]) => String(url).includes('/rest/v1/bilm_user_data'))).toBe(true);
+  });
+
   it('paginates shared-feed safely when many records share the same timestamp', async () => {
     const registerTarget = await worker.fetch(new Request(`https://data-api.watchbilm.org/links?userId=${OTHER_USER_ID}`, {
       headers: { authorization: 'Bearer other-token' }

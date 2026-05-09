@@ -4178,6 +4178,56 @@ async function readSectorSyncRowsFromD1Backup({ env, userId, sinceMs, limit, sec
   return Array.isArray(query?.results) ? query.results : [];
 }
 
+async function readSharedSyncRowsFromD1Backup({ env, userId, sinceMs, sectors = [], limit, cursor = null }) {
+  const db = getD1Database(env);
+  if (!db) return null;
+  const statement = buildSharedSyncItemsStatement({
+    db,
+    userId,
+    sinceMs,
+    sectors,
+    limit,
+    cursor
+  });
+  if (!statement) return [];
+  const query = await statement.all();
+  return Array.isArray(query?.results) ? query.results : [];
+}
+
+async function readSharedSyncRowsFromSupabaseCanonical({
+  config,
+  userId,
+  sinceMs,
+  sectors = [],
+  limit,
+  cursor = null,
+  requestId = ''
+}) {
+  const searchParams = {
+    user_id: `eq.${userId}`,
+    data_scope: 'eq.sector'
+  };
+  const cursorFilter = buildSupabaseSyncCursorFilter(cursor);
+  if (cursorFilter) {
+    searchParams.or = `(${cursorFilter})`;
+  } else {
+    searchParams.updated_at_ms = `gt.${sinceMs}`;
+  }
+  const sectorsFilter = buildSupabaseInFilter(sectors);
+  if (sectorsFilter) {
+    searchParams.data_group = `in.${sectorsFilter}`;
+  }
+  return selectSupabaseCanonicalRows({
+    config,
+    table: config.userDataTable,
+    select: 'data_group,data_key,payload_json,updated_at_ms,deleted_at_ms,op_id',
+    searchParams,
+    order: 'updated_at_ms.asc,op_id.asc.nullsfirst,data_group.asc,data_key.asc',
+    limit,
+    requestId
+  });
+}
+
 async function readUserSyncStateFromD1Backup({ env, userId }) {
   const db = getD1Database(env);
   if (!db) return null;
@@ -5544,6 +5594,8 @@ async function handleResetAccountData({ request, env, corsOrigin, verifyIdToken,
 
 async function handlePullLinkedSharedFeed({ request, env, corsOrigin, verifyIdToken, requestId }) {
   assertD1Configured(env, corsOrigin);
+  const canonicalConfig = resolveSupabaseCanonicalConfig(env);
+  const supabasePrimaryActive = isSupabaseCanonicalPrimaryActive(env, canonicalConfig);
   const url = new URL(request.url);
   const userId = normalizeUserId(url.searchParams.get('userId'));
   const authContext = await requireAccountLinkAuthContext({
@@ -5584,6 +5636,12 @@ async function handlePullLinkedSharedFeed({ request, env, corsOrigin, verifyIdTo
   const operations = [];
   let hasAdditionalResults = false;
   const linkSignatureParts = [];
+  const backendSources = new Set();
+  const diagnostics = {
+    requestId,
+    backendSource: supabasePrimaryActive ? 'supabase' : 'cloudflare-d1',
+    links: []
+  };
 
   for (const link of activeLinks) {
     const role = getAccountLinkRole({
@@ -5605,34 +5663,106 @@ async function handlePullLinkedSharedFeed({ request, env, corsOrigin, verifyIdTo
     ].join(':'));
     if (!sourceUserId || !sectors.length) continue;
 
-    const statement = buildSharedSyncItemsStatement({
-      db,
-      userId: sourceUserId,
-      sinceMs,
-      sectors,
-      limit: limit + 1,
-      cursor
+    let rawRows = [];
+    let linkBackendSource = supabasePrimaryActive ? 'supabase' : 'cloudflare-d1';
+    let supabaseRowCount = 0;
+    let backupRowCount = 0;
+    if (supabasePrimaryActive) {
+      const cooldownState = getSupabaseCanonicalReadCooldownState(sourceUserId);
+      let supabaseQuery = null;
+      if (!cooldownState.blocked) {
+        supabaseQuery = await readSharedSyncRowsFromSupabaseCanonical({
+          config: canonicalConfig,
+          userId: sourceUserId,
+          sinceMs,
+          sectors,
+          limit: limit + 1,
+          cursor,
+          requestId
+        });
+      }
+      if (supabaseQuery?.ok) {
+        clearSupabaseCanonicalReadCooldown(sourceUserId);
+        rawRows = supabaseQuery.rows;
+        supabaseRowCount = rawRows.length;
+        const backupRows = await readSharedSyncRowsFromD1Backup({
+          env,
+          userId: sourceUserId,
+          sinceMs,
+          sectors,
+          limit: limit + 1,
+          cursor
+        });
+        backupRowCount = Array.isArray(backupRows) ? backupRows.length : 0;
+        if (backupRowCount > rawRows.length || (!cursor && sinceMs <= 0 && backupRowCount > 0 && rawRows.length === 0)) {
+          rawRows = mergePullRowsWithBackup(rawRows, backupRows, {
+            kind: 'sector',
+            limit: limit + 1
+          });
+          linkBackendSource = 'supabase+d1-backup';
+          logSupabaseFallback(requestId, 'linked shared feed read', `supabase_rows_${supabaseRowCount}_d1_rows_${backupRowCount}`);
+        }
+      } else {
+        const retryAfterSeconds = supabaseQuery
+          ? recordSupabaseCanonicalReadCooldown({ env, userId: sourceUserId, status: supabaseQuery.status })
+          : cooldownState.retryAfterSeconds;
+        const backupRows = await readSharedSyncRowsFromD1Backup({
+          env,
+          userId: sourceUserId,
+          sinceMs,
+          sectors,
+          limit: limit + 1,
+          cursor
+        });
+        if (backupRows) {
+          rawRows = backupRows;
+          backupRowCount = backupRows.length;
+          linkBackendSource = 'cloudflare-d1-fallback';
+          logSupabaseFallback(
+            requestId,
+            'linked shared feed read',
+            supabaseQuery ? (supabaseQuery.error || `http_${supabaseQuery.status || 0}`) : `read_cooldown_${retryAfterSeconds || 0}s`
+          );
+        } else {
+          enforceSupabaseCanonicalReadCooldown({ env, userId: sourceUserId, corsOrigin, requestId });
+          rawRows = [];
+          linkBackendSource = 'unavailable';
+        }
+      }
+    } else {
+      const backupRows = await readSharedSyncRowsFromD1Backup({
+        env,
+        userId: sourceUserId,
+        sinceMs,
+        sectors,
+        limit: limit + 1,
+        cursor
+      });
+      rawRows = Array.isArray(backupRows) ? backupRows : [];
+      backupRowCount = rawRows.length;
+    }
+    backendSources.add(linkBackendSource);
+    diagnostics.links.push({
+      linkId: String(link?.id || '').trim(),
+      sourceUserId: String(sourceUserId || '').trim(),
+      backendSource: linkBackendSource,
+      supabaseRows: supabaseRowCount,
+      backupRows: backupRowCount,
+      rowCount: rawRows.length
     });
-    if (!statement) continue;
-    const query = await statement.all();
-    const rawRows = Array.isArray(query?.results) ? query.results : [];
     const rows = rawRows.slice(0, limit);
     if (rawRows.length > rows.length) {
       hasAdditionalResults = true;
     }
     rows.forEach((row) => {
       const updatedAtMs = parseSinceMs(row?.updated_at_ms);
-      const sectorKey = normalizeSectorKey(row?.sector_key);
-      const itemKey = normalizeItemKey(row?.item_key);
+      const sectorKey = normalizeSectorKey(row?.sector_key ?? row?.data_group);
+      const itemKey = normalizeItemKey(row?.item_key ?? row?.data_key);
       if (!isValidSectorKey(sectorKey) || !itemKey) return;
       const deleted = Number(row?.deleted_at_ms || 0) > 0;
       let payload = null;
       if (!deleted) {
-        try {
-          payload = JSON.parse(String(row?.item_json || 'null'));
-        } catch {
-          payload = null;
-        }
+        payload = parseCanonicalPayloadObject(row?.item_json ?? row?.payload_json);
         if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return;
       }
       operations.push({
@@ -5673,6 +5803,10 @@ async function handlePullLinkedSharedFeed({ request, env, corsOrigin, verifyIdTo
     ? buildSharedFeedCursorFromOperation(limited[limited.length - 1])
     : fallbackCursor;
   const hasMore = hasAdditionalResults || operations.length > limited.length;
+  const backendSource = backendSources.size
+    ? [...backendSources].sort().join('+')
+    : (supabasePrimaryActive ? 'supabase' : 'cloudflare-d1');
+  diagnostics.backendSource = backendSource;
 
   return jsonResponse(200, {
     ok: true,
@@ -5683,8 +5817,10 @@ async function handlePullLinkedSharedFeed({ request, env, corsOrigin, verifyIdTo
     cursorSectorKey: normalizeSectorKey(nextCursor.sectorKey),
     cursorItemKey: normalizeItemKey(nextCursor.itemKey),
     hasMore,
+    backendSource,
     activeLinkIds,
     linkSignature: linkSignatureParts.sort().join('|'),
+    diagnostics,
     operations: limited
   }, corsOrigin, { 'x-request-id': requestId });
 }
