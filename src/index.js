@@ -544,6 +544,8 @@ const ACCOUNT_LINK_STATUS_ACTIVE = 'active';
 const ACCOUNT_LINK_STATUS_DECLINED = 'declined';
 const ACCOUNT_LINK_STATUS_UNLINKED = 'unlinked';
 const ACCOUNT_LINK_STATUS_EXPIRED = 'expired';
+const SHARED_PARTNER_LINKING_DISABLED = true;
+const SHARED_PARTNER_LINKING_DISABLED_MESSAGE = 'Shared partner linking is temporarily disabled while account sync is being repaired.';
 const ACCOUNT_LINK_SCOPE_KEYS = Object.freeze([
   'continueWatching',
   'favorites',
@@ -807,6 +809,60 @@ function textResponse(status, text, corsOrigin = '', extraHeaders = {}) {
       ...extraHeaders
     }
   });
+}
+
+function accountLinkingDisabledResponse({ method = 'GET', path = '', url = null, corsOrigin = '', requestId = '' } = {}) {
+  const normalizedMethod = String(method || 'GET').trim().toUpperCase();
+  const normalizedPath = String(path || '').trim();
+  const searchParams = url?.searchParams instanceof URLSearchParams ? url.searchParams : new URLSearchParams();
+  const base = {
+    ok: normalizedMethod === 'GET',
+    disabled: true,
+    error: 'shared_partner_linking_disabled',
+    code: 'shared_partner_linking_disabled',
+    message: SHARED_PARTNER_LINKING_DISABLED_MESSAGE,
+    requestId
+  };
+  if (normalizedMethod === 'GET' && normalizedPath === '/links') {
+    return jsonResponse(200, {
+      ...base,
+      ok: true,
+      links: [],
+      activeLink: null,
+      incomingRequests: [],
+      pendingRequests: []
+    }, corsOrigin, { 'x-request-id': requestId });
+  }
+  if (normalizedMethod === 'GET' && normalizedPath === '/links/target-capabilities') {
+    return jsonResponse(200, {
+      ...base,
+      ok: true,
+      targetEmail: normalizeEmail(searchParams.get('email')),
+      accountFound: false,
+      requesterBlocked: true,
+      targetBlocked: true,
+      canRequest: false
+    }, corsOrigin, { 'x-request-id': requestId });
+  }
+  if (normalizedMethod === 'GET' && normalizedPath === '/links/shared-feed') {
+    return jsonResponse(200, {
+      ...base,
+      ok: true,
+      operations: [],
+      activeLinkIds: [],
+      links: [],
+      cursorMs: 0,
+      hasMore: false,
+      linkSignature: 'disabled'
+    }, corsOrigin, { 'x-request-id': requestId });
+  }
+  return errorResponse(403, {
+    error: 'shared_partner_linking_disabled',
+    message: SHARED_PARTNER_LINKING_DISABLED_MESSAGE,
+    retryable: false,
+    code: 'shared_partner_linking_disabled',
+    requestId
+  }, corsOrigin);
 }
 
 function createRequestId() {
@@ -7117,7 +7173,7 @@ function buildHealthPayload(env) {
       { id: 'sync_pull', method: 'GET', path: '/sync/sectors/pull?userId=<uid>&since=0', expectedStatuses: [200, 401] },
       { id: 'sync_push', method: 'POST', path: '/sync/sectors/push', expectedStatuses: [200, 401] },
       { id: 'account_links_list', method: 'GET', path: '/links?userId=<uid>', expectedStatuses: [200, 401] },
-      { id: 'account_links_request', method: 'POST', path: '/links/request', expectedStatuses: [200, 400, 401, 409] },
+      { id: 'account_links_request', method: 'POST', path: '/links/request', expectedStatuses: [403] },
       { id: 'account_links_shared_feed', method: 'GET', path: '/links/shared-feed?userId=<uid>&since=0', expectedStatuses: [200, 401] },
       { id: 'account_reset', method: 'POST', path: '/account/reset', expectedStatuses: [200, 400, 401, 403] },
       { id: 'import_admin_guard', method: 'POST', path: '/?import=true', expectedStatuses: [200, 401, 403] }
@@ -7181,6 +7237,16 @@ export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOri
             code: 'route_not_found',
             requestId
           }, corsOrigin);
+        }
+
+        if (SHARED_PARTNER_LINKING_DISABLED && url.pathname.startsWith('/links')) {
+          return accountLinkingDisabledResponse({
+            method: request.method,
+            path: url.pathname,
+            url,
+            corsOrigin,
+            requestId
+          });
         }
 
         if (request.method === 'GET' && url.pathname === '/links') {

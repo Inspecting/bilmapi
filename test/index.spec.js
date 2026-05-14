@@ -1952,7 +1952,72 @@ describe('data api', () => {
     expect(body.requestId).toBeTruthy();
   });
 
-  it('creates account links with non-chat scopes and watch later support', async () => {
+  it('temporarily disables shared partner link endpoints without exposing shared data', async () => {
+    const listResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/links?userId=${USER_ID}`, {
+      headers: { authorization: 'Bearer valid-token' }
+    }), env);
+    expect(listResponse.status).toBe(200);
+    const listBody = await listResponse.json();
+    expect(listBody).toMatchObject({
+      ok: true,
+      disabled: true,
+      activeLink: null
+    });
+    expect(listBody.links).toEqual([]);
+    expect(listBody.incomingRequests).toEqual([]);
+    expect(listBody.pendingRequests).toEqual([]);
+
+    const capabilityResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/links/target-capabilities?userId=${USER_ID}&email=bob@example.com`, {
+      headers: { authorization: 'Bearer valid-token' }
+    }), env);
+    expect(capabilityResponse.status).toBe(200);
+    const capabilityBody = await capabilityResponse.json();
+    expect(capabilityBody).toMatchObject({
+      ok: true,
+      disabled: true,
+      accountFound: false,
+      canRequest: false,
+      targetEmail: 'bob@example.com'
+    });
+
+    const feedResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/links/shared-feed?userId=${USER_ID}&since=0`, {
+      headers: { authorization: 'Bearer valid-token' }
+    }), env);
+    expect(feedResponse.status).toBe(200);
+    const feedBody = await feedResponse.json();
+    expect(feedBody).toMatchObject({
+      ok: true,
+      disabled: true,
+      hasMore: false,
+      linkSignature: 'disabled'
+    });
+    expect(feedBody.operations).toEqual([]);
+    expect(feedBody.links).toEqual([]);
+    expect(feedBody.activeLinkIds).toEqual([]);
+
+    for (const [path, body] of [
+      ['/links/request', { userId: USER_ID, targetEmail: 'bob@example.com' }],
+      ['/links/respond', { userId: USER_ID, linkId: 'link-1', action: 'approve' }],
+      ['/links/scopes', { userId: USER_ID, linkId: 'link-1', shareScopes: { favorites: true } }],
+      ['/links/unlink', { userId: USER_ID, linkId: 'link-1' }],
+      ['/links/chat-ready', { userId: USER_ID, linkId: 'link-1' }]
+    ]) {
+      const response = await worker.fetch(new Request(`https://data-api.watchbilm.org${path}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: 'Bearer valid-token'
+        },
+        body: JSON.stringify(body)
+      }), env);
+      expect(response.status).toBe(403);
+      const payload = await response.json();
+      expect(payload.code).toBe('shared_partner_linking_disabled');
+      expect(payload.retryable).toBe(false);
+    }
+  });
+
+  it.skip('creates account links with non-chat scopes and watch later support', async () => {
     const registerTarget = await worker.fetch(new Request(`https://data-api.watchbilm.org/links?userId=${OTHER_USER_ID}`, {
       headers: { authorization: 'Bearer other-token' }
     }), env);
@@ -1985,7 +2050,7 @@ describe('data api', () => {
     expect(body.link.me.shareScopes.secretChat).toBeUndefined();
   });
 
-  it('surfaces pending requests for equivalent gmail aliases', async () => {
+  it.skip('surfaces pending requests for equivalent gmail aliases', async () => {
     const registerTarget = await worker.fetch(new Request(`https://data-api.watchbilm.org/links?userId=${GMAIL_USER_ID}`, {
       headers: { authorization: 'Bearer gmail-token' }
     }), env);
@@ -2018,7 +2083,7 @@ describe('data api', () => {
     expect(payload.incomingRequests[0].canApprove).toBe(true);
   });
 
-  it('rejects self links and blocks a second pending link', async () => {
+  it.skip('rejects self links and blocks a second pending link', async () => {
     const selfLink = await worker.fetch(new Request('https://data-api.watchbilm.org/links/request', {
       method: 'POST',
       headers: {
@@ -2069,7 +2134,7 @@ describe('data api', () => {
     expect((await second.json()).code).toBe('requester_link_conflict');
   });
 
-  it('allows account-link requests when target email is not yet indexed in capabilities', async () => {
+  it.skip('allows account-link requests when target email is not yet indexed in capabilities', async () => {
     const response = await worker.fetch(new Request('https://data-api.watchbilm.org/links/request', {
       method: 'POST',
       headers: {
@@ -2091,7 +2156,7 @@ describe('data api', () => {
     expect(body.link.partner.email).toBe('missing-user@example.com');
   });
 
-  it('indexes capability from authenticated snapshot writes for account-link lookup', async () => {
+  it.skip('indexes capability from authenticated snapshot writes for account-link lookup', async () => {
     const saveResponse = await worker.fetch(new Request('https://data-api.watchbilm.org/', {
       method: 'POST',
       headers: {
@@ -2119,7 +2184,7 @@ describe('data api', () => {
     expect(payload.canRequest).toBe(true);
   });
 
-  it('approves links and shared-feed returns approved non-chat sectors with a signature', async () => {
+  it.skip('approves links and shared-feed returns approved non-chat sectors with a signature', async () => {
     const registerTarget = await worker.fetch(new Request(`https://data-api.watchbilm.org/links?userId=${OTHER_USER_ID}`, {
       headers: { authorization: 'Bearer other-token' }
     }), env);
@@ -2221,7 +2286,7 @@ describe('data api', () => {
     expect(feed.operations.some((operation) => operation.sectorKey === 'chat_messages')).toBe(false);
   });
 
-  it('reads linked shared-feed from Supabase canonical primary before D1 backup', async () => {
+  it.skip('reads linked shared-feed from Supabase canonical primary before D1 backup', async () => {
     enableSupabasePrimary(env);
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init = {}) => {
       const requestUrl = String(input || '');
@@ -2303,7 +2368,7 @@ describe('data api', () => {
     expect(fetchSpy.mock.calls.some(([url]) => String(url).includes('/rest/v1/bilm_user_data'))).toBe(true);
   });
 
-  it('paginates shared-feed safely when many records share the same timestamp', async () => {
+  it.skip('paginates shared-feed safely when many records share the same timestamp', async () => {
     const registerTarget = await worker.fetch(new Request(`https://data-api.watchbilm.org/links?userId=${OTHER_USER_ID}`, {
       headers: { authorization: 'Bearer other-token' }
     }), env);
@@ -2415,7 +2480,7 @@ describe('data api', () => {
     expect(new Set(receivedItemKeys).size).toBe(130);
   });
 
-  it('returns target capability availability for known and unknown accounts', async () => {
+  it.skip('returns target capability availability for known and unknown accounts', async () => {
     const registerTarget = await worker.fetch(new Request(`https://data-api.watchbilm.org/links?userId=${OTHER_USER_ID}`, {
       headers: { authorization: 'Bearer other-token' }
     }), env);
@@ -2441,7 +2506,7 @@ describe('data api', () => {
     expect(missingBody.canRequest).toBe(true);
   });
 
-  it('rate limits account-link endpoints per user', async () => {
+  it.skip('rate limits account-link endpoints per user', async () => {
     env.ACCOUNT_LINK_RATE_LIMIT_READ = '1';
     env.ACCOUNT_LINK_RATE_LIMIT_READ_WINDOW_MS = '60000';
 
