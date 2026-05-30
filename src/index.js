@@ -427,13 +427,15 @@ const SECTOR_SYNC_KEYS = new Set([
   'settings_profile',
   'playback_notes',
   'tv_progress',
-  'ui_prefs'
+  'ui_prefs',
+  'my_lists'
 ]);
 const CHAT_SECTOR_KEY = 'chat_messages';
 const SETTINGS_PROFILE_SECTOR_KEY = 'settings_profile';
 const PLAYBACK_NOTES_SECTOR_KEY = 'playback_notes';
 const TV_PROGRESS_SECTOR_KEY = 'tv_progress';
 const UI_PREFS_SECTOR_KEY = 'ui_prefs';
+const MY_LISTS_SECTOR_KEY = 'my_lists';
 const SYNC_FUTURE_TIME_WINDOW_MS = 10 * 60 * 1000;
 const TOMBSTONE_RETENTION_DAYS = 30;
 const SUPABASE_CANONICAL_DELETED_RETENTION_DAYS = 7;
@@ -4595,6 +4597,7 @@ function validateGenericSectorPayload(payload, {
   if (sectorKey === PLAYBACK_NOTES_SECTOR_KEY) maxLength = 24000;
   if (sectorKey === TV_PROGRESS_SECTOR_KEY) maxLength = 8000;
   if (sectorKey === UI_PREFS_SECTOR_KEY) maxLength = 6000;
+  if (sectorKey === MY_LISTS_SECTOR_KEY) maxLength = 48000;
   if (length > maxLength) {
     throw errorResponse(413, {
       error: 'payload_too_large',

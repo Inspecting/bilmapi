@@ -1881,7 +1881,7 @@ describe('data api', () => {
     expect(body.requestId).toBeTruthy();
   });
 
-  it('accepts settings/profile and progress sector operations', async () => {
+  it('accepts settings/profile, progress, and custom list sector operations', async () => {
     const response = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
       method: 'POST',
       headers: {
@@ -1910,6 +1910,16 @@ describe('data api', () => {
               storageKey: 'bilm-playback-note',
               value: '{"movie:42":"01:20"}'
             }
+          },
+          {
+            sectorKey: 'my_lists',
+            itemKey: 'custom_lists',
+            updatedAtMs: 1725100000200,
+            deleted: false,
+            payload: {
+              storageKey: 'bilm-custom-lists-v1',
+              value: '{"schema":"bilm-custom-lists-v1","version":1,"lists":[]}'
+            }
           }
         ]
       })
@@ -1918,7 +1928,18 @@ describe('data api', () => {
     expect(response.status).toBe(200);
     const body = await response.json();
     expect(body.ok).toBe(true);
-    expect(body.processed).toBe(2);
+    expect(body.processed).toBe(3);
+
+    const pull = await worker.fetch(new Request(`https://data-api.watchbilm.org/sync/sectors/pull?userId=${USER_ID}&since=0&sectors=my_lists`, {
+      method: 'GET',
+      headers: { authorization: 'Bearer valid-token' }
+    }), env);
+
+    expect(pull.status).toBe(200);
+    const pullBody = await pull.json();
+    expect(pullBody.operations.length).toBe(1);
+    expect(pullBody.operations[0].sectorKey).toBe('my_lists');
+    expect(pullBody.operations[0].itemKey).toBe('custom_lists');
   });
 
   it('enforces generic sector payload size limits', async () => {
