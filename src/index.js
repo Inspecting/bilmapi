@@ -438,7 +438,7 @@ const UI_PREFS_SECTOR_KEY = 'ui_prefs';
 const MY_LISTS_SECTOR_KEY = 'my_lists';
 const SYNC_FUTURE_TIME_WINDOW_MS = 10 * 60 * 1000;
 const TOMBSTONE_RETENTION_DAYS = 30;
-const SUPABASE_CANONICAL_DELETED_RETENTION_DAYS = 7;
+const SUPABASE_CANONICAL_DELETED_RETENTION_DAYS = 30;
 const SUPABASE_SYNC_STATE_SCOPE = 'sync_state';
 const SUPABASE_SYNC_STATE_GROUP = 'sync';
 const SUPABASE_SYNC_STATE_KEY = 'state';
@@ -6701,29 +6701,60 @@ async function handleSectorSyncBootstrap({ request, env, corsOrigin, verifyIdTok
     const db = getD1Database(env);
     currentState = await readUserSyncState({ db, userId });
   }
+  const operations = Array.isArray(body?.operations) ? body.operations : [];
   if (currentState.migratedAtMs) {
-    const responsePayload = {
-      ok: true,
-      skipped: true,
-      processed: 0,
-      cursorMs: currentState.migratedAtMs,
-      state: currentState
-    };
-    queueSupabaseMirrorWrite({
-      executionContext,
-      env,
-      path: '/sync/sectors/bootstrap',
-      method: request.method,
-      userId,
-      requestId,
-      requestBody: body,
-      responseBody: responsePayload,
-      status: 200
-    });
-    return jsonResponse(200, responsePayload, corsOrigin, { 'x-request-id': requestId });
+    let allowEmptyMigrationRepair = false;
+    if (operations.length > 0) {
+      if (supabasePrimaryActive) {
+        const existingRowsResult = await selectSupabaseCanonicalRows({
+          config: canonicalConfig,
+          table: canonicalConfig.userDataTable,
+          select: 'data_key',
+          searchParams: {
+            user_id: `eq.${userId}`,
+            data_scope: 'eq.sector',
+            deleted_at_ms: 'is.null'
+          },
+          order: 'updated_at_ms.desc',
+          limit: 1,
+          requestId
+        });
+        allowEmptyMigrationRepair = existingRowsResult.ok && existingRowsResult.rows.length === 0;
+      } else {
+        const existingRows = await readSectorSyncRowsFromD1Backup({
+          env,
+          userId,
+          sinceMs: 0,
+          limit: 1,
+          sectors: [],
+          cursor: null
+        });
+        allowEmptyMigrationRepair = Array.isArray(existingRows) && existingRows.length === 0;
+      }
+    }
+    if (!allowEmptyMigrationRepair) {
+      const responsePayload = {
+        ok: true,
+        skipped: true,
+        processed: 0,
+        cursorMs: currentState.migratedAtMs,
+        state: currentState
+      };
+      queueSupabaseMirrorWrite({
+        executionContext,
+        env,
+        path: '/sync/sectors/bootstrap',
+        method: request.method,
+        userId,
+        requestId,
+        requestBody: body,
+        responseBody: responsePayload,
+        status: 200
+      });
+      return jsonResponse(200, responsePayload, corsOrigin, { 'x-request-id': requestId });
+    }
   }
 
-  const operations = Array.isArray(body?.operations) ? body.operations : [];
   if (operations.length > 1000) {
     return errorResponse(400, {
       error: 'too_many_operations',

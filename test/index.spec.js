@@ -1851,6 +1851,62 @@ describe('data api', () => {
     expect(secondBody.state.migrationSource).toBe('firebase_snapshot');
   });
 
+  it('repairs an empty migrated sector bootstrap with later non-empty data', async () => {
+    const emptyBootstrap = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/bootstrap', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        migrationSource: 'empty_first_run',
+        operations: []
+      })
+    }), env);
+
+    expect(emptyBootstrap.status).toBe(200);
+    const emptyBody = await emptyBootstrap.json();
+    expect(emptyBody.ok).toBe(true);
+    expect(emptyBody.skipped).toBe(false);
+    expect(emptyBody.processed).toBe(0);
+
+    const repair = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/bootstrap', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer valid-token'
+      },
+      body: JSON.stringify({
+        userId: USER_ID,
+        migrationSource: 'repair_seed',
+        operations: [
+          {
+            sectorKey: 'favorites',
+            itemKey: 'movie:repair-1',
+            updatedAtMs: 1724100000000,
+            deleted: false,
+            payload: { key: 'movie-repair-1', type: 'movie', id: 910, updatedAt: 1724100000000 }
+          }
+        ]
+      })
+    }), env);
+
+    expect(repair.status).toBe(200);
+    const repairBody = await repair.json();
+    expect(repairBody.ok).toBe(true);
+    expect(repairBody.skipped).toBe(false);
+    expect(repairBody.processed).toBe(1);
+
+    const pull = await worker.fetch(new Request(`https://data-api.watchbilm.org/sync/sectors/pull?userId=${USER_ID}&since=0&sectors=favorites`, {
+      method: 'GET',
+      headers: { authorization: 'Bearer valid-token' }
+    }), env);
+    expect(pull.status).toBe(200);
+    const pullBody = await pull.json();
+    expect(pullBody.operations.some((operation) => operation.itemKey === 'movie:repair-1')).toBe(true);
+  });
+
   it('returns chat-specific validation errors with retry metadata', async () => {
     const payload = 'x'.repeat(2105);
     const response = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
