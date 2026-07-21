@@ -2316,4 +2316,89 @@ describe('data api', () => {
     }), env);
     expect(bulkWrong.status).toBe(403);
   });
+
+  it('creates, joins, synchronizes, and transfers a watch party host', async () => {
+    const createResponse = await worker.fetch(new Request('https://data-api.watchbilm.org/watch-parties', {
+      method: 'POST',
+      headers: { origin: ALLOWED_ORIGIN, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Host',
+        maxParticipants: 2,
+        media: { type: 'movie', id: '447365', season: 0, episode: 0, path: '/movies/watch/viewer.html?id=447365' }
+      })
+    }), env);
+    expect(createResponse.status).toBe(201);
+    expect(createResponse.headers.get('access-control-allow-origin')).toBe(ALLOWED_ORIGIN);
+    const created = await createResponse.json();
+    expect(created.party.code).toMatch(/^[A-Z0-9]{6}$/);
+    expect(created.party.availableSlots).toBe(1);
+
+    const joinResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/watch-parties/${created.party.code}/join`, {
+      method: 'POST',
+      headers: { origin: ALLOWED_ORIGIN, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Guest' })
+    }), env);
+    expect(joinResponse.status).toBe(200);
+    const joined = await joinResponse.json();
+    expect(joined.party.participants).toHaveLength(2);
+
+    const stateResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/watch-parties/${created.party.code}/state`, {
+      method: 'POST',
+      headers: { origin: ALLOWED_ORIGIN, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        participantId: created.party.participantId,
+        participantToken: created.participantToken,
+        playback: { playing: true, currentTime: 120, duration: 7200, event: 'play', server: 'vidking' }
+      })
+    }), env);
+    expect(stateResponse.status).toBe(200);
+
+    const leaveResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/watch-parties/${created.party.code}/leave`, {
+      method: 'POST',
+      headers: { origin: ALLOWED_ORIGIN, 'content-type': 'application/json' },
+      body: JSON.stringify({ participantId: created.party.participantId, participantToken: created.participantToken })
+    }), env);
+    expect(leaveResponse.status).toBe(200);
+
+    const heartbeatResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/watch-parties/${created.party.code}/heartbeat`, {
+      method: 'POST',
+      headers: { origin: ALLOWED_ORIGIN, 'content-type': 'application/json' },
+      body: JSON.stringify({ participantId: joined.party.participantId, participantToken: joined.participantToken })
+    }), env);
+    expect(heartbeatResponse.status).toBe(200);
+    const heartbeat = await heartbeatResponse.json();
+    expect(heartbeat.party.hostId).toBe(joined.party.participantId);
+    expect(heartbeat.party.state.playing).toBe(true);
+    expect(heartbeat.party.state.currentTime).toBeGreaterThanOrEqual(120);
+  });
+
+  it('rejects invalid, missing, full, and non-host watch party requests', async () => {
+    const missing = await worker.fetch(new Request('https://data-api.watchbilm.org/watch-parties/ABC123/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}'
+    }), env);
+    expect(missing.status).toBe(404);
+
+    const created = await (await worker.fetch(new Request('https://data-api.watchbilm.org/watch-parties', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Host', maxParticipants: 2, media: { type: 'tv', id: '100', path: '/tv/watch/viewer.html?id=100' } })
+    }), env)).json();
+    const joined = await (await worker.fetch(new Request(`https://data-api.watchbilm.org/watch-parties/${created.party.code}/join`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'Guest' })
+    }), env)).json();
+
+    const full = await worker.fetch(new Request(`https://data-api.watchbilm.org/watch-parties/${created.party.code}/join`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'Third' })
+    }), env);
+    expect(full.status).toBe(409);
+
+    const guestControl = await worker.fetch(new Request(`https://data-api.watchbilm.org/watch-parties/${created.party.code}/state`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ participantId: joined.party.participantId, participantToken: joined.participantToken, playback: { playing: true } })
+    }), env);
+    expect(guestControl.status).toBe(403);
+  });
 });

@@ -1,4 +1,5 @@
 import { createRemoteJWKSet, jwtVerify } from 'jose';
+import { handleWatchPartyRequest } from './watch-parties.js';
 
 const DEFAULT_PROJECT_ID = 'bilm-7bfe1';
 const FIREBASE_ISSUER_BASE = 'https://securetoken.google.com';
@@ -4488,6 +4489,10 @@ export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOri
       }
 
       try {
+        if (url.pathname === '/watch-parties' || url.pathname.startsWith('/watch-parties/')) {
+          return await handleWatchPartyRequest({ request, env });
+        }
+
         if (request.method === 'GET' && (url.pathname === '/health' || url.pathname === '/healthz')) {
           return await handleHealthCheck({ env, corsOrigin });
         }
