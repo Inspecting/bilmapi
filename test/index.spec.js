@@ -83,6 +83,18 @@ class MemoryD1Statement {
   }
 
   async run() {
+    if (this.sql.startsWith('insert into watch_parties')) {
+      const [code, partyJson, expiresAtMs, updatedAtMs] = this.params;
+      this.db.watchPartyRows.set(String(code), {
+        code: String(code),
+        party_json: String(partyJson),
+        expires_at_ms: Number(expiresAtMs || 0) || 0,
+        updated_at_ms: Number(updatedAtMs || 0) || 0
+      });
+      this.db.watchPartyWrites += 1;
+      return { success: true, meta: { changes: 1 } };
+    }
+
     if (this.sql.startsWith('insert into user_snapshots')) {
       const [userId, snapshotJson, updatedAtMs, deviceId, schema, savedAt] = this.params;
       this.db.rows.set(String(userId), {
@@ -348,6 +360,12 @@ class MemoryD1Statement {
       return { success: true, meta: { changes: had ? 1 : 0 } };
     }
 
+    if (this.sql.startsWith('delete from watch_parties')) {
+      const had = this.db.watchPartyRows.delete(String(this.params[0] || ''));
+      if (had) this.db.watchPartyWrites += 1;
+      return { success: true, meta: { changes: had ? 1 : 0 } };
+    }
+
     if (this.sql.startsWith('delete from sync_items')) {
       if (this.sql.includes('where user_id = ?1')) {
         const userId = String(this.params[0] || '');
@@ -482,6 +500,11 @@ class MemoryD1Statement {
 
   async first() {
     const key = String(this.params[0] || '');
+    if (this.sql.includes('from watch_parties')) {
+      const partyRow = this.db.watchPartyRows.get(key);
+      return partyRow ? { party_json: partyRow.party_json } : null;
+    }
+
     if (this.sql.includes('from account_user_capabilities')) {
       const emails = this.params
         .map((value) => String(value || '').toLowerCase())
@@ -680,6 +703,8 @@ class MemoryD1 {
     this.mediaLocks = new Map();
     this.accountCapabilityRows = new Map();
     this.accountLinkRows = new Map();
+    this.watchPartyRows = new Map();
+    this.watchPartyWrites = 0;
   }
 
   prepare(sql) {
@@ -2447,6 +2472,41 @@ describe('data api', () => {
       body: JSON.stringify({ participantId: created.party.participantId, participantToken: created.participantToken })
     }), env);
     expect(afterLeave.status).toBe(404);
+  });
+
+  it('uses D1 and checkpoints presence instead of writing on every heartbeat', async () => {
+    const baseTime = 1_800_000_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(baseTime);
+    env.WATCH_PARTY_PRESENCE_WRITE_MS = '60000';
+    kv.get = vi.fn(async () => { throw new Error('Watch parties must not read KV.'); });
+    kv.put = vi.fn(async () => { throw new Error('Watch parties must not write KV.'); });
+
+    const created = await (await worker.fetch(new Request('https://data-api.watchbilm.org/watch-parties', {
+      method: 'POST',
+      headers: { origin: ALLOWED_ORIGIN, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'D1 Host', maxParticipants: 5, media: { type: 'movie', id: '447365', path: '/movies/watch/viewer.html?id=447365' } })
+    }), env)).json();
+    expect(d1.watchPartyWrites).toBe(1);
+
+    for (let elapsed = 5000; elapsed <= 55000; elapsed += 5000) {
+      nowSpy.mockReturnValue(baseTime + elapsed);
+      const heartbeat = await worker.fetch(new Request(`https://data-api.watchbilm.org/watch-parties/${created.party.code}/heartbeat`, {
+        method: 'POST',
+        headers: { origin: ALLOWED_ORIGIN, 'content-type': 'application/json' },
+        body: JSON.stringify({ participantId: created.party.participantId, participantToken: created.participantToken })
+      }), env);
+      expect(heartbeat.status).toBe(200);
+    }
+    expect(d1.watchPartyWrites).toBe(1);
+
+    nowSpy.mockReturnValue(baseTime + 60000);
+    const checkpoint = await worker.fetch(new Request(`https://data-api.watchbilm.org/watch-parties/${created.party.code}/heartbeat`, {
+      method: 'POST',
+      headers: { origin: ALLOWED_ORIGIN, 'content-type': 'application/json' },
+      body: JSON.stringify({ participantId: created.party.participantId, participantToken: created.participantToken })
+    }), env);
+    expect(checkpoint.status).toBe(200);
+    expect(d1.watchPartyWrites).toBe(2);
   });
 
   it('rejects invalid, missing, full, and non-host watch party requests', async () => {
