@@ -2323,7 +2323,7 @@ describe('data api', () => {
       headers: { origin: ALLOWED_ORIGIN, 'content-type': 'application/json' },
       body: JSON.stringify({
         name: 'Host',
-        maxParticipants: 2,
+        maxParticipants: 5,
         media: { type: 'movie', id: '447365', season: 0, episode: 0, path: '/movies/watch/viewer.html?id=447365' }
       })
     }), env);
@@ -2331,7 +2331,8 @@ describe('data api', () => {
     expect(createResponse.headers.get('access-control-allow-origin')).toBe(ALLOWED_ORIGIN);
     const created = await createResponse.json();
     expect(created.party.code).toMatch(/^[A-Z0-9]{6}$/);
-    expect(created.party.availableSlots).toBe(1);
+    expect(created.party.maxParticipants).toBe(5);
+    expect(created.party.availableSlots).toBe(4);
 
     const joinResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/watch-parties/${created.party.code}/join`, {
       method: 'POST',
@@ -2342,13 +2343,49 @@ describe('data api', () => {
     const joined = await joinResponse.json();
     expect(joined.party.participants).toHaveLength(2);
 
+    const guestDeniedResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/watch-parties/${created.party.code}/state`, {
+      method: 'POST',
+      headers: { origin: ALLOWED_ORIGIN, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        participantId: joined.party.participantId,
+        participantToken: joined.participantToken,
+        playback: { playing: false, currentTime: 60, event: 'pause', server: 'vidfast' }
+      })
+    }), env);
+    expect(guestDeniedResponse.status).toBe(403);
+
+    const permissionResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/watch-parties/${created.party.code}/permissions`, {
+      method: 'POST',
+      headers: { origin: ALLOWED_ORIGIN, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        participantId: created.party.participantId,
+        participantToken: created.participantToken,
+        targetParticipantId: joined.party.participantId,
+        canControl: true
+      })
+    }), env);
+    expect(permissionResponse.status).toBe(200);
+    const permissionPayload = await permissionResponse.json();
+    expect(permissionPayload.party.participants.find((participant) => participant.id === joined.party.participantId)?.canControl).toBe(true);
+
+    const guestStateResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/watch-parties/${created.party.code}/state`, {
+      method: 'POST',
+      headers: { origin: ALLOWED_ORIGIN, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        participantId: joined.party.participantId,
+        participantToken: joined.participantToken,
+        playback: { playing: false, currentTime: 60, event: 'pause', server: 'vidfast' }
+      })
+    }), env);
+    expect(guestStateResponse.status).toBe(200);
+
     const stateResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/watch-parties/${created.party.code}/state`, {
       method: 'POST',
       headers: { origin: ALLOWED_ORIGIN, 'content-type': 'application/json' },
       body: JSON.stringify({
         participantId: created.party.participantId,
         participantToken: created.participantToken,
-        playback: { playing: true, currentTime: 120, duration: 7200, event: 'play', server: 'vidking' }
+        playback: { playing: true, currentTime: 120, duration: 7200, event: 'play', server: 'vidfast' }
       })
     }), env);
     expect(stateResponse.status).toBe(200);

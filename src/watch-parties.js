@@ -9,7 +9,7 @@ function numberSetting(value, fallback, min, max) {
 
 function config(env) {
   return {
-    maxSize: numberSetting(env?.WATCH_PARTY_MAX_SIZE, 3, 2, 50),
+    maxSize: numberSetting(env?.WATCH_PARTY_MAX_SIZE, 5, 2, 50),
     ttlMs: numberSetting(env?.WATCH_PARTY_TTL_MS, 21_600_000, 60_000, 604_800_000),
     graceMs: numberSetting(env?.WATCH_PARTY_RECONNECT_GRACE_MS, 45_000, 10_000, 600_000)
   };
@@ -110,7 +110,9 @@ async function load(kv, code) {
       await kv.delete(keyFor(code));
       return null;
     }
-    party.participants = Array.isArray(party.participants) ? party.participants : [];
+    party.participants = Array.isArray(party.participants)
+      ? party.participants.map((person) => ({ ...person, canControl: Boolean(person?.canControl) }))
+      : [];
     return party;
   } catch {
     await kv.delete(keyFor(code));
@@ -142,6 +144,7 @@ function publicParty(party, participantId, graceMs) {
   const now = Date.now();
   const playback = { ...party.playback };
   if (playback.playing) playback.currentTime = Math.max(0, Number(playback.currentTime || 0) + (now - Number(playback.updatedAt || now)) / 1000);
+  const currentParticipant = party.participants.find((person) => person.id === participantId);
   return {
     code: party.code,
     media: party.media,
@@ -152,9 +155,11 @@ function publicParty(party, participantId, graceMs) {
       id: person.id,
       name: person.name,
       isHost: person.id === party.hostId,
+      canControl: person.id === party.hostId || Boolean(person.canControl),
       isConnected: now - Number(person.lastSeen || 0) < Math.min(10_000, graceMs)
     })),
     hostId: party.hostId,
+    canControl: participantId === party.hostId || Boolean(currentParticipant?.canControl),
     state: playback,
     createdAt: party.createdAt,
     expiresAt: party.expiresAt
@@ -177,8 +182,8 @@ async function create({ request, env, kv }) {
       media,
       maxParticipants: Math.max(2, Math.min(limits.maxSize, Math.floor(Number(body.maxParticipants) || limits.maxSize))),
       hostId: participantId,
-      participants: [{ id: participantId, token: participantToken, name: cleanName(body.name || 'Host'), joinedAt: now, lastSeen: now }],
-      playback: { playing: false, currentTime: Math.max(0, Number(body.currentTime) || 0), duration: 0, event: 'created', server: String(body.server || '').slice(0, 32), revision: 1, updatedAt: now },
+      participants: [{ id: participantId, token: participantToken, name: cleanName(body.name || 'Host'), canControl: true, joinedAt: now, lastSeen: now }],
+      playback: { playing: false, currentTime: Math.max(0, Number(body.currentTime) || 0), duration: 0, event: 'created', server: String(body.server || '').slice(0, 32), revision: 1, updatedBy: participantId, updatedAt: now },
       createdAt: now,
       expiresAt: now + limits.ttlMs
     };
@@ -210,7 +215,7 @@ async function mutate({ request, env, kv, code, action }) {
     const participantId = token(12);
     const participantToken = token(24);
     const now = Date.now();
-    party.participants.push({ id: participantId, token: participantToken, name: cleanName(body.name), joinedAt: now, lastSeen: now });
+    party.participants.push({ id: participantId, token: participantToken, name: cleanName(body.name), canControl: false, joinedAt: now, lastSeen: now });
     await save(kv, party);
     return response(200, { party: publicParty(party, participantId, limits.graceMs), participantToken }, request);
   }
@@ -236,8 +241,16 @@ async function mutate({ request, env, kv, code, action }) {
     await save(kv, party);
     return response(200, { ok: true }, request);
   }
+  if (action === 'permissions') {
+    if (party.hostId !== participant.id) return response(403, { error: 'Only the host can change playback permissions.' }, request);
+    const target = party.participants.find((person) => person.id === String(body.targetParticipantId || ''));
+    if (!target || target.id === party.hostId) return response(400, { error: 'Choose a current guest participant.' }, request);
+    target.canControl = Boolean(body.canControl);
+    await save(kv, party);
+    return response(200, { party: publicParty(party, participant.id, limits.graceMs) }, request);
+  }
   if (action === 'state') {
-    if (party.hostId !== participant.id) return response(403, { error: 'Only the host can control party playback.' }, request);
+    if (party.hostId !== participant.id && !participant.canControl) return response(403, { error: 'The host has not enabled playback control for you.' }, request);
     const playback = body.playback && typeof body.playback === 'object' ? body.playback : {};
     party.playback = {
       playing: Boolean(playback.playing),
@@ -246,6 +259,7 @@ async function mutate({ request, env, kv, code, action }) {
       event: String(playback.event || 'timeupdate').slice(0, 24),
       server: String(playback.server || '').slice(0, 32),
       revision: Number(party.playback?.revision || 0) + 1,
+      updatedBy: participant.id,
       updatedAt: Date.now()
     };
     await save(kv, party);
@@ -263,7 +277,7 @@ export async function handleWatchPartyRequest({ request, env }) {
   }
   try {
     if (request.method === 'POST' && url.pathname === '/watch-parties') return await create({ request, env, kv });
-    const match = url.pathname.match(/^\/watch-parties\/([A-Za-z0-9]{4,12})\/(join|state|heartbeat|leave)$/);
+    const match = url.pathname.match(/^\/watch-parties\/([A-Za-z0-9]{4,12})\/(join|state|permissions|heartbeat|leave)$/);
     if (request.method === 'POST' && match) return await mutate({ request, env, kv, code: cleanCode(match[1]), action: match[2] });
     return response(405, { error: 'Method not allowed.' }, request, { allow: 'POST, OPTIONS' });
   } catch (error) {
