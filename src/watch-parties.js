@@ -11,7 +11,7 @@ function config(env) {
   return {
     maxSize: numberSetting(env?.WATCH_PARTY_MAX_SIZE, 5, 2, 50),
     ttlMs: numberSetting(env?.WATCH_PARTY_TTL_MS, 21_600_000, 60_000, 604_800_000),
-    graceMs: numberSetting(env?.WATCH_PARTY_RECONNECT_GRACE_MS, 45_000, 10_000, 600_000)
+    graceMs: numberSetting(env?.WATCH_PARTY_RECONNECT_GRACE_MS, 1_800_000, 60_000, 21_600_000)
   };
 }
 
@@ -120,7 +120,11 @@ async function load(kv, code) {
   }
 }
 
-async function save(kv, party) {
+async function save(kv, party, ttlMs = 0) {
+  if (Number(ttlMs) > 0) {
+    party.updatedAt = Date.now();
+    party.expiresAt = party.updatedAt + Number(ttlMs);
+  }
   const seconds = Math.max(60, Math.ceil((Number(party.expiresAt || 0) - Date.now()) / 1000));
   await kv.put(keyFor(party.code), JSON.stringify(party), { expirationTtl: seconds });
 }
@@ -156,7 +160,7 @@ function publicParty(party, participantId, graceMs) {
       name: person.name,
       isHost: person.id === party.hostId,
       canControl: person.id === party.hostId || Boolean(person.canControl),
-      isConnected: now - Number(person.lastSeen || 0) < Math.min(10_000, graceMs)
+      isConnected: now - Number(person.lastSeen || 0) < Math.min(20_000, graceMs)
     })),
     hostId: party.hostId,
     canControl: participantId === party.hostId || Boolean(currentParticipant?.canControl),
@@ -187,7 +191,7 @@ async function create({ request, env, kv }) {
       createdAt: now,
       expiresAt: now + limits.ttlMs
     };
-    await save(kv, party);
+    await save(kv, party, limits.ttlMs);
     return response(201, { party: publicParty(party, participantId, limits.graceMs), participantToken, testingLimit: limits.maxSize }, request);
   }
   return response(503, { error: 'Unable to allocate a party code. Please try again.' }, request);
@@ -197,10 +201,6 @@ async function mutate({ request, env, kv, code, action }) {
   const limits = config(env);
   const party = await load(kv, code);
   if (!party) return response(404, { error: 'Party not found or expired.' }, request);
-  if (!prune(party, limits.graceMs)) {
-    await kv.delete(keyFor(code));
-    return response(404, { error: 'Party not found or expired.' }, request);
-  }
   const body = await bodyJson(request);
 
   if (action === 'join') {
@@ -208,24 +208,30 @@ async function mutate({ request, env, kv, code, action }) {
     if (returning) {
       returning.name = cleanName(body.name || returning.name);
       returning.lastSeen = Date.now();
-      await save(kv, party);
+      prune(party, limits.graceMs);
+      await save(kv, party, limits.ttlMs);
       return response(200, { party: publicParty(party, returning.id, limits.graceMs), participantToken: returning.token, reconnected: true }, request);
+    }
+    if (!prune(party, limits.graceMs)) {
+      await kv.delete(keyFor(code));
+      return response(404, { error: 'Party not found or expired.' }, request);
     }
     if (party.participants.length >= party.maxParticipants) return response(409, { error: 'This party is full.' }, request);
     const participantId = token(12);
     const participantToken = token(24);
     const now = Date.now();
     party.participants.push({ id: participantId, token: participantToken, name: cleanName(body.name), canControl: false, joinedAt: now, lastSeen: now });
-    await save(kv, party);
+    await save(kv, party, limits.ttlMs);
     return response(200, { party: publicParty(party, participantId, limits.graceMs), participantToken }, request);
   }
 
   const participant = participantFor(party, body.participantId, body.participantToken);
   if (!participant) return response(401, { error: 'Invalid party participant credentials.' }, request);
   participant.lastSeen = Date.now();
+  prune(party, limits.graceMs);
 
   if (action === 'heartbeat') {
-    await save(kv, party);
+    await save(kv, party, limits.ttlMs);
     return response(200, { party: publicParty(party, participant.id, limits.graceMs) }, request);
   }
   if (action === 'leave') {
@@ -238,7 +244,7 @@ async function mutate({ request, env, kv, code, action }) {
       party.participants.sort((a, b) => Number(a.joinedAt || 0) - Number(b.joinedAt || 0));
       party.hostId = party.participants[0].id;
     }
-    await save(kv, party);
+    await save(kv, party, limits.ttlMs);
     return response(200, { ok: true }, request);
   }
   if (action === 'permissions') {
@@ -246,7 +252,7 @@ async function mutate({ request, env, kv, code, action }) {
     const target = party.participants.find((person) => person.id === String(body.targetParticipantId || ''));
     if (!target || target.id === party.hostId) return response(400, { error: 'Choose a current guest participant.' }, request);
     target.canControl = Boolean(body.canControl);
-    await save(kv, party);
+    await save(kv, party, limits.ttlMs);
     return response(200, { party: publicParty(party, participant.id, limits.graceMs) }, request);
   }
   if (action === 'state') {
@@ -262,7 +268,7 @@ async function mutate({ request, env, kv, code, action }) {
       updatedBy: participant.id,
       updatedAt: Date.now()
     };
-    await save(kv, party);
+    await save(kv, party, limits.ttlMs);
     return response(200, { ok: true, state: party.playback }, request);
   }
   return response(404, { error: 'Unknown party action.' }, request);

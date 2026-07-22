@@ -2409,6 +2409,46 @@ describe('data api', () => {
     expect(heartbeat.party.state.currentTime).toBeGreaterThanOrEqual(120);
   });
 
+  it('revives an authenticated party member after background timer suspension and refreshes party expiry', async () => {
+    const baseTime = 1_800_000_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(baseTime);
+    env.WATCH_PARTY_RECONNECT_GRACE_MS = '60000';
+    env.WATCH_PARTY_TTL_MS = '21600000';
+
+    const created = await (await worker.fetch(new Request('https://data-api.watchbilm.org/watch-parties', {
+      method: 'POST',
+      headers: { origin: ALLOWED_ORIGIN, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Background Host', maxParticipants: 5, media: { type: 'movie', id: '447365', path: '/movies/watch/viewer.html?id=447365' } })
+    }), env)).json();
+
+    nowSpy.mockReturnValue(baseTime + 120000);
+    const resumedResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/watch-parties/${created.party.code}/heartbeat`, {
+      method: 'POST',
+      headers: { origin: ALLOWED_ORIGIN, 'content-type': 'application/json' },
+      body: JSON.stringify({ participantId: created.party.participantId, participantToken: created.participantToken })
+    }), env);
+
+    expect(resumedResponse.status).toBe(200);
+    const resumed = await resumedResponse.json();
+    expect(resumed.party.participants).toHaveLength(1);
+    expect(resumed.party.participants[0].isConnected).toBe(true);
+    expect(resumed.party.expiresAt).toBe(baseTime + 120000 + 21600000);
+
+    const leaveResponse = await worker.fetch(new Request(`https://data-api.watchbilm.org/watch-parties/${created.party.code}/leave`, {
+      method: 'POST',
+      headers: { origin: ALLOWED_ORIGIN, 'content-type': 'application/json' },
+      body: JSON.stringify({ participantId: created.party.participantId, participantToken: created.participantToken })
+    }), env);
+    expect(leaveResponse.status).toBe(200);
+
+    const afterLeave = await worker.fetch(new Request(`https://data-api.watchbilm.org/watch-parties/${created.party.code}/heartbeat`, {
+      method: 'POST',
+      headers: { origin: ALLOWED_ORIGIN, 'content-type': 'application/json' },
+      body: JSON.stringify({ participantId: created.party.participantId, participantToken: created.participantToken })
+    }), env);
+    expect(afterLeave.status).toBe(404);
+  });
+
   it('rejects invalid, missing, full, and non-host watch party requests', async () => {
     const missing = await worker.fetch(new Request('https://data-api.watchbilm.org/watch-parties/ABC123/heartbeat', {
       method: 'POST',
