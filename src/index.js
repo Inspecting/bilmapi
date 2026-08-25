@@ -503,6 +503,9 @@ const DEFAULT_ALLOWED_ORIGINS = new Set([
   'https://data-api.reidmhit.workers.dev',
   'https://bilm-backend.reidmhit.workers.dev'
 ]);
+const STOCK_SYMBOL_RE = /^[A-Z][A-Z0-9.-]{0,9}$/;
+const STOCK_MARKET_CACHE = new Map();
+const STOCK_MARKET_CACHE_TTL_MS = 15000;
 const MAX_SNAPSHOT_BYTES = 1500000;
 const ACCOUNT_LINK_STATUS_PENDING = 'pending';
 const ACCOUNT_LINK_STATUS_ACTIVE = 'active';
@@ -4469,6 +4472,101 @@ async function handleHealthCheck({ env, corsOrigin }) {
   return jsonResponse(200, buildHealthPayload(env), corsOrigin);
 }
 
+function normalizeStockSymbols(value) {
+  return [...new Set(String(value || '')
+    .toUpperCase()
+    .split(',')
+    .map((symbol) => symbol.trim())
+    .filter((symbol) => STOCK_SYMBOL_RE.test(symbol)))]
+    .slice(0, 8);
+}
+
+function stockNumberOrNull(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function normalizeStockChart(symbol, payload) {
+  const result = payload?.chart?.result?.[0];
+  if (!result) throw new Error(`No market data returned for ${symbol}`);
+  const meta = result.meta || {};
+  const timestamps = Array.isArray(result.timestamp) ? result.timestamp : [];
+  const source = result.indicators?.quote?.[0] || {};
+  const candles = timestamps.map((timestamp, index) => ({
+    timestamp: new Date(Number(timestamp) * 1000).toISOString(),
+    open: stockNumberOrNull(source.open?.[index]),
+    high: stockNumberOrNull(source.high?.[index]),
+    low: stockNumberOrNull(source.low?.[index]),
+    close: stockNumberOrNull(source.close?.[index]),
+    volume: stockNumberOrNull(source.volume?.[index])
+  })).filter((candle) => candle.close != null && candle.close > 0);
+  const price = stockNumberOrNull(meta.regularMarketPrice) ?? candles.at(-1)?.close ?? null;
+  const previousClose = stockNumberOrNull(meta.chartPreviousClose) ?? stockNumberOrNull(meta.previousClose) ?? price;
+  const estimatedSpread = price == null ? null : Math.max(0.01, price * 0.00015);
+  return {
+    quote: {
+      symbol,
+      price,
+      previousClose,
+      change: price != null && previousClose != null ? price - previousClose : null,
+      changePercent: price != null && previousClose ? ((price - previousClose) / previousClose) * 100 : null,
+      bid: price == null ? null : price - estimatedSpread / 2,
+      ask: price == null ? null : price + estimatedSpread / 2,
+      bidSize: null,
+      askSize: null,
+      volume: candles.at(-1)?.volume ?? null,
+      timestamp: meta.regularMarketTime ? new Date(Number(meta.regularMarketTime) * 1000).toISOString() : new Date().toISOString(),
+      exchange: meta.fullExchangeName || meta.exchangeName || 'US equities',
+      quoteType: 'estimated-spread',
+      marketState: meta.marketState || 'unknown'
+    },
+    candles
+  };
+}
+
+async function handleStockMarketRequest({ request, corsOrigin }) {
+  const url = new URL(request.url);
+  const symbols = normalizeStockSymbols(url.searchParams.get('symbols') || 'AAPL,MSFT,NVDA,TSLA');
+  if (!symbols.length) {
+    return jsonResponse(400, { error: 'invalid_symbols', message: 'At least one valid stock symbol is required.' }, corsOrigin);
+  }
+  const cacheKey = symbols.join(',');
+  const cached = STOCK_MARKET_CACHE.get(cacheKey);
+  if (cached && Date.now() - cached.savedAt < STOCK_MARKET_CACHE_TTL_MS) {
+    return jsonResponse(200, cached.payload, corsOrigin, { 'cache-control': 'public, max-age=10' });
+  }
+  try {
+    const rows = await Promise.all(symbols.map(async (symbol) => {
+      const upstreamUrl = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`);
+      upstreamUrl.searchParams.set('range', '5d');
+      upstreamUrl.searchParams.set('interval', '5m');
+      upstreamUrl.searchParams.set('includePrePost', 'false');
+      const response = await fetch(upstreamUrl, {
+        headers: { 'user-agent': 'Bilm-Simulated-Trading/1.0' }
+      });
+      if (!response.ok) throw new Error(`Market provider returned ${response.status}`);
+      return normalizeStockChart(symbol, await response.json());
+    }));
+    const payload = {
+      provider: 'Yahoo Finance chart',
+      feed: 'REFERENCE',
+      isRealTime: false,
+      generatedAt: new Date().toISOString(),
+      quotes: rows.map((row) => row.quote),
+      candles: rows[0]?.candles || []
+    };
+    STOCK_MARKET_CACHE.set(cacheKey, { savedAt: Date.now(), payload });
+    if (STOCK_MARKET_CACHE.size > 100) STOCK_MARKET_CACHE.delete(STOCK_MARKET_CACHE.keys().next().value);
+    return jsonResponse(200, payload, corsOrigin, { 'cache-control': 'public, max-age=10' });
+  } catch (error) {
+    return jsonResponse(503, {
+      error: 'market_data_unavailable',
+      message: 'Market data is temporarily unavailable.',
+      detail: String(error?.message || '')
+    }, corsOrigin);
+  }
+}
+
 export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOrigins = DEFAULT_ALLOWED_ORIGINS } = {}) {
   return {
     async fetch(request, env, ctx) {
@@ -4491,6 +4589,10 @@ export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOri
       try {
         if (url.pathname === '/watch-parties' || url.pathname.startsWith('/watch-parties/')) {
           return await handleWatchPartyRequest({ request, env });
+        }
+
+        if (request.method === 'GET' && url.pathname === '/stocks/market') {
+          return await handleStockMarketRequest({ request, corsOrigin });
         }
 
         if (request.method === 'GET' && (url.pathname === '/health' || url.pathname === '/healthz')) {

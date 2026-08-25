@@ -1083,6 +1083,37 @@ describe('data api', () => {
     expect(body.endpoints.some((entry) => entry.id === 'account_reset')).toBe(true);
   });
 
+  it('returns public stock quotes and candles with site cors', async () => {
+    const timestamps = [1787677200, 1787677500];
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      chart: {
+        result: [{
+          meta: {
+            regularMarketPrice: 231.45,
+            chartPreviousClose: 230,
+            regularMarketTime: 1787677500,
+            fullExchangeName: 'NasdaqGS',
+            marketState: 'REGULAR'
+          },
+          timestamp: timestamps,
+          indicators: { quote: [{ open: [230, 231], high: [231, 232], low: [229.5, 230.5], close: [230.8, 231.45], volume: [1000, 1400] }] }
+        }],
+        error: null
+      }
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+    const response = await worker.fetch(new Request('https://data-api.watchbilm.org/stocks/market?symbols=AAPL', {
+      headers: { origin: ALLOWED_ORIGIN }
+    }), env);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('access-control-allow-origin')).toBe(ALLOWED_ORIGIN);
+    const body = await response.json();
+    expect(body.provider).toBe('Yahoo Finance chart');
+    expect(body.quotes).toHaveLength(1);
+    expect(body.quotes[0]).toMatchObject({ symbol: 'AAPL', price: 231.45, quoteType: 'estimated-spread' });
+    expect(body.candles).toHaveLength(2);
+  });
+
   it('returns snapshot metadata from meta route (D1)', async () => {
     d1.rows.set(USER_ID, {
       user_id: USER_ID,
