@@ -4478,7 +4478,18 @@ function normalizeStockSymbols(value) {
     .split(',')
     .map((symbol) => symbol.trim())
     .filter((symbol) => STOCK_SYMBOL_RE.test(symbol)))]
-    .slice(0, 8);
+    .slice(0, 32);
+}
+
+const MARKET_INTERVALS = Object.freeze({
+  '1m': { yahoo: '1m', coinbase: 'ONE_MINUTE', seconds: 60, candles: 240, range: '1d' },
+  '5m': { yahoo: '5m', coinbase: 'FIVE_MINUTE', seconds: 300, candles: 240, range: '5d' },
+  '15m': { yahoo: '15m', coinbase: 'FIFTEEN_MINUTE', seconds: 900, candles: 240, range: '5d' }
+});
+
+function normalizeMarketInterval(value) {
+  const interval = String(value || '5m').trim().toLowerCase();
+  return MARKET_INTERVALS[interval] ? interval : '5m';
 }
 
 function stockNumberOrNull(value) {
@@ -4517,6 +4528,8 @@ function normalizeStockChart(symbol, payload) {
       volume: candles.at(-1)?.volume ?? null,
       timestamp: meta.regularMarketTime ? new Date(Number(meta.regularMarketTime) * 1000).toISOString() : new Date().toISOString(),
       exchange: meta.fullExchangeName || meta.exchangeName || 'US equities',
+      provider: 'Yahoo Finance chart',
+      feed: 'REFERENCE',
       quoteType: 'estimated-spread',
       marketState: meta.marketState || 'unknown'
     },
@@ -4524,36 +4537,148 @@ function normalizeStockChart(symbol, payload) {
   };
 }
 
+function normalizeCoinbaseCandles(payload) {
+  return (Array.isArray(payload?.candles) ? payload.candles : [])
+    .map((candle) => ({
+      timestamp: new Date(Number(candle?.start) * 1000).toISOString(),
+      open: stockNumberOrNull(candle?.open),
+      high: stockNumberOrNull(candle?.high),
+      low: stockNumberOrNull(candle?.low),
+      close: stockNumberOrNull(candle?.close),
+      volume: stockNumberOrNull(candle?.volume)
+    }))
+    .filter((candle) => candle.close != null && candle.close > 0)
+    .sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
+}
+
+async function fetchMarketJson(url, provider) {
+  let lastStatus = 0;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const response = await fetch(url, { headers: { 'user-agent': 'Bilm-Market-Data/2.0' } });
+    if (response.ok) return response.json();
+    lastStatus = response.status;
+    if (attempt === 2 || (response.status !== 429 && response.status < 500)) break;
+    const retryAfterSeconds = Number(response.headers.get('retry-after'));
+    const waitMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+      ? Math.min(2000, retryAfterSeconds * 1000)
+      : 250 * (attempt + 1);
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+  }
+  throw new Error(`${provider} returned ${lastStatus || 'an invalid response'}`);
+}
+
+async function fetchYahooMarketRow(symbol, intervalConfig) {
+  const upstreamUrl = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`);
+  upstreamUrl.searchParams.set('range', intervalConfig.range);
+  upstreamUrl.searchParams.set('interval', intervalConfig.yahoo);
+  upstreamUrl.searchParams.set('includePrePost', 'false');
+  return normalizeStockChart(symbol, await fetchMarketJson(upstreamUrl, 'Yahoo Finance'));
+}
+
+async function fetchCoinbaseMarketRow(symbol, intervalConfig) {
+  const productId = symbol.toUpperCase();
+  const productUrl = new URL(`https://api.coinbase.com/api/v3/brokerage/market/products/${encodeURIComponent(productId)}`);
+  const tickerUrl = new URL(`https://api.coinbase.com/api/v3/brokerage/market/products/${encodeURIComponent(productId)}/ticker`);
+  tickerUrl.searchParams.set('limit', '1');
+  const end = Math.floor(Date.now() / 1000);
+  const start = end - (intervalConfig.seconds * intervalConfig.candles);
+  const candlesUrl = new URL(`https://api.coinbase.com/api/v3/brokerage/market/products/${encodeURIComponent(productId)}/candles`);
+  candlesUrl.searchParams.set('start', String(start));
+  candlesUrl.searchParams.set('end', String(end));
+  candlesUrl.searchParams.set('granularity', intervalConfig.coinbase);
+  candlesUrl.searchParams.set('limit', String(intervalConfig.candles));
+  const [product, ticker, candlePayload] = await Promise.all([
+    fetchMarketJson(productUrl, 'Coinbase'),
+    fetchMarketJson(tickerUrl, 'Coinbase').catch(() => null),
+    fetchMarketJson(candlesUrl, 'Coinbase')
+  ]);
+  const candles = normalizeCoinbaseCandles(candlePayload);
+  const lastTrade = Array.isArray(ticker?.trades) ? ticker.trades[0] : null;
+  const price = stockNumberOrNull(product?.price) ?? stockNumberOrNull(lastTrade?.price) ?? candles.at(-1)?.close ?? null;
+  const changePercent = stockNumberOrNull(product?.price_percentage_change_24h);
+  const previousClose = price != null && changePercent != null && changePercent > -100
+    ? price / (1 + changePercent / 100)
+    : candles[0]?.close ?? price;
+  const bid = stockNumberOrNull(ticker?.best_bid);
+  const ask = stockNumberOrNull(ticker?.best_ask);
+  return {
+    quote: {
+      symbol,
+      price,
+      previousClose,
+      change: price != null && previousClose != null ? price - previousClose : null,
+      changePercent: price != null && previousClose ? ((price - previousClose) / previousClose) * 100 : changePercent,
+      bid,
+      ask,
+      bidSize: null,
+      askSize: null,
+      volume: stockNumberOrNull(product?.volume_24h),
+      quoteVolume: stockNumberOrNull(product?.approximate_quote_24h_volume),
+      timestamp: lastTrade?.time || new Date().toISOString(),
+      exchange: 'Coinbase',
+      provider: 'Coinbase Advanced Trade',
+      feed: 'REAL-TIME EXCHANGE',
+      quoteType: bid != null && ask != null ? 'exchange-bid-ask' : 'exchange-last-trade',
+      marketState: 'OPEN'
+    },
+    candles
+  };
+}
+
+async function settleMarketRows(symbols, intervalConfig) {
+  const results = [];
+  const concurrency = symbols.some((symbol) => symbol.endsWith('-USD')) ? 2 : 4;
+  for (let index = 0; index < symbols.length; index += concurrency) {
+    const batch = symbols.slice(index, index + concurrency);
+    const settled = await Promise.allSettled(batch.map((symbol) => (
+      symbol.endsWith('-USD')
+        ? fetchCoinbaseMarketRow(symbol, intervalConfig)
+        : fetchYahooMarketRow(symbol, intervalConfig)
+    )));
+    settled.forEach((result, offset) => {
+      const symbol = batch[offset];
+      if (result.status === 'fulfilled') results.push({ symbol, row: result.value });
+      else results.push({ symbol, error: String(result.reason?.message || 'Provider request failed') });
+    });
+  }
+  return results;
+}
+
 async function handleStockMarketRequest({ request, corsOrigin }) {
   const url = new URL(request.url);
   const symbols = normalizeStockSymbols(url.searchParams.get('symbols') || 'AAPL,MSFT,NVDA,TSLA');
+  const interval = normalizeMarketInterval(url.searchParams.get('interval'));
+  const intervalConfig = MARKET_INTERVALS[interval];
   if (!symbols.length) {
     return jsonResponse(400, { error: 'invalid_symbols', message: 'At least one valid stock symbol is required.' }, corsOrigin);
   }
-  const cacheKey = symbols.join(',');
+  const cacheKey = `${interval}:${symbols.join(',')}`;
   const cached = STOCK_MARKET_CACHE.get(cacheKey);
   if (cached && Date.now() - cached.savedAt < STOCK_MARKET_CACHE_TTL_MS) {
     return jsonResponse(200, cached.payload, corsOrigin, { 'cache-control': 'public, max-age=10' });
   }
   try {
-    const rows = await Promise.all(symbols.map(async (symbol) => {
-      const upstreamUrl = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`);
-      upstreamUrl.searchParams.set('range', '5d');
-      upstreamUrl.searchParams.set('interval', '5m');
-      upstreamUrl.searchParams.set('includePrePost', 'false');
-      const response = await fetch(upstreamUrl, {
-        headers: { 'user-agent': 'Bilm-Simulated-Trading/1.0' }
-      });
-      if (!response.ok) throw new Error(`Market provider returned ${response.status}`);
-      return normalizeStockChart(symbol, await response.json());
-    }));
+    const results = await settleMarketRows(symbols, intervalConfig);
+    const successful = results.filter((result) => result.row);
+    const failed = results.filter((result) => result.error).map(({ symbol, error }) => ({ symbol, error }));
+    if (!successful.length) throw new Error(failed.map((item) => `${item.symbol}: ${item.error}`).join('; '));
+    const providers = [...new Set(successful.map((result) => result.row.quote.provider))];
+    const feeds = [...new Set(successful.map((result) => result.row.quote.feed))];
+    const candlesBySymbol = Object.fromEntries(successful.map((result) => [result.symbol, result.row.candles]));
     const payload = {
-      provider: 'Yahoo Finance chart',
-      feed: 'REFERENCE',
-      isRealTime: false,
+      provider: providers.length === 1 ? providers[0] : 'Multiple market providers',
+      providers,
+      feed: feeds.length === 1 ? feeds[0] : 'MIXED',
+      isRealTime: feeds.length === 1 && feeds[0] === 'REAL-TIME EXCHANGE',
       generatedAt: new Date().toISOString(),
-      quotes: rows.map((row) => row.quote),
-      candles: rows[0]?.candles || []
+      interval,
+      requestedSymbols: symbols,
+      returnedSymbols: successful.map((result) => result.symbol),
+      failedSymbols: failed,
+      coverage: { requested: symbols.length, returned: successful.length, failed: failed.length },
+      quotes: successful.map((result) => result.row.quote),
+      candlesBySymbol,
+      candles: successful[0]?.row.candles || []
     };
     STOCK_MARKET_CACHE.set(cacheKey, { savedAt: Date.now(), payload });
     if (STOCK_MARKET_CACHE.size > 100) STOCK_MARKET_CACHE.delete(STOCK_MARKET_CACHE.keys().next().value);

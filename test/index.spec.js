@@ -1114,6 +1114,88 @@ describe('data api', () => {
     expect(body.candles).toHaveLength(2);
   });
 
+  it('returns per-symbol histories for a full stock universe and tolerates one provider failure', async () => {
+    const symbols = ['AAPL', 'MSFT', 'NVDA', 'TSLA', 'AMZN', 'AMD', 'GOOGL', 'META', 'NFLX', 'AVGO', 'PLTR', 'COIN'];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (request) => {
+      const url = new URL(String(request));
+      const symbol = decodeURIComponent(url.pathname.split('/').at(-1));
+      if (symbol === 'PLTR') return new Response('unavailable', { status: 503 });
+      expect(url.searchParams.get('interval')).toBe('15m');
+      const index = symbols.indexOf(symbol);
+      return new Response(JSON.stringify({
+        chart: {
+          result: [{
+            meta: {
+              regularMarketPrice: 100 + index,
+              chartPreviousClose: 99 + index,
+              regularMarketTime: 1787677500,
+              fullExchangeName: 'NasdaqGS',
+              marketState: 'REGULAR'
+            },
+            timestamp: [1787677200, 1787677500],
+            indicators: { quote: [{
+              open: [99 + index, 100 + index], high: [101 + index, 102 + index],
+              low: [98 + index, 99 + index], close: [100 + index, 100.5 + index], volume: [1000, 1400]
+            }] }
+          }],
+          error: null
+        }
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+
+    const response = await worker.fetch(new Request(`https://data-api.watchbilm.org/stocks/market?symbols=${symbols.join(',')}&interval=15m`, {
+      headers: { origin: ALLOWED_ORIGIN }
+    }), env);
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.interval).toBe('15m');
+    expect(body.requestedSymbols).toEqual(symbols);
+    expect(body.quotes).toHaveLength(11);
+    expect(Object.keys(body.candlesBySymbol)).toHaveLength(11);
+    expect(body.candlesBySymbol.META).toHaveLength(2);
+    expect(body.failedSymbols).toEqual([{ symbol: 'PLTR', error: 'Yahoo Finance returned 503' }]);
+    expect(body.coverage).toEqual({ requested: 12, returned: 11, failed: 1 });
+  });
+
+  it('uses Coinbase exchange quotes and candles for crypto symbols', async () => {
+    const upstreamUrls = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (request) => {
+      const url = new URL(String(request));
+      upstreamUrls.push(url);
+      if (url.pathname.endsWith('/ticker')) {
+        return new Response(JSON.stringify({
+          best_bid: '144.95', best_ask: '145.05',
+          trades: [{ price: '145.00', size: '2.1', time: '2026-08-28T15:00:00Z' }]
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (url.pathname.endsWith('/candles')) {
+        return new Response(JSON.stringify({ candles: [
+          { start: '1787928300', open: '144', high: '146', low: '143', close: '145', volume: '1200' },
+          { start: '1787927400', open: '143', high: '145', low: '142', close: '144', volume: '900' }
+        ] }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({
+        product_id: 'SOL-USD', price: '145.00', price_percentage_change_24h: '2.5',
+        volume_24h: '500000', approximate_quote_24h_volume: '72500000'
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+
+    const response = await worker.fetch(new Request('https://data-api.watchbilm.org/stocks/market?symbols=SOL-USD&interval=15m', {
+      headers: { origin: ALLOWED_ORIGIN }
+    }), env);
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.provider).toBe('Coinbase Advanced Trade');
+    expect(body.feed).toBe('REAL-TIME EXCHANGE');
+    expect(body.isRealTime).toBe(true);
+    expect(body.quotes[0]).toMatchObject({
+      symbol: 'SOL-USD', price: 145, bid: 144.95, ask: 145.05,
+      provider: 'Coinbase Advanced Trade', quoteType: 'exchange-bid-ask'
+    });
+    expect(body.candlesBySymbol['SOL-USD'].map((candle) => candle.close)).toEqual([144, 145]);
+    expect(upstreamUrls.find((url) => url.pathname.endsWith('/candles'))?.searchParams.get('granularity')).toBe('FIFTEEN_MINUTE');
+  });
+
   it('returns snapshot metadata from meta route (D1)', async () => {
     d1.rows.set(USER_ID, {
       user_id: USER_ID,
