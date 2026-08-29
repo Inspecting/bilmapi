@@ -1248,6 +1248,26 @@ describe('data api', () => {
     expect(upstream).not.toHaveBeenCalled();
   });
 
+  it('returns valid short Solana histories as partial data instead of a 503', async () => {
+    const rows = Array.from({ length: 22 }, (_, index) => {
+      const close = 1 + index * .01;
+      return [1787920000 + index * 300, close - .01, close + .02, close - .02, close, 10000 + index];
+    });
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ data: { attributes: { ohlcv_list: rows } } }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    }));
+
+    const response = await worker.fetch(new Request('https://data-api.watchbilm.org/stocks/solana-candles?pool=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', {
+      headers: { origin: ALLOWED_ORIGIN }
+    }), env);
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.incomplete).toBe(true);
+    expect(body.candles).toHaveLength(22);
+    expect(body.coverage).toEqual({ usableCandles: 22, minimumForSignals: 40 });
+  });
+
   it('does not multiply GeckoTerminal rate-limit failures across retries or pools', async () => {
     const upstream = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ error: 'rate limited' }), {
       status: 429,

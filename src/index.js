@@ -4823,7 +4823,7 @@ async function readSolanaCandleEdgeCache(request, pool) {
     if (!response) return null;
     const payload = await response.json();
     const savedAt = Number(response.headers.get('x-bilm-saved-at')) || Date.parse(payload?.generatedAt || '');
-    if (!Number.isFinite(savedAt) || !Array.isArray(payload?.candles) || payload.candles.length < 40) return null;
+    if (!Number.isFinite(savedAt) || !Array.isArray(payload?.candles) || payload.candles.length === 0) return null;
     return { savedAt, payload };
   } catch {
     return null;
@@ -4877,8 +4877,18 @@ async function handleSolanaCandleRequest({ request, env, corsOrigin }) {
     geckoUrl.searchParams.set('limit', '120');
     const payload = await fetchMarketJson(geckoUrl, 'GeckoTerminal', { accept: 'application/json' }, { maxAttempts: 1 });
     const candles = normalizeSolanaCandles(payload?.data?.attributes?.ohlcv_list);
-    if (candles.length < 40) throw new Error(`GeckoTerminal returned ${candles.length} usable candles`);
-    const result = { provider: 'GeckoTerminal', feed: '5-MINUTE DEX OHLCV', fallback: false, generatedAt: new Date().toISOString(), candles };
+    if (!candles.length) throw new Error('GeckoTerminal returned no usable candles');
+    const incomplete = candles.length < 40;
+    const result = {
+      provider: 'GeckoTerminal',
+      feed: '5-MINUTE DEX OHLCV',
+      fallback: false,
+      generatedAt: new Date().toISOString(),
+      candles,
+      incomplete,
+      coverage: { usableCandles: candles.length, minimumForSignals: 40 },
+      warning: incomplete ? `Only ${candles.length}/40 candles are available; trading signals remain disabled.` : ''
+    };
     SOLANA_CANDLE_CACHE.set(pool, { savedAt: Date.now(), payload: result });
     await writeSolanaCandleEdgeCache(request, pool, result);
     if (SOLANA_CANDLE_CACHE.size > 100) SOLANA_CANDLE_CACHE.delete(SOLANA_CANDLE_CACHE.keys().next().value);
@@ -4908,8 +4918,18 @@ async function handleSolanaCandleRequest({ request, env, corsOrigin }) {
         };
       }).filter((row) => row.timestamp && row.close != null && row.close > 0)
         .sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
-      if (candles.length < 40) throw new Error(`Birdeye returned ${candles.length} usable candles`);
-      const result = { provider: 'Birdeye', feed: '5-MINUTE DEX OHLCV', fallback: true, warning, generatedAt: new Date().toISOString(), candles };
+      if (!candles.length) throw new Error('Birdeye returned no usable candles');
+      const incomplete = candles.length < 40;
+      const result = {
+        provider: 'Birdeye',
+        feed: '5-MINUTE DEX OHLCV',
+        fallback: true,
+        warning: [warning, incomplete ? `Only ${candles.length}/40 candles are available; trading signals remain disabled.` : ''].filter(Boolean).join(' '),
+        generatedAt: new Date().toISOString(),
+        candles,
+        incomplete,
+        coverage: { usableCandles: candles.length, minimumForSignals: 40 }
+      };
       SOLANA_CANDLE_CACHE.set(pool, { savedAt: Date.now(), payload: result });
       await writeSolanaCandleEdgeCache(request, pool, result);
       return jsonResponse(200, result, corsOrigin, { 'cache-control': 'public, max-age=300' });
