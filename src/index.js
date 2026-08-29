@@ -429,13 +429,15 @@ const SECTOR_SYNC_KEYS = new Set([
   'settings_profile',
   'playback_notes',
   'tv_progress',
-  'ui_prefs'
+  'ui_prefs',
+  'my_lists'
 ]);
 const CHAT_SECTOR_KEY = 'chat_messages';
 const SETTINGS_PROFILE_SECTOR_KEY = 'settings_profile';
 const PLAYBACK_NOTES_SECTOR_KEY = 'playback_notes';
 const TV_PROGRESS_SECTOR_KEY = 'tv_progress';
 const UI_PREFS_SECTOR_KEY = 'ui_prefs';
+const MY_LISTS_SECTOR_KEY = 'my_lists';
 const SYNC_FUTURE_TIME_WINDOW_MS = 10 * 60 * 1000;
 const TOMBSTONE_RETENTION_DAYS = 30;
 const MEDIA_CACHE_R2_INLINE_THRESHOLD_BYTES = 96 * 1024;
@@ -508,7 +510,9 @@ const STOCK_MARKET_CACHE = new Map();
 const STOCK_MARKET_CACHE_TTL_MS = 15000;
 const SOLANA_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,64}$/;
 const SOLANA_CANDLE_CACHE = new Map();
-const SOLANA_CANDLE_CACHE_TTL_MS = 60000;
+const SOLANA_CANDLE_CACHE_TTL_MS = 5 * 60 * 1000;
+const SOLANA_CANDLE_STALE_TTL_MS = 24 * 60 * 60 * 1000;
+let solanaProviderCooldownUntilMs = 0;
 const MAX_SNAPSHOT_BYTES = 1500000;
 const ACCOUNT_LINK_STATUS_PENDING = 'pending';
 const ACCOUNT_LINK_STATUS_ACTIVE = 'active';
@@ -2766,6 +2770,7 @@ function validateGenericSectorPayload(payload, {
   if (sectorKey === PLAYBACK_NOTES_SECTOR_KEY) maxLength = 24000;
   if (sectorKey === TV_PROGRESS_SECTOR_KEY) maxLength = 8000;
   if (sectorKey === UI_PREFS_SECTOR_KEY) maxLength = 6000;
+  if (sectorKey === MY_LISTS_SECTOR_KEY) maxLength = 48000;
   if (length > maxLength) {
     throw errorResponse(413, {
       error: 'payload_too_large',
@@ -4554,20 +4559,24 @@ function normalizeCoinbaseCandles(payload) {
     .sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
 }
 
-async function fetchMarketJson(url, provider, headers = {}) {
+async function fetchMarketJson(url, provider, headers = {}, { maxAttempts = 3 } = {}) {
   let lastStatus = 0;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  let retryAfterSeconds = 0;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const response = await fetch(url, { headers: { 'user-agent': 'Bilm-Market-Data/2.0', ...headers } });
     if (response.ok) return response.json();
     lastStatus = response.status;
-    if (attempt === 2 || (response.status !== 429 && response.status < 500)) break;
-    const retryAfterSeconds = Number(response.headers.get('retry-after'));
+    retryAfterSeconds = Number(response.headers.get('retry-after')) || 0;
+    if (attempt === maxAttempts - 1 || (response.status !== 429 && response.status < 500)) break;
     const waitMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
       ? Math.min(2000, retryAfterSeconds * 1000)
       : 250 * (attempt + 1);
     await new Promise((resolve) => setTimeout(resolve, waitMs));
   }
-  throw new Error(`${provider} returned ${lastStatus || 'an invalid response'}`);
+  const error = new Error(`${provider} returned ${lastStatus || 'an invalid response'}`);
+  error.status = lastStatus;
+  error.retryAfterSeconds = retryAfterSeconds;
+  throw error;
 }
 
 async function fetchYahooMarketRow(symbol, intervalConfig) {
@@ -4799,6 +4808,46 @@ function normalizeSolanaCandles(rows) {
     .sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
 }
 
+function getSolanaCandleCacheRequest(request, pool) {
+  const cacheUrl = new URL(request.url);
+  cacheUrl.search = '';
+  cacheUrl.searchParams.set('pool', pool);
+  return new Request(cacheUrl.toString(), { method: 'GET' });
+}
+
+async function readSolanaCandleEdgeCache(request, pool) {
+  const edgeCache = globalThis.caches?.default;
+  if (!edgeCache) return null;
+  try {
+    const response = await edgeCache.match(getSolanaCandleCacheRequest(request, pool));
+    if (!response) return null;
+    const payload = await response.json();
+    const savedAt = Number(response.headers.get('x-bilm-saved-at')) || Date.parse(payload?.generatedAt || '');
+    if (!Number.isFinite(savedAt) || !Array.isArray(payload?.candles) || payload.candles.length < 40) return null;
+    return { savedAt, payload };
+  } catch {
+    return null;
+  }
+}
+
+async function writeSolanaCandleEdgeCache(request, pool, payload) {
+  const edgeCache = globalThis.caches?.default;
+  if (!edgeCache) return;
+  try {
+    const savedAt = Date.now();
+    await edgeCache.put(getSolanaCandleCacheRequest(request, pool), new Response(JSON.stringify(payload), {
+      status: 200,
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'public, max-age=86400',
+        'x-bilm-saved-at': String(savedAt)
+      }
+    }));
+  } catch {
+    // Edge caching is an optimization; provider responses still work without it.
+  }
+}
+
 async function handleSolanaCandleRequest({ request, env, corsOrigin }) {
   const url = new URL(request.url);
   const pool = String(url.searchParams.get('pool') || '').trim();
@@ -4806,24 +4855,40 @@ async function handleSolanaCandleRequest({ request, env, corsOrigin }) {
   if (!SOLANA_ADDRESS_RE.test(pool)) {
     return jsonResponse(400, { error: 'invalid_pool', message: 'A valid Solana pool address is required.' }, corsOrigin);
   }
-  const cached = SOLANA_CANDLE_CACHE.get(pool);
+  let cached = SOLANA_CANDLE_CACHE.get(pool);
+  if (!cached) {
+    cached = await readSolanaCandleEdgeCache(request, pool);
+    if (cached) SOLANA_CANDLE_CACHE.set(pool, cached);
+  }
   if (cached && Date.now() - cached.savedAt < SOLANA_CANDLE_CACHE_TTL_MS) {
-    return jsonResponse(200, cached.payload, corsOrigin, { 'cache-control': 'public, max-age=30' });
+    return jsonResponse(200, cached.payload, corsOrigin, { 'cache-control': 'public, max-age=300' });
   }
   let warning = '';
   try {
+    if (Date.now() < solanaProviderCooldownUntilMs) {
+      const retryAfterSeconds = Math.max(1, Math.ceil((solanaProviderCooldownUntilMs - Date.now()) / 1000));
+      const cooldownError = new Error(`GeckoTerminal cooling down after rate limiting; retry in ${retryAfterSeconds}s`);
+      cooldownError.status = 429;
+      cooldownError.retryAfterSeconds = retryAfterSeconds;
+      throw cooldownError;
+    }
     const geckoUrl = new URL(`https://api.geckoterminal.com/api/v2/networks/solana/pools/${encodeURIComponent(pool)}/ohlcv/minute`);
     geckoUrl.searchParams.set('aggregate', '5');
     geckoUrl.searchParams.set('limit', '120');
-    const payload = await fetchMarketJson(geckoUrl, 'GeckoTerminal', { accept: 'application/json' });
+    const payload = await fetchMarketJson(geckoUrl, 'GeckoTerminal', { accept: 'application/json' }, { maxAttempts: 1 });
     const candles = normalizeSolanaCandles(payload?.data?.attributes?.ohlcv_list);
     if (candles.length < 40) throw new Error(`GeckoTerminal returned ${candles.length} usable candles`);
     const result = { provider: 'GeckoTerminal', feed: '5-MINUTE DEX OHLCV', fallback: false, generatedAt: new Date().toISOString(), candles };
     SOLANA_CANDLE_CACHE.set(pool, { savedAt: Date.now(), payload: result });
+    await writeSolanaCandleEdgeCache(request, pool, result);
     if (SOLANA_CANDLE_CACHE.size > 100) SOLANA_CANDLE_CACHE.delete(SOLANA_CANDLE_CACHE.keys().next().value);
-    return jsonResponse(200, result, corsOrigin, { 'cache-control': 'public, max-age=30' });
+    return jsonResponse(200, result, corsOrigin, { 'cache-control': 'public, max-age=300' });
   } catch (error) {
     warning = String(error?.message || 'GeckoTerminal request failed');
+    if (Number(error?.status) === 429) {
+      const retryAfterSeconds = Math.max(60, Number(error?.retryAfterSeconds) || 0);
+      solanaProviderCooldownUntilMs = Math.max(solanaProviderCooldownUntilMs, Date.now() + retryAfterSeconds * 1000);
+    }
   }
   const birdeyeKey = String(env?.BIRDEYE_API_KEY || '').trim();
   if (birdeyeKey && SOLANA_ADDRESS_RE.test(token)) {
@@ -4846,17 +4911,30 @@ async function handleSolanaCandleRequest({ request, env, corsOrigin }) {
       if (candles.length < 40) throw new Error(`Birdeye returned ${candles.length} usable candles`);
       const result = { provider: 'Birdeye', feed: '5-MINUTE DEX OHLCV', fallback: true, warning, generatedAt: new Date().toISOString(), candles };
       SOLANA_CANDLE_CACHE.set(pool, { savedAt: Date.now(), payload: result });
-      return jsonResponse(200, result, corsOrigin, { 'cache-control': 'public, max-age=30' });
+      await writeSolanaCandleEdgeCache(request, pool, result);
+      return jsonResponse(200, result, corsOrigin, { 'cache-control': 'public, max-age=300' });
     } catch (error) {
       warning = `${warning}; ${String(error?.message || 'Birdeye request failed')}`;
     }
   }
+  if (cached && Date.now() - cached.savedAt < SOLANA_CANDLE_STALE_TTL_MS) {
+    return jsonResponse(200, {
+      ...cached.payload,
+      stale: true,
+      warning,
+      cacheAgeSeconds: Math.max(0, Math.floor((Date.now() - cached.savedAt) / 1000))
+    }, corsOrigin, {
+      'cache-control': 'public, max-age=60',
+      warning: '110 - "Response is stale"'
+    });
+  }
+  const retryAfterSeconds = Math.max(1, Math.ceil((solanaProviderCooldownUntilMs - Date.now()) / 1000), 60);
   return jsonResponse(503, {
     error: 'solana_candles_unavailable',
     message: 'Solana historical data is temporarily unavailable.',
     detail: warning,
-    retryAfterSeconds: 60
-  }, corsOrigin, { 'retry-after': '60' });
+    retryAfterSeconds
+  }, corsOrigin, { 'retry-after': String(retryAfterSeconds) });
 }
 
 export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOrigins = DEFAULT_ALLOWED_ORIGINS } = {}) {

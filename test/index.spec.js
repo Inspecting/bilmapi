@@ -1248,6 +1248,26 @@ describe('data api', () => {
     expect(upstream).not.toHaveBeenCalled();
   });
 
+  it('does not multiply GeckoTerminal rate-limit failures across retries or pools', async () => {
+    const upstream = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ error: 'rate limited' }), {
+      status: 429,
+      headers: { 'content-type': 'application/json', 'retry-after': '90' }
+    }));
+
+    const first = await worker.fetch(new Request('https://data-api.watchbilm.org/stocks/solana-candles?pool=22222222222222222222222222222222', {
+      headers: { origin: ALLOWED_ORIGIN }
+    }), env);
+    const second = await worker.fetch(new Request('https://data-api.watchbilm.org/stocks/solana-candles?pool=33333333333333333333333333333333', {
+      headers: { origin: ALLOWED_ORIGIN }
+    }), env);
+
+    expect(first.status).toBe(503);
+    expect(second.status).toBe(503);
+    expect(upstream).toHaveBeenCalledTimes(1);
+    expect(Number(first.headers.get('retry-after'))).toBeGreaterThanOrEqual(60);
+    expect((await second.json()).detail).toContain('cooling down');
+  });
+
   it('uses Coinbase exchange quotes and candles for crypto symbols', async () => {
     const upstreamUrls = [];
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (request) => {
@@ -1998,7 +2018,7 @@ describe('data api', () => {
     expect(body.requestId).toBeTruthy();
   });
 
-  it('accepts settings/profile and progress sector operations', async () => {
+  it('accepts settings/profile, progress, and custom-list sector operations', async () => {
     const response = await worker.fetch(new Request('https://data-api.watchbilm.org/sync/sectors/push', {
       method: 'POST',
       headers: {
@@ -2027,6 +2047,16 @@ describe('data api', () => {
               storageKey: 'bilm-playback-note',
               value: '{"movie:42":"01:20"}'
             }
+          },
+          {
+            sectorKey: 'my_lists',
+            itemKey: 'custom_lists',
+            updatedAtMs: 1725100000200,
+            deleted: false,
+            payload: {
+              storageKey: 'bilm-custom-lists-v1',
+              value: '{"schema":"bilm-custom-lists-v1","version":1,"lists":[]}'
+            }
           }
         ]
       })
@@ -2035,7 +2065,16 @@ describe('data api', () => {
     expect(response.status).toBe(200);
     const body = await response.json();
     expect(body.ok).toBe(true);
-    expect(body.processed).toBe(2);
+    expect(body.processed).toBe(3);
+
+    const pull = await worker.fetch(new Request(`https://data-api.watchbilm.org/sync/sectors/pull?userId=${USER_ID}&since=0&sectors=my_lists`, {
+      method: 'GET',
+      headers: { authorization: 'Bearer valid-token' }
+    }), env);
+    expect(pull.status).toBe(200);
+    const pullBody = await pull.json();
+    expect(pullBody.operations).toHaveLength(1);
+    expect(pullBody.operations[0]).toMatchObject({ sectorKey: 'my_lists', itemKey: 'custom_lists' });
   });
 
   it('enforces generic sector payload size limits', async () => {
