@@ -506,6 +506,9 @@ const DEFAULT_ALLOWED_ORIGINS = new Set([
 const STOCK_SYMBOL_RE = /^[A-Z][A-Z0-9.-]{0,9}$/;
 const STOCK_MARKET_CACHE = new Map();
 const STOCK_MARKET_CACHE_TTL_MS = 15000;
+const SOLANA_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,64}$/;
+const SOLANA_CANDLE_CACHE = new Map();
+const SOLANA_CANDLE_CACHE_TTL_MS = 60000;
 const MAX_SNAPSHOT_BYTES = 1500000;
 const ACCOUNT_LINK_STATUS_PENDING = 'pending';
 const ACCOUNT_LINK_STATUS_ACTIVE = 'active';
@@ -4781,6 +4784,81 @@ async function handleStockMarketRequest({ request, env, corsOrigin }) {
   }
 }
 
+function normalizeSolanaCandles(rows) {
+  return (Array.isArray(rows) ? rows : []).map((row) => {
+    const unixTime = Number(row?.[0]);
+    return {
+      timestamp: Number.isFinite(unixTime) && unixTime > 0 ? new Date(unixTime * 1000).toISOString() : null,
+      open: stockNumberOrNull(row?.[1]),
+      high: stockNumberOrNull(row?.[2]),
+      low: stockNumberOrNull(row?.[3]),
+      close: stockNumberOrNull(row?.[4]),
+      volume: stockNumberOrNull(row?.[5])
+    };
+  }).filter((row) => row.timestamp && row.close != null && row.close > 0)
+    .sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
+}
+
+async function handleSolanaCandleRequest({ request, env, corsOrigin }) {
+  const url = new URL(request.url);
+  const pool = String(url.searchParams.get('pool') || '').trim();
+  const token = String(url.searchParams.get('token') || '').trim();
+  if (!SOLANA_ADDRESS_RE.test(pool)) {
+    return jsonResponse(400, { error: 'invalid_pool', message: 'A valid Solana pool address is required.' }, corsOrigin);
+  }
+  const cached = SOLANA_CANDLE_CACHE.get(pool);
+  if (cached && Date.now() - cached.savedAt < SOLANA_CANDLE_CACHE_TTL_MS) {
+    return jsonResponse(200, cached.payload, corsOrigin, { 'cache-control': 'public, max-age=30' });
+  }
+  let warning = '';
+  try {
+    const geckoUrl = new URL(`https://api.geckoterminal.com/api/v2/networks/solana/pools/${encodeURIComponent(pool)}/ohlcv/minute`);
+    geckoUrl.searchParams.set('aggregate', '5');
+    geckoUrl.searchParams.set('limit', '120');
+    const payload = await fetchMarketJson(geckoUrl, 'GeckoTerminal', { accept: 'application/json' });
+    const candles = normalizeSolanaCandles(payload?.data?.attributes?.ohlcv_list);
+    if (candles.length < 40) throw new Error(`GeckoTerminal returned ${candles.length} usable candles`);
+    const result = { provider: 'GeckoTerminal', feed: '5-MINUTE DEX OHLCV', fallback: false, generatedAt: new Date().toISOString(), candles };
+    SOLANA_CANDLE_CACHE.set(pool, { savedAt: Date.now(), payload: result });
+    if (SOLANA_CANDLE_CACHE.size > 100) SOLANA_CANDLE_CACHE.delete(SOLANA_CANDLE_CACHE.keys().next().value);
+    return jsonResponse(200, result, corsOrigin, { 'cache-control': 'public, max-age=30' });
+  } catch (error) {
+    warning = String(error?.message || 'GeckoTerminal request failed');
+  }
+  const birdeyeKey = String(env?.BIRDEYE_API_KEY || '').trim();
+  if (birdeyeKey && SOLANA_ADDRESS_RE.test(token)) {
+    try {
+      const birdeyeUrl = new URL('https://public-api.birdeye.so/defi/ohlcv');
+      birdeyeUrl.searchParams.set('address', token);
+      birdeyeUrl.searchParams.set('type', '5m');
+      birdeyeUrl.searchParams.set('time_from', String(Math.floor(Date.now() / 1000) - 5 * 60 * 120));
+      birdeyeUrl.searchParams.set('time_to', String(Math.floor(Date.now() / 1000)));
+      const payload = await fetchMarketJson(birdeyeUrl, 'Birdeye', { accept: 'application/json', 'X-API-KEY': birdeyeKey, 'x-chain': 'solana' });
+      const candles = (payload?.data?.items || []).map((row) => {
+        const unixTime = Number(row?.unixTime);
+        return {
+          timestamp: Number.isFinite(unixTime) && unixTime > 0 ? new Date(unixTime * 1000).toISOString() : null,
+          open: stockNumberOrNull(row?.o), high: stockNumberOrNull(row?.h), low: stockNumberOrNull(row?.l),
+          close: stockNumberOrNull(row?.c), volume: stockNumberOrNull(row?.v)
+        };
+      }).filter((row) => row.timestamp && row.close != null && row.close > 0)
+        .sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
+      if (candles.length < 40) throw new Error(`Birdeye returned ${candles.length} usable candles`);
+      const result = { provider: 'Birdeye', feed: '5-MINUTE DEX OHLCV', fallback: true, warning, generatedAt: new Date().toISOString(), candles };
+      SOLANA_CANDLE_CACHE.set(pool, { savedAt: Date.now(), payload: result });
+      return jsonResponse(200, result, corsOrigin, { 'cache-control': 'public, max-age=30' });
+    } catch (error) {
+      warning = `${warning}; ${String(error?.message || 'Birdeye request failed')}`;
+    }
+  }
+  return jsonResponse(503, {
+    error: 'solana_candles_unavailable',
+    message: 'Solana historical data is temporarily unavailable.',
+    detail: warning,
+    retryAfterSeconds: 60
+  }, corsOrigin, { 'retry-after': '60' });
+}
+
 export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOrigins = DEFAULT_ALLOWED_ORIGINS } = {}) {
   return {
     async fetch(request, env, ctx) {
@@ -4807,6 +4885,10 @@ export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOri
 
         if (request.method === 'GET' && url.pathname === '/stocks/market') {
           return await handleStockMarketRequest({ request, env, corsOrigin });
+        }
+
+        if (request.method === 'GET' && url.pathname === '/stocks/solana-candles') {
+          return await handleSolanaCandleRequest({ request, env, corsOrigin });
         }
 
         if (request.method === 'GET' && (url.pathname === '/health' || url.pathname === '/healthz')) {

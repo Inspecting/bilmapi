@@ -1206,6 +1206,48 @@ describe('data api', () => {
     expect(body.candlesBySymbol.ORCL).toHaveLength(50);
   });
 
+  it('returns normalized Solana candles from the public data API', async () => {
+    const pool = '11111111111111111111111111111111';
+    const rows = Array.from({ length: 50 }, (_, index) => {
+      const close = 1 + index * .01;
+      return [1787920000 + (49 - index) * 300, close - .01, close + .02, close - .02, close, 10000 + index];
+    });
+    const upstream = vi.spyOn(globalThis, 'fetch').mockImplementation(async (request) => {
+      const url = new URL(String(request));
+      expect(url.hostname).toBe('api.geckoterminal.com');
+      expect(url.pathname).toContain(`/pools/${pool}/ohlcv/minute`);
+      expect(url.searchParams.get('aggregate')).toBe('5');
+      expect(url.searchParams.get('limit')).toBe('120');
+      return new Response(JSON.stringify({ data: { attributes: { ohlcv_list: rows } } }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      });
+    });
+
+    const response = await worker.fetch(new Request(`https://data-api.watchbilm.org/stocks/solana-candles?pool=${pool}`, {
+      headers: { origin: ALLOWED_ORIGIN }
+    }), env);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('access-control-allow-origin')).toBe(ALLOWED_ORIGIN);
+    expect(response.headers.get('content-type')).toContain('application/json');
+    const body = await response.json();
+    expect(upstream).toHaveBeenCalledTimes(1);
+    expect(body.provider).toBe('GeckoTerminal');
+    expect(body.feed).toBe('5-MINUTE DEX OHLCV');
+    expect(body.candles).toHaveLength(50);
+    expect(Date.parse(body.candles[0].timestamp)).toBeLessThan(Date.parse(body.candles.at(-1).timestamp));
+  });
+
+  it('rejects invalid Solana pool addresses before calling a provider', async () => {
+    const upstream = vi.spyOn(globalThis, 'fetch');
+    const response = await worker.fetch(new Request('https://data-api.watchbilm.org/stocks/solana-candles?pool=not-a-pool', {
+      headers: { origin: ALLOWED_ORIGIN }
+    }), env);
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toBe('invalid_pool');
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
   it('uses Coinbase exchange quotes and candles for crypto symbols', async () => {
     const upstreamUrls = [];
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (request) => {
