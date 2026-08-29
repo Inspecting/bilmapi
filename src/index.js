@@ -4949,12 +4949,19 @@ async function handleSolanaCandleRequest({ request, env, corsOrigin }) {
     });
   }
   const retryAfterSeconds = Math.max(1, Math.ceil((solanaProviderCooldownUntilMs - Date.now()) / 1000), 60);
-  return jsonResponse(503, {
-    error: 'solana_candles_unavailable',
-    message: 'Solana historical data is temporarily unavailable.',
-    detail: warning,
+  return jsonResponse(206, {
+    provider: 'Solana candle providers',
+    feed: '5-MINUTE DEX OHLCV',
+    available: false,
+    retryable: true,
+    upstreamStatus: warning.includes('429') || warning.includes('rate limiting') ? 429 : 503,
+    warning: warning || 'Solana historical data is temporarily unavailable.',
+    candles: [],
     retryAfterSeconds
-  }, corsOrigin, { 'retry-after': String(retryAfterSeconds) });
+  }, corsOrigin, {
+    'cache-control': 'no-store',
+    'retry-after': String(retryAfterSeconds)
+  });
 }
 
 export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOrigins = DEFAULT_ALLOWED_ORIGINS } = {}) {

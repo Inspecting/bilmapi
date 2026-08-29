@@ -1281,11 +1281,13 @@ describe('data api', () => {
       headers: { origin: ALLOWED_ORIGIN }
     }), env);
 
-    expect(first.status).toBe(503);
-    expect(second.status).toBe(503);
+    expect(first.status).toBe(206);
+    expect(second.status).toBe(206);
     expect(upstream).toHaveBeenCalledTimes(1);
     expect(Number(first.headers.get('retry-after'))).toBeGreaterThanOrEqual(60);
-    expect((await second.json()).detail).toContain('cooling down');
+    const secondBody = await second.json();
+    expect(secondBody.available).toBe(false);
+    expect(secondBody.warning).toContain('cooling down');
   });
 
   it('uses Coinbase exchange quotes and candles for crypto symbols', async () => {
