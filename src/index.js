@@ -4482,9 +4482,9 @@ function normalizeStockSymbols(value) {
 }
 
 const MARKET_INTERVALS = Object.freeze({
-  '1m': { yahoo: '1m', coinbase: 'ONE_MINUTE', seconds: 60, candles: 240, range: '1d' },
-  '5m': { yahoo: '5m', coinbase: 'FIVE_MINUTE', seconds: 300, candles: 240, range: '5d' },
-  '15m': { yahoo: '15m', coinbase: 'FIFTEEN_MINUTE', seconds: 900, candles: 240, range: '5d' }
+  '1m': { yahoo: '1m', alpaca: '1Min', alpacaLookbackDays: 7, coinbase: 'ONE_MINUTE', seconds: 60, candles: 240, range: '1d' },
+  '5m': { yahoo: '5m', alpaca: '5Min', alpacaLookbackDays: 10, coinbase: 'FIVE_MINUTE', seconds: 300, candles: 240, range: '5d' },
+  '15m': { yahoo: '15m', alpaca: '15Min', alpacaLookbackDays: 21, coinbase: 'FIFTEEN_MINUTE', seconds: 900, candles: 240, range: '5d' }
 });
 
 function normalizeMarketInterval(value) {
@@ -4551,10 +4551,10 @@ function normalizeCoinbaseCandles(payload) {
     .sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
 }
 
-async function fetchMarketJson(url, provider) {
+async function fetchMarketJson(url, provider, headers = {}) {
   let lastStatus = 0;
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const response = await fetch(url, { headers: { 'user-agent': 'Bilm-Market-Data/2.0' } });
+    const response = await fetch(url, { headers: { 'user-agent': 'Bilm-Market-Data/2.0', ...headers } });
     if (response.ok) return response.json();
     lastStatus = response.status;
     if (attempt === 2 || (response.status !== 429 && response.status < 500)) break;
@@ -4573,6 +4573,78 @@ async function fetchYahooMarketRow(symbol, intervalConfig) {
   upstreamUrl.searchParams.set('interval', intervalConfig.yahoo);
   upstreamUrl.searchParams.set('includePrePost', 'false');
   return normalizeStockChart(symbol, await fetchMarketJson(upstreamUrl, 'Yahoo Finance'));
+}
+
+function normalizeAlpacaCandles(rows) {
+  return (Array.isArray(rows) ? rows : []).map((bar) => ({
+    timestamp: bar?.t,
+    open: stockNumberOrNull(bar?.o),
+    high: stockNumberOrNull(bar?.h),
+    low: stockNumberOrNull(bar?.l),
+    close: stockNumberOrNull(bar?.c),
+    volume: stockNumberOrNull(bar?.v)
+  })).filter((candle) => candle.timestamp && candle.close != null && candle.close > 0)
+    .sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
+}
+
+async function fetchAlpacaStockRows(symbols, intervalConfig, env) {
+  const keyId = String(env?.ALPACA_API_KEY || '').trim();
+  const secretKey = String(env?.ALPACA_API_SECRET || '').trim();
+  if (!keyId || !secretKey) throw new Error('Alpaca credentials are not configured');
+  const headers = { 'APCA-API-KEY-ID': keyId, 'APCA-API-SECRET-KEY': secretKey };
+  const joined = symbols.join(',');
+  const snapshotsUrl = new URL('https://data.alpaca.markets/v2/stocks/snapshots');
+  snapshotsUrl.searchParams.set('symbols', joined);
+  snapshotsUrl.searchParams.set('feed', 'iex');
+  const barsUrl = new URL('https://data.alpaca.markets/v2/stocks/bars');
+  barsUrl.searchParams.set('symbols', joined);
+  barsUrl.searchParams.set('timeframe', intervalConfig.alpaca);
+  barsUrl.searchParams.set('start', new Date(Date.now() - intervalConfig.alpacaLookbackDays * 86400000).toISOString());
+  barsUrl.searchParams.set('limit', '10000');
+  barsUrl.searchParams.set('adjustment', 'raw');
+  barsUrl.searchParams.set('feed', 'iex');
+  barsUrl.searchParams.set('sort', 'asc');
+  const [snapshotPayload, barsPayload] = await Promise.all([
+    fetchMarketJson(snapshotsUrl, 'Alpaca', headers),
+    fetchMarketJson(barsUrl, 'Alpaca', headers)
+  ]);
+  const snapshots = snapshotPayload?.snapshots || snapshotPayload || {};
+  const barsBySymbol = barsPayload?.bars || {};
+  return symbols.map((symbol) => {
+    const snapshot = snapshots[symbol] || {};
+    const candles = normalizeAlpacaCandles(barsBySymbol[symbol]).slice(-intervalConfig.candles * 2);
+    const latestTrade = snapshot.latestTrade || {};
+    const latestQuote = snapshot.latestQuote || {};
+    const minuteBar = snapshot.minuteBar || {};
+    const dailyBar = snapshot.dailyBar || {};
+    const previousDailyBar = snapshot.prevDailyBar || {};
+    const price = stockNumberOrNull(latestTrade.p) ?? stockNumberOrNull(minuteBar.c) ?? stockNumberOrNull(dailyBar.c) ?? candles.at(-1)?.close ?? null;
+    const previousClose = stockNumberOrNull(previousDailyBar.c) ?? stockNumberOrNull(dailyBar.o) ?? price;
+    if (price == null || !candles.length) return { symbol, error: 'Alpaca returned incomplete quote or candle data' };
+    return {
+      symbol,
+      row: {
+        quote: {
+          symbol,
+          price,
+          previousClose,
+          change: previousClose != null ? price - previousClose : null,
+          changePercent: previousClose ? ((price - previousClose) / previousClose) * 100 : null,
+          bid: stockNumberOrNull(latestQuote.bp),
+          ask: stockNumberOrNull(latestQuote.ap),
+          bidSize: stockNumberOrNull(latestQuote.bs),
+          askSize: stockNumberOrNull(latestQuote.as),
+          volume: stockNumberOrNull(dailyBar.v) ?? candles.at(-1)?.volume ?? null,
+          timestamp: latestTrade.t || latestQuote.t || minuteBar.t || candles.at(-1)?.timestamp,
+          exchange: latestTrade.x || latestQuote.ax || 'IEX',
+          provider: 'Alpaca Market Data',
+          feed: 'REAL-TIME IEX',
+          quoteType: latestQuote.bp != null && latestQuote.ap != null ? 'exchange-bid-ask' : 'exchange-last-trade'
+        },
+        candles
+      }
+    };
+  });
 }
 
 async function fetchCoinbaseMarketRow(symbol, intervalConfig) {
@@ -4625,16 +4697,11 @@ async function fetchCoinbaseMarketRow(symbol, intervalConfig) {
   };
 }
 
-async function settleMarketRows(symbols, intervalConfig) {
+async function settleProviderRows(symbols, concurrency, provider) {
   const results = [];
-  const concurrency = symbols.some((symbol) => symbol.endsWith('-USD')) ? 2 : 4;
   for (let index = 0; index < symbols.length; index += concurrency) {
     const batch = symbols.slice(index, index + concurrency);
-    const settled = await Promise.allSettled(batch.map((symbol) => (
-      symbol.endsWith('-USD')
-        ? fetchCoinbaseMarketRow(symbol, intervalConfig)
-        : fetchYahooMarketRow(symbol, intervalConfig)
-    )));
+    const settled = await Promise.allSettled(batch.map(provider));
     settled.forEach((result, offset) => {
       const symbol = batch[offset];
       if (result.status === 'fulfilled') results.push({ symbol, row: result.value });
@@ -4644,7 +4711,29 @@ async function settleMarketRows(symbols, intervalConfig) {
   return results;
 }
 
-async function handleStockMarketRequest({ request, corsOrigin }) {
+async function settleMarketRows(symbols, intervalConfig, env) {
+  const stockSymbols = symbols.filter((symbol) => !symbol.endsWith('-USD'));
+  const cryptoSymbols = symbols.filter((symbol) => symbol.endsWith('-USD'));
+  let stockResults = [];
+  if (stockSymbols.length && env?.ALPACA_API_KEY && env?.ALPACA_API_SECRET) {
+    try {
+      stockResults = await fetchAlpacaStockRows(stockSymbols, intervalConfig, env);
+    } catch {
+      stockResults = [];
+    }
+  }
+  const alpacaBySymbol = new Map(stockResults.map((result) => [result.symbol, result]));
+  const stockFallbackSymbols = stockSymbols.filter((symbol) => !alpacaBySymbol.get(symbol)?.row);
+  const fallbackResults = await settleProviderRows(stockFallbackSymbols, 4, (symbol) => fetchYahooMarketRow(symbol, intervalConfig));
+  const fallbackBySymbol = new Map(fallbackResults.map((result) => [result.symbol, result]));
+  const cryptoResults = await settleProviderRows(cryptoSymbols, 2, (symbol) => fetchCoinbaseMarketRow(symbol, intervalConfig));
+  const cryptoBySymbol = new Map(cryptoResults.map((result) => [result.symbol, result]));
+  return symbols.map((symbol) => alpacaBySymbol.get(symbol)?.row
+    ? alpacaBySymbol.get(symbol)
+    : fallbackBySymbol.get(symbol) || cryptoBySymbol.get(symbol) || { symbol, error: 'No provider result' });
+}
+
+async function handleStockMarketRequest({ request, env, corsOrigin }) {
   const url = new URL(request.url);
   const symbols = normalizeStockSymbols(url.searchParams.get('symbols') || 'AAPL,MSFT,NVDA,TSLA');
   const interval = normalizeMarketInterval(url.searchParams.get('interval'));
@@ -4658,7 +4747,7 @@ async function handleStockMarketRequest({ request, corsOrigin }) {
     return jsonResponse(200, cached.payload, corsOrigin, { 'cache-control': 'public, max-age=10' });
   }
   try {
-    const results = await settleMarketRows(symbols, intervalConfig);
+    const results = await settleMarketRows(symbols, intervalConfig, env);
     const successful = results.filter((result) => result.row);
     const failed = results.filter((result) => result.error).map(({ symbol, error }) => ({ symbol, error }));
     if (!successful.length) throw new Error(failed.map((item) => `${item.symbol}: ${item.error}`).join('; '));
@@ -4717,7 +4806,7 @@ export function createWorker({ verifyIdToken = verifyFirebaseIdToken, allowedOri
         }
 
         if (request.method === 'GET' && url.pathname === '/stocks/market') {
-          return await handleStockMarketRequest({ request, corsOrigin });
+          return await handleStockMarketRequest({ request, env, corsOrigin });
         }
 
         if (request.method === 'GET' && (url.pathname === '/health' || url.pathname === '/healthz')) {

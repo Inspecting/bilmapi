@@ -1157,6 +1157,55 @@ describe('data api', () => {
     expect(body.coverage).toEqual({ requested: 12, returned: 11, failed: 1 });
   });
 
+  it('uses two authenticated Alpaca batch requests for the stock universe', async () => {
+    env.ALPACA_API_KEY = 'test-alpaca-key';
+    env.ALPACA_API_SECRET = 'test-alpaca-secret';
+    const symbols = ['IBM', 'ORCL'];
+    const bars = Object.fromEntries(symbols.map((symbol, symbolIndex) => [symbol,
+      Array.from({ length: 50 }, (_, index) => ({
+        t: new Date(1787920000000 + index * 300000).toISOString(),
+        o: 200 + symbolIndex + index * .1,
+        h: 201 + symbolIndex + index * .1,
+        l: 199 + symbolIndex + index * .1,
+        c: 200.5 + symbolIndex + index * .1,
+        v: 10000 + index
+      }))
+    ]));
+    const snapshots = Object.fromEntries(symbols.map((symbol, index) => [symbol, {
+      latestTrade: { p: 205 + index, t: '2026-08-28T20:00:00Z', x: 'V' },
+      latestQuote: { bp: 204.95 + index, ap: 205.05 + index, bs: 10, as: 12, t: '2026-08-28T20:00:00Z', ax: 'V' },
+      minuteBar: { c: 205 + index, t: '2026-08-28T20:00:00Z' },
+      dailyBar: { o: 202 + index, c: 205 + index, v: 500000 },
+      prevDailyBar: { c: 201 + index }
+    }]));
+    const upstream = vi.spyOn(globalThis, 'fetch').mockImplementation(async (request, options) => {
+      const url = new URL(String(request));
+      expect(options.headers['APCA-API-KEY-ID']).toBe('test-alpaca-key');
+      expect(options.headers['APCA-API-SECRET-KEY']).toBe('test-alpaca-secret');
+      if (url.pathname.endsWith('/snapshots')) {
+        expect(url.searchParams.get('symbols')).toBe('IBM,ORCL');
+        return new Response(JSON.stringify(snapshots), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      expect(url.pathname).toBe('/v2/stocks/bars');
+      expect(url.searchParams.get('timeframe')).toBe('5Min');
+      expect(url.searchParams.get('feed')).toBe('iex');
+      return new Response(JSON.stringify({ bars, next_page_token: null }), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+
+    const response = await worker.fetch(new Request('https://data-api.watchbilm.org/stocks/market?symbols=IBM,ORCL&interval=5m', {
+      headers: { origin: ALLOWED_ORIGIN }
+    }), env);
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(upstream).toHaveBeenCalledTimes(2);
+    expect(body.provider).toBe('Alpaca Market Data');
+    expect(body.feed).toBe('REAL-TIME IEX');
+    expect(body.coverage).toEqual({ requested: 2, returned: 2, failed: 0 });
+    expect(body.quotes[0]).toMatchObject({ symbol: 'IBM', price: 205, bid: 204.95, ask: 205.05 });
+    expect(body.candlesBySymbol.IBM).toHaveLength(50);
+    expect(body.candlesBySymbol.ORCL).toHaveLength(50);
+  });
+
   it('uses Coinbase exchange quotes and candles for crypto symbols', async () => {
     const upstreamUrls = [];
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (request) => {
